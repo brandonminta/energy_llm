@@ -1,0 +1,25 @@
+name: exp01_truthfulqa_baseline
+runner: exp1_factual_vs_hallucinated
+model_config: configs/models/qwen25_3b.yaml
+dataset_config: configs/datasets/truthfulqa.yaml
+output_dir: runs/exp01_truthfulqa_baseline
+bank:
+  name: gate
+  normalize: false
+  strict: true
+representation:
+  pooling: mean
+  layers: null
+  separator: "\n"
+divergence:
+  beta: 15.0
+  energy_mode: cosine
+  active_threshold: 0.1
+score:
+  metric: js
+  aggregation: mean
+  signal_zone: null
+  use_absolute: false
+runtime:
+  skip_on_error: true
+  verbose: true

@@ -1,0 +1,10 @@
+numpy>=1.26
+pandas>=2.2
+tqdm>=4.66
+PyYAML>=6.0
+datasets>=2.19
+transformers>=4.45
+accelerate>=0.33
+torch>=2.2
+sentencepiece>=0.2
+bitsandbytes>=0.43; platform_system == "Linux"

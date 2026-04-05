@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "energy_llm"
+version = "0.1.0"
+description = "Research framework for energy-based analysis of LLM internal states."
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+authors = [
+  { name = "energy_llm contributors" },
+]
+keywords = [
+  "llm",
+  "mechanistic-interpretability",
+  "hallucination-detection",
+  "hopfield",
+  "hidden-states",
+]
+
+[project.scripts]
+energy-llm = "energy_llm.cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

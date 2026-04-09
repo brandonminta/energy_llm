@@ -1,0 +1,9 @@
+environment: hpc
+device: cuda
+max_vram_gb: 20           # a100_3g.20gb as baseline
+max_ram_gb: 60
+default_batch_size: 8
+use_4bit: true            # also on HPC for larger models
+num_workers: 8
+cache_dir: $SCRATCH/hopfield_cache
+results_dir: $SCRATCH/hopfield_results

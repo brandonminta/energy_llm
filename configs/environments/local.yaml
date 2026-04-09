@@ -1,0 +1,9 @@
+environment: local
+device: cuda              # RTX 2050
+max_vram_gb: 4
+max_ram_gb: 14            # leave 2 GB for OS
+default_batch_size: 1     # conservative for 4 GB VRAM
+use_4bit: true
+num_workers: 4
+cache_dir: ./data/cache
+results_dir: ./data/results

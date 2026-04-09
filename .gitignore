@@ -37,10 +37,19 @@ Thumbs.db
 artifacts/
 runs/
 data/raw/
+data/cache/
+data/results/
 data/interim/
 data/processed/
+experiments/runs/
+
+# HPC
+.env.hpc
+logs/
 
 # Optional cache
 .cache/
 .pytest_cache/
 .mypy_cache/
+
+CLAUDE.md

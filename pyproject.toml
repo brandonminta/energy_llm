@@ -3,14 +3,14 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "energy_llm"
+name = "hopfield_llm"
 version = "0.1.0"
-description = "Research framework for energy-based analysis of LLM internal states."
+description = "Energy-based hallucination detection for LLMs using Modern Hopfield networks."
 readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 authors = [
-  { name = "energy_llm contributors" },
+  { name = "hopfield_llm contributors" },
 ]
 keywords = [
   "llm",
@@ -21,7 +21,7 @@ keywords = [
 ]
 
 [project.scripts]
-energy-llm = "energy_llm.cli.main:main"
+hopfield-llm = "hopfield_llm.cli.run:main"
 
 [project.optional-dependencies]
 dev = [

@@ -8,3 +8,5 @@ accelerate>=0.33
 torch>=2.2
 sentencepiece>=0.2
 bitsandbytes>=0.43; platform_system == "Linux"
+matplotlib>=3.8
+h5py>=3.10

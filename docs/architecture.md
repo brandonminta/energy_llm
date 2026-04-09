@@ -1,143 +1,112 @@
-# Architecture Overview
+# Architecture
 
-## Purpose
+## Overview
 
-`energy_llm` studies whether energy-like signals over LLM internal representations can separate factual and hallucinated behavior. The working baseline combines:
-
-1. model loading
-2. MLP bank extraction
-3. hidden-state segmentation
-4. layer-wise divergence computation
-5. scalar score aggregation
-
-The repository is intentionally organized as a research framework, not a large application. Some modules are implemented now, while others are placeholders kept in place to preserve the planned package layout.
-
-## Top-Level Folders
-
-- `src/energy_llm/`: installable Python package
-- `configs/`: YAML configs for models, datasets, experiments, and sweeps
-- `scripts/`: local shell launchers and Slurm wrappers
-- `data/`: raw, interim, and processed dataset storage
-- `artifacts/`: reusable intermediate outputs such as banks, hidden states, retrievals, and plots
-- `runs/`: per-execution outputs and summaries
-- `docs/`: contributor-facing documentation
-- `tests/`: test suite, currently minimal
-- `notebooks/`: exploratory analysis notebooks
-
-## Package Layout
-
-### `src/energy_llm/models/`
-
-- `model_profiles.py`: canonical model aliases and dimensions
-- `hf_llm.py`: Hugging Face model loader and hidden-state-capable wrapper
-- `model_factory.py`: placeholder for a future backend selection layer
-
-Current status:
-
-- implemented: `model_profiles.py`, `hf_llm.py`
-- placeholder: `model_factory.py`
-
-### `src/energy_llm/memory/`
-
-- `mlp_bank.py`: extraction of per-layer MLP banks from model layers
-- `bank_cache.py`, `bank_extractors.py`, `bank_metadata.py`: planned support modules
-
-Current status:
-
-- implemented: `mlp_bank.py`
-- placeholders: `bank_cache.py`, `bank_extractors.py`, `bank_metadata.py`
-
-### `src/energy_llm/representations/`
-
-- `segment_states.py`: pooled hidden-state extraction for question/answer segments
-- `state_cache.py`, `token_pooling.py`, `trajectory_states.py`: planned extensions
-
-Current status:
-
-- implemented: `segment_states.py`
-- placeholders: `state_cache.py`, `token_pooling.py`, `trajectory_states.py`
-
-### `src/energy_llm/metrics/`
-
-- `divergences.py`: Hopfield-style energy and layer-wise divergence metrics
-- `scores.py`: scalar aggregation from layer-wise metrics
-- `classification.py`, `ranking.py`: future evaluation helpers
-
-Current status:
-
-- implemented: `divergences.py`, `scores.py`
-- placeholders: `classification.py`, `ranking.py`
-
-### `src/energy_llm/datasets/`
-
-- `truthfulqa.py`: normalized TruthfulQA loader for the current baseline
-- `base.py`, `halu_eval.py`, `hotpotqa.py`, `local_jsonl.py`, `splits.py`, `triviaqa.py`: reserved for multi-dataset support
-
-Current status:
-
-- implemented: `truthfulqa.py`
-- placeholders: all other modules in this package
-
-### `src/energy_llm/experiments/`
-
-- `exp1_factual_vs_hallucinated.py`: implemented baseline runner
-- `base.py`, `exp2_context_vs_answer.py`, `exp3_cross_model.py`, `exp4_cross_dataset.py`, `exp5_generation_trajectory.py`: reserved for future experiments
-
-Current status:
-
-- implemented: `exp1_factual_vs_hallucinated.py`
-- placeholders: all other experiment modules
-
-### `src/energy_llm/cli/`
-
-- `main.py`: thin command-line entrypoint that wires configs to the implemented baseline runner
-
-### `src/energy_llm/analysis/`, `evaluation/`, `pipelines/`, `core/`, `utils/`, `energies/`
-
-These packages currently exist to preserve the intended architecture, but most files are placeholders. They should remain lightweight until the corresponding functionality is actually needed.
+hopfield_llm implements a five-stage pipeline for energy-based hallucination detection in LLMs. Each stage is independently runnable and persists its output to disk so downstream stages can reuse cached results.
 
 ## Data Flow
 
-The working baseline data flow is:
+```
+                    +---------+
+                    | Dataset |
+                    +----+----+
+                         |
+                         v
++--------+    +---------------------+
+| Model  |--->| Stage 1: Bank       |---> banks/{model}__{bank}.pt
++--------+    | (MLP weights only)  |
+              +---------------------+
+                         |
+              +----------v----------+
+              | Stage 2: Hidden     |---> hidden_states/{model}__{pooling}.pt
+              | (forward passes)    |
+              +---------------------+
+                         |
+              +----------v----------+
+              | Stage 3: Score      |---> scores/{params}.pt
+              | (Hopfield energy +  |
+              |  divergences)       |
+              +---------------------+
+                         |
+              +----------v----------+
+              | Stage 4: Analyze    |---> analysis.json
+              | (statistics)        |
+              +---------------------+
+                         |
+              +----------v----------+
+              | Stage 5: Visualize  |---> plots/
+              | (matplotlib)        |
+              +---------------------+
+```
 
-1. `HFLLM` loads a causal LM with hidden-state output enabled.
-2. `extract_mlp_memory_bank` extracts a layer-indexed bank from each MLP.
-3. `load_truthfulqa` returns normalized question/factual/hallucinated samples.
-4. `extract_segment_hidden_states` produces one `[L, D]` representation for each segment.
-5. `compute_layer_divergences` compares factual and hallucinated answer states against the same bank.
-6. `hallucination_score` reduces layer-wise metrics to a scalar.
-7. `energy_llm.cli.main` writes CSV and JSON outputs under `runs/`.
+## Module Dependency Graph
 
-## Config Layout
+```
+cli/run.py
+  └─> pipeline/stages.py
+        ├─> models/loader.py          (HFLLM)
+        │     └─> models/profiles.py  (ModelProfile)
+        ├─> extraction/memory_bank.py
+        ├─> extraction/hidden_states.py
+        ├─> metrics/hopfield.py       (energy primitive)
+        ├─> metrics/divergences.py    (KL, JS, Hellinger + layer comparisons)
+        ├─> metrics/scoring.py        (hallucination_score aggregation)
+        ├─> datasets/prompts.py
+        └─> visualization/plots.py
 
-- `configs/models/`: model aliases and load settings
-- `configs/datasets/`: dataset selection and sampling settings
-- `configs/experiments/`: experiment wiring, bank parameters, scoring parameters, and output locations
-- `configs/sweeps/`: documented sweep definitions
+experiments/experiment1.py
+  ├─> extraction/hidden_states.py
+  ├─> metrics/divergences.py
+  └─> metrics/scoring.py
 
-Implemented now:
+datasets/truthfulqa.py
+  └─> datasets/base.py  (BaseHallucinationDataset)
 
-- `configs/models/*.yaml`
-- `configs/datasets/truthfulqa.yaml`
-- `configs/experiments/exp01_truthfulqa_baseline.yaml`
+pipeline/cache.py            (independent — no model dependencies)
+utils/env.py                 (independent — reads YAML configs)
+utils/tracking.py            (independent — filesystem + git)
+```
 
-Documented placeholders:
+## Module Responsibilities
 
-- non-TruthfulQA dataset configs
-- experiments `exp02` through `exp05`
+| Module | Responsibility |
+|--------|---------------|
+| `models/loader.py` | Loads HuggingFace causal LMs with 4-bit quantization, resolves architecture-specific backbone and layers |
+| `models/profiles.py` | Predefined profiles (Qwen, Phi, Mistral, Llama) with layer count, hidden dim, and 4-bit safety flags |
+| `extraction/memory_bank.py` | Extracts MLP weight matrices as per-layer memory banks (gate, up, down, composites) |
+| `extraction/hidden_states.py` | Tokenises Q+sep+A, runs forward pass, pools hidden states per segment. Supports single and batched modes |
+| `metrics/hopfield.py` | Modern Hopfield energy primitive: cosine/dot similarity, softmax retrieval, entropy metrics |
+| `metrics/divergences.py` | KL, JS, Hellinger primitives + layer-wise divergence computation comparing two states against the same bank |
+| `metrics/scoring.py` | Aggregates per-layer divergence arrays into a scalar hallucination score |
+| `datasets/base.py` | Abstract base class and DataSample dataclass for uniform dataset interface |
+| `datasets/truthfulqa.py` | TruthfulQA adapter producing paired factual/hallucinated DataSamples |
+| `datasets/prompts.py` | Loads standalone JSON prompt files for decoupled hidden-state extraction |
+| `experiments/experiment1.py` | Orchestrates the factual-vs-hallucinated comparison experiment |
+| `pipeline/stages.py` | Five decoupled stages callable from CLI or programmatically |
+| `pipeline/cache.py` | CacheManager with parameter-encoded filenames, supports .pt, .json, .parquet |
+| `utils/env.py` | Auto-detects local vs HPC environment, loads YAML configs |
+| `utils/tracking.py` | ExperimentTracker: config snapshots, git info, incremental metrics, replay |
+| `utils/io.py` | Save/load for torch and JSON artifacts |
+| `utils/logging.py` | Structured logging under the hopfield_llm namespace |
+| `visualization/plots.py` | Bar charts (score by category), line plots (metrics by layer) |
+| `cli/run.py` | Argparse CLI with subcommands for each pipeline stage |
 
-## Local vs HPC Workflow
+## Key Design Decisions
 
-Local workflow:
+**Layer indexing**: Memory banks use 0-indexed keys (matching `enumerate(llm.layers)`). Hidden states use 1-indexed layer numbers (matching HuggingFace's `output_hidden_states` convention where index 0 is the embedding layer). The `align_banks_to_layers()` function in `extraction/hidden_states.py` bridges this gap.
 
-- activate the environment
-- install editable package
-- run `./scripts/run_exp01.sh`
+**Batched extraction**: `extract_hidden_states_batch()` pads variable-length sequences and processes them in a single forward pass. This is the primary parallelisation mechanism — the forward pass accounts for 99%+ of total runtime.
 
-HPC workflow:
+**Cache-first pipeline**: Each stage checks for existing artifacts before recomputing. This is critical for the HPC workflow where forward passes run in separate SLURM jobs.
 
-- activate micromamba inside the job
-- export `PYTHONPATH=$REPO_ROOT/src`
-- launch `scripts/slurm/exp01.slurm`
+**Environment abstraction**: All environment-specific configuration (VRAM limits, batch sizes, paths) lives in YAML files under `configs/environments/`. Business logic has no `if local / if hpc` branches.
 
-The Slurm wrappers avoid hardcoded cluster-specific paths and expect `REPO_ROOT` plus an existing environment.
+## Artifact Formats
+
+| Artifact | Format | Contents |
+|----------|--------|----------|
+| Memory bank | `.pt` (torch) | `{artifact_type, model, bank_name, normalize, banks: {layer: Tensor[K,D]}, metadata}` |
+| Hidden states | `.pt` (torch) | `{artifact_type, model, pooling, samples: [{id, mode, h_question, h_answer, ...}]}` |
+| Scores | `.pt` (torch) | `{artifact_type, params, samples: [{id, metrics: {name: [L]}, score}], summary}` |
+| Analysis | `.json` | `{score_summary, score_by_category, score_by_label, layer_metrics}` |
+| Experiment run | directory | `config.yaml + environment.yaml + git_info.json + metrics.parquet + log.txt` |

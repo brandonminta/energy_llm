@@ -1,4 +1,9 @@
-# Audit Report — energy_llm
+# Audit Report — Pre-Refactor Baseline (energy_llm → hopfield_llm)
+
+> **Historical document.** This audit was performed on commit `5f45f6b` of the pre-refactor
+> `energy_llm` package. The refactor in commit `992aec5` restructured the codebase into
+> `src/hopfield_llm/` and addressed the issues documented below. Refer to
+> `docs/architecture.md` for the current package structure.
 
 **Date**: 2026-04-09
 **Scope**: Full codebase audit — `src/energy_llm/`, `configs/`, `scripts/`

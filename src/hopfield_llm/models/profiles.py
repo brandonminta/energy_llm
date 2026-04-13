@@ -16,16 +16,26 @@ class ModelProfile:
 MODEL_PROFILES: dict[str, ModelProfile] = {
     alias: ModelProfile(model_id=mid, L=L, D=D, safe_4bit=s4)
     for aliases, mid, L, D, s4 in [
-        (("qwen25_3b", "qwen3b", "qwen2.5-3b", "qwen2.5-3b-instruct"),
-         "Qwen/Qwen2.5-3B-Instruct", 36, 2048, True),
+        # ── 1–3 B  (local + HPC) ─────────────────────────────────────────────
         (("qwen25_1_5b", "qwen15b"),
          "Qwen/Qwen2.5-1.5B-Instruct", 28, 1536, True),
+        (("qwen25_3b", "qwen3b", "qwen2.5-3b", "qwen2.5-3b-instruct"),
+         "Qwen/Qwen2.5-3B-Instruct", 36, 2048, True),
         (("phi3_mini", "phi3mini"),
          "microsoft/Phi-3-mini-4k-instruct", 32, 3072, True),
-        (("mistral7b",),
-         "mistralai/Mistral-7B-Instruct-v0.3", 32, 4096, False),
         (("llama32_3b", "llama3b"),
          "meta-llama/Llama-3.2-3B-Instruct", 28, 3072, True),
+        (("gemma2_2b", "gemma2b"),
+         "google/gemma-2-2b-it", 26, 2304, True),
+        # ── 7–9 B  (HPC recommended, 4-bit fits A100 20 GB) ──────────────────
+        (("qwen25_7b", "qwen7b"),
+         "Qwen/Qwen2.5-7B-Instruct", 28, 3584, True),
+        (("mistral7b",),
+         "mistralai/Mistral-7B-Instruct-v0.3", 32, 4096, False),
+        (("llama31_8b", "llama8b"),
+         "meta-llama/Llama-3.1-8B-Instruct", 32, 4096, True),
+        (("gemma2_9b", "gemma9b"),
+         "google/gemma-2-9b-it", 42, 3584, True),
     ]
     for alias in aliases
 }

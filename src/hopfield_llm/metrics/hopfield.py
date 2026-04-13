@@ -1,9 +1,8 @@
-"""Modern Hopfield energy computation."""
+"""Modern Hopfield energy over MLP h_pre activations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -11,98 +10,81 @@ import torch.nn.functional as F
 
 @dataclass
 class LayerEnergyResult:
-    energy: float
-    retrieval_entropy: float
-    normalized_entropy: float
-    top_activation: float
-    mean_activation: float
-    n_active_memories: int
-    lse: float
-    K: int
-    softmax_w: torch.Tensor          # [K] on CPU
-    similarities: torch.Tensor | None = None  # [K] on CPU if requested
+    energy:       float
+    entropy:      float
+    norm_entropy: float
+    lse:          float
+    quadratic:    float
+    top_act:      float
+    n_active:     int
 
 
 def hopfield_energy_mlp(
-    xi: torch.Tensor,
-    W_keys: torch.Tensor,
+    h_pre: torch.Tensor,
+    W_down: torch.Tensor,
     beta: float = 15.0,
-    active_threshold: float = 0.1,
-    energy_mode: Literal["cosine", "dot"] = "cosine",
-    return_similarities: bool = False,
+    threshold: float = 0.1,
+    energy_mode: str = "dot",
 ) -> LayerEnergyResult:
-    """Compute Modern Hopfield energy for a query state against a memory bank.
+    """Compute Modern Hopfield energy for h_pre against W_down.
 
     Args:
-        xi: Query hidden state, shape [D].
-        W_keys: Memory bank, shape [K, D].
+        h_pre: Pre-projection MLP activation, shape [d_m].
+              Captured as ``args[0]`` from a forward_pre_hook on down_proj.
+        W_down: Down-projection weight matrix, shape [d, d_m].
         beta: Inverse temperature (sharpness of retrieval).
-        active_threshold: Similarity threshold for counting active memories.
-        energy_mode: 'cosine' (normalised) or 'dot' (raw).
-        return_similarities: Include raw similarity vector in result.
+        threshold: Activation threshold for counting active neurons.
+        energy_mode: 'dot' (default) or 'cosine'.
 
     Returns:
-        LayerEnergyResult with energy, entropy, and activation metrics.
+        LayerEnergyResult with scalar metrics.
     """
-    if xi.ndim != 1:
-        raise ValueError(f"xi must be 1D [D], got shape={tuple(xi.shape)}")
-    if W_keys.ndim != 2:
-        raise ValueError(f"W_keys must be 2D [K, D], got shape={tuple(W_keys.shape)}")
-    if W_keys.shape[1] != xi.shape[0]:
+    if h_pre.ndim != 1:
+        raise ValueError(f"h_pre must be 1D [d_m], got shape={tuple(h_pre.shape)}")
+    if W_down.ndim != 2:
+        raise ValueError(f"W_down must be 2D [d, d_m], got shape={tuple(W_down.shape)}")
+    if W_down.shape[1] != h_pre.shape[0]:
         raise ValueError(
-            f"Shape mismatch: W_keys={tuple(W_keys.shape)} vs xi={tuple(xi.shape)}"
+            f"Shape mismatch: W_down={tuple(W_down.shape)}, h_pre={tuple(h_pre.shape)}"
         )
 
-    xi = xi.to(torch.float32)
-    W_keys = W_keys.to(torch.float32)
-    K = W_keys.shape[0]
+    h_pre = h_pre.to(torch.float32)
+    W_down = W_down.to(torch.float32)
+
+    K = W_down.shape[0]  # = d, output dim of down_proj
     if K <= 0:
-        raise ValueError("W_keys must contain at least one memory (K > 0)")
+        raise ValueError("W_down must have at least one row (d > 0)")
 
-    logK_over_beta = float(
-        torch.log(torch.tensor(float(K), dtype=torch.float32)) / beta
-    )
-
-    if energy_mode == "cosine":
-        xi_eff = F.normalize(xi, dim=0)
-        W_eff = F.normalize(W_keys, dim=1)
-        quadratic_term = 0.5
-        C = logK_over_beta + 0.5
-    elif energy_mode == "dot":
-        xi_eff = xi
-        W_eff = W_keys
-        quadratic_term = 0.5 * float(xi.pow(2).sum())
-        C = logK_over_beta
+    if energy_mode == "dot":
+        s = W_down @ h_pre                        # [d]
+        quadratic = 0.5 * float(h_pre.pow(2).sum())
+    elif energy_mode == "cosine":
+        h_norm = F.normalize(h_pre, dim=0)
+        s = W_down @ h_norm                       # [d]
+        quadratic = 0.5
     else:
-        raise ValueError(f"Unknown energy_mode: {energy_mode}")
+        raise ValueError(f"Unknown energy_mode: '{energy_mode}'. Use 'dot' or 'cosine'.")
 
-    v = W_eff @ xi_eff
-    lse_t = torch.logsumexp(beta * v, dim=0) / beta
-    lse = float(lse_t)
-    energy = float(-lse + quadratic_term + C)
+    logK_over_beta = float(torch.tensor(float(K)).log() / beta)
+    lse = float(torch.logsumexp(beta * s, dim=0) / beta)
+    energy = -lse + quadratic + logK_over_beta
 
-    softmax_w = F.softmax(beta * v, dim=0)
+    softmax_w = F.softmax(beta * s, dim=0)
     entropy_t = -(softmax_w.clamp_min(1e-9).log() * softmax_w).sum()
-    retrieval_entropy = float(entropy_t)
-    normalized_entropy = (
-        float(entropy_t / torch.log(torch.tensor(float(K), dtype=torch.float32)))
-        if K > 1
-        else 0.0
+    entropy = float(entropy_t)
+    norm_entropy = (
+        float(entropy_t / torch.tensor(float(K)).log()) if K > 1 else 0.0
     )
 
-    top_activation = float(v.max())
-    mean_activation = float(v.mean())
-    n_active_memories = int((v > active_threshold).sum())
+    top_act = float(s.max())
+    n_active = int((s > threshold).sum())
 
     return LayerEnergyResult(
         energy=energy,
-        retrieval_entropy=retrieval_entropy,
-        normalized_entropy=normalized_entropy,
-        top_activation=top_activation,
-        mean_activation=mean_activation,
-        n_active_memories=n_active_memories,
+        entropy=entropy,
+        norm_entropy=norm_entropy,
         lse=lse,
-        K=K,
-        softmax_w=softmax_w.detach().cpu(),
-        similarities=v.detach().cpu() if return_similarities else None,
+        quadratic=quadratic,
+        top_act=top_act,
+        n_active=n_active,
     )

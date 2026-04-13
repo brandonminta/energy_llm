@@ -1,0 +1,7 @@
+model_alias: gemma2_9b
+model_id: google/gemma-2-9b-it
+load_in_4bit: true
+trust_remote_code: false
+output_hidden_states: true
+device: null
+notes: "HPC only (A100 20 GB). 9B, 42 layers, D=3584. ~5.5 GB in 4-bit NF4. Requires HuggingFace access grant."

@@ -1,41 +1,26 @@
 #!/usr/bin/env bash
-# Run the full 5-stage pipeline for each model.
+# Run trajectory for multiple models sequentially on one machine.
+# For HPC, submit one jobs/submit_pipeline.sh per model instead.
+#
+# Usage: DATASET=triviaqa ./scripts/run_multi_model.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 
-BANK="${BANK:-gate}"
-PROMPTS="${PROMPTS:?Set PROMPTS=path/to/truthfulqa_paired.json}"
+DATASET="${DATASET:-triviaqa}"
+MODELS="${MODELS:-qwen25_3b phi3_mini llama32_3b}"
 
-for model in qwen25_3b phi3_mini llama32_3b; do
-    echo "[multi_model] model=${model}: running full pipeline..."
-    OUT_DIR="runs/multi_model/${model}"
-    BANK_PATH="data/cache/banks/${model}__${BANK}.pt"
-    HIDDEN_PATH="data/cache/hidden_states/${model}__mean.pt"
+for model in $MODELS; do
+    echo "=== $model / $DATASET ==="
+    BANKS="data/cache/banks/${model}_banks.pt"
+    OUT="runs/multi_model/${model}_${DATASET}"
+    mkdir -p data/cache/banks "$OUT"
 
-    python -m hopfield_llm.cli.run build-memory \
-        --model "$model" \
-        --output "$BANK_PATH" \
-        --bank "$BANK"
-
-    python -m hopfield_llm.cli.run extract-hidden \
-        --memory "$BANK_PATH" \
-        --prompts "$PROMPTS" \
-        --output "$HIDDEN_PATH"
-
-    python -m hopfield_llm.cli.run score \
-        --memory "$BANK_PATH" \
-        --hidden "$HIDDEN_PATH" \
-        --output "${OUT_DIR}/scores.pt" \
-        "$@"
-
-    python -m hopfield_llm.cli.run analyze \
-        --scores "${OUT_DIR}/scores.pt" \
-        --output "${OUT_DIR}/analysis.json"
-
-    python -m hopfield_llm.cli.run visualize \
-        --analysis "${OUT_DIR}/analysis.json" \
-        --output "${OUT_DIR}/plots"
+    hopfield-llm build-banks --model "$model" --output "$BANKS"
+    hopfield-llm run-trajectory \
+        --model "$model" --dataset "$DATASET" \
+        --banks "$BANKS" --output "$OUT"
+    echo "  → $OUT"
 done

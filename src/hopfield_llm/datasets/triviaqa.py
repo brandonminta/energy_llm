@@ -1,4 +1,4 @@
-"""TruthfulQA dataset adapter."""
+"""TriviaQA dataset adapter."""
 
 from __future__ import annotations
 
@@ -10,13 +10,14 @@ from datasets import load_dataset
 from hopfield_llm.datasets.base import BaseDataset, DataSample
 from hopfield_llm.utils.logging import get_logger
 
-log = get_logger("datasets.truthfulqa")
+log = get_logger("datasets.triviaqa")
 
 
-class TruthfulQADataset(BaseDataset):
-    """Load TruthfulQA (generation split) and produce one DataSample per question.
+class TriviaQADataset(BaseDataset):
+    """Load TriviaQA (rc config, validation split) and produce one DataSample per question.
 
-    Each sample's ``gold_answers`` contains all correct answers for the question.
+    HuggingFace source: ``mandarjoshi/trivia_qa``, config ``rc``.
+    Each sample's ``gold_answers`` is the list of normalised answer aliases.
     """
 
     def __init__(
@@ -32,7 +33,7 @@ class TruthfulQADataset(BaseDataset):
 
     @property
     def name(self) -> str:
-        return "truthfulqa"
+        return "triviaqa"
 
     def __iter__(self) -> Iterator[DataSample]:
         return iter(self._samples)
@@ -42,27 +43,24 @@ class TruthfulQADataset(BaseDataset):
 
     def _load(self, verbose: bool) -> None:
         rng = random.Random(self._seed)
-        raw = load_dataset("truthfulqa/truthful_qa", "generation", split="validation")
+        raw = load_dataset("mandarjoshi/trivia_qa", "rc", split="validation")
 
         samples: list[DataSample] = []
         skipped = 0
 
         for idx, row in enumerate(raw):
             question = row["question"].strip()
-            best = row["best_answer"].strip()
-            correct = [a.strip() for a in row["correct_answers"] if a.strip()]
-
-            gold = correct if correct else []
-            if best and best not in gold:
-                gold = [best] + gold
+            # answer.aliases contains all valid answer strings
+            aliases: list[str] = row.get("answer", {}).get("aliases", [])
+            gold = [a.strip() for a in aliases if a.strip()]
 
             if not gold:
                 skipped += 1
                 continue
 
             samples.append(DataSample(
-                id=f"truthfulqa_{idx}",
-                source="truthfulqa",
+                id=f"triviaqa_{idx}",
+                source="triviaqa",
                 question=question,
                 gold_answers=gold,
             ))
@@ -76,6 +74,6 @@ class TruthfulQADataset(BaseDataset):
 
         if verbose:
             log.info(
-                "TruthfulQA: loaded %d samples (skipped %d with no gold answers)",
+                "TriviaQA: loaded %d samples (skipped %d with no gold answers)",
                 len(self._samples), skipped,
             )

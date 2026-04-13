@@ -1,0 +1,7 @@
+model_alias: gemma2_2b
+model_id: google/gemma-2-2b-it
+load_in_4bit: true
+trust_remote_code: false
+output_hidden_states: true
+device: null
+notes: "Local + HPC. 2B, 26 layers, D=2304. ~1.5 GB in 4-bit NF4. Requires HuggingFace access grant."

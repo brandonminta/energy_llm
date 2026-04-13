@@ -1,342 +1,267 @@
-"""Five decoupled pipeline stages.
+"""Two-stage pipeline: bank extraction and trajectory collection.
 
-Each stage can run independently as long as its upstream artifacts exist.
-
-    Stage 1: build_memory_bank   — model weights → .pt bank artifact
-    Stage 2: extract_hidden      — forward passes → .pt hidden-state artifact
-    Stage 3: score               — energy + divergences → .pt score artifact
-    Stage 4: analyze             — aggregate statistics → .json analysis
-    Stage 5: visualize           — plots from analysis JSON
+    Stage 1: build_banks   — W_down weights → .pt artifact
+    Stage 2: run_trajectory — prefill + generation passes → .npz + .json per sample
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
+import json
+import traceback
 from pathlib import Path
-from typing import Any, Literal
 
 import numpy as np
+from tqdm import tqdm
 
-from hopfield_llm.datasets.prompts import load_prompt_records
-from hopfield_llm.extraction.hidden_states import (
-    align_banks_to_layers,
-    extract_segment_hidden_states,
-    segment_hidden_states_to_dict,
-)
+from hopfield_llm.datasets.nq import NaturalQuestionsDataset
+from hopfield_llm.datasets.triviaqa import TriviaQADataset
+from hopfield_llm.datasets.truthfulqa import TruthfulQADataset
+from hopfield_llm.extraction.generation import run_generation_pass
 from hopfield_llm.extraction.memory_bank import extract_mlp_memory_bank
-from hopfield_llm.metrics.divergences import (
-    compute_layer_divergences,
-    compute_layer_energy_profile,
-)
-from hopfield_llm.metrics.scoring import hallucination_score
+from hopfield_llm.extraction.prefill import run_prefill_pass
 from hopfield_llm.models.loader import HFLLM
-from hopfield_llm.utils.io import (
-    load_json_artifact,
-    load_torch_artifact,
-    save_json_artifact,
-    save_torch_artifact,
-)
+from hopfield_llm.utils.io import load_torch_artifact, save_torch_artifact
 from hopfield_llm.utils.logging import get_logger
-from hopfield_llm.visualization.plots import visualize_analysis
 
 log = get_logger("pipeline.stages")
 
 
 # ------------------------------------------------------------------
-# Stage 1 — Memory bank extraction
+# Stage 1 — Bank extraction
 # ------------------------------------------------------------------
 
 
-def build_memory_bank(
+def build_banks(
     model: str,
     output: str | Path,
-    bank: str = "gate",
-    normalize: bool = False,
-    strict: bool = True,
     device: str | None = None,
     load_in_4bit: bool = True,
 ) -> Path:
-    """Extract MLP memory banks and save as a torch artifact."""
+    """Extract W_down[l] for all layers and save as a torch artifact.
+
+    Saves ``{model_alias}_banks.pt`` (or the path specified by *output*).
+    Banks are 0-indexed: ``banks[l]`` has shape ``[d, d_m]``.
+
+    Args:
+        model: Model alias or HuggingFace model ID.
+        output: Output path for the .pt artifact.
+        device: Target device (None = auto).
+        load_in_4bit: Use 4-bit NF4 quantization when available.
+
+    Returns:
+        Path to the saved artifact.
+    """
     llm = HFLLM(
-        model_id=model, device=device, load_in_4bit=load_in_4bit,
-        output_hidden_states=False,  # not needed for weight extraction
+        model_id=model,
+        device=device,
+        load_in_4bit=load_in_4bit,
+        output_hidden_states=False,
     )
-    banks, metadata = extract_mlp_memory_bank(
-        llm, bank=bank, normalize=normalize, strict=strict, return_metadata=True,
+    banks = extract_mlp_memory_bank(
+        llm, bank="down", normalize=False, strict=True
     )
     artifact = {
-        "artifact_type": "memory_bank",
+        "artifact_type": "banks",
         "model": llm.summary(),
-        "bank_name": bank,
-        "normalize": normalize,
         "banks": banks,
-        "metadata": metadata,
     }
     path = save_torch_artifact(artifact, output)
-    log.info("Stage 1 complete: saved bank to %s", path)
-    return path
-
-
-# ------------------------------------------------------------------
-# Stage 2 — Hidden-state extraction
-# ------------------------------------------------------------------
-
-
-def extract_hidden(
-    memory: str | Path,
-    prompts: str | Path,
-    output: str | Path,
-    pooling: Literal["mean", "last", "max", "first"] = "mean",
-    separator: str = "\n",
-    layers: list[int] | None = None,
-    device: str | None = None,
-) -> Path:
-    """Extract hidden states from prompts and save as a torch artifact."""
-    memory_artifact = load_torch_artifact(memory)
-    model_summary = memory_artifact["model"]
-    model_ref = model_summary.get("alias") or model_summary["model_id"]
-
-    llm = HFLLM(
-        model_id=model_ref, device=device,
-        load_in_4bit=model_summary.get("load_in_4bit_requested", True),
-        output_hidden_states=True,
+    log.info(
+        "build_banks: saved %d layers to %s (model=%s)",
+        len(banks), path, llm.alias,
     )
-
-    samples = []
-    records = load_prompt_records(prompts)
-    for i, record in enumerate(records):
-        sample: dict[str, Any] = {
-            "id": record["id"],
-            "mode": record["mode"],
-            "question": record["question"],
-            "category": record.get("category", "unknown"),
-            "label": record.get("label"),
-        }
-        if record["mode"] == "paired":
-            factual = extract_segment_hidden_states(
-                llm, question=record["question"], answer=record["answer_factual"],
-                separator=separator, pooling=pooling, layers=layers,
-                normalize=False, to_cpu=True,
-            )
-            hallucinated = extract_segment_hidden_states(
-                llm, question=record["question"], answer=record["answer_hallucinated"],
-                separator=separator, pooling=pooling, layers=layers,
-                normalize=False, to_cpu=True,
-            )
-            sample["answer_factual"] = record["answer_factual"]
-            sample["answer_hallucinated"] = record["answer_hallucinated"]
-            sample["factual"] = segment_hidden_states_to_dict(factual)
-            sample["hallucinated"] = segment_hidden_states_to_dict(hallucinated)
-        else:
-            hidden = extract_segment_hidden_states(
-                llm, question=record["question"], answer=record["answer"],
-                separator=separator, pooling=pooling, layers=layers,
-                normalize=False, to_cpu=True,
-            )
-            sample["answer"] = record["answer"]
-            sample["hidden"] = segment_hidden_states_to_dict(hidden)
-        samples.append(sample)
-        if (i + 1) % 50 == 0:
-            log.info("Extracted %d/%d samples", i + 1, len(records))
-
-    artifact = {
-        "artifact_type": "hidden_states",
-        "model": llm.summary(),
-        "memory_summary": {
-            "bank_name": memory_artifact.get("bank_name"),
-            "normalize": memory_artifact.get("normalize"),
-        },
-        "pooling": pooling,
-        "separator": separator,
-        "layers": layers,
-        "samples": samples,
-    }
-    path = save_torch_artifact(artifact, output)
-    log.info("Stage 2 complete: saved %d samples to %s", len(samples), path)
     return path
 
 
 # ------------------------------------------------------------------
-# Stage 3 — Scoring
+# Stage 2 — Trajectory collection
 # ------------------------------------------------------------------
 
 
-def score_hidden_states(
-    memory: str | Path,
-    hidden: str | Path,
+def run_trajectory(
+    model: str,
+    dataset: str,
+    banks: str | Path,
     output: str | Path,
     beta: float = 15.0,
-    energy_mode: Literal["cosine", "dot"] = "cosine",
-    active_threshold: float = 0.1,
-    score_metric: str = "js",
-    score_aggregation: Literal["mean", "max", "weighted"] = "mean",
-    score_use_absolute: bool = False,
+    threshold: float = 0.1,
+    energy_mode: str = "dot",
+    max_samples: int | None = None,
+    seed: int = 42,
+    max_new_tokens: int = 50,
+    diagnostic_subset: int = 20,
+    shard_id: int = 0,
+    num_shards: int = 1,
+    device: str | None = None,
+    load_in_4bit: bool = True,
 ) -> Path:
-    """Compute divergence scores from cached hidden states and banks."""
-    memory_artifact = load_torch_artifact(memory)
-    hidden_artifact = load_torch_artifact(hidden)
-    banks = memory_artifact["banks"]
+    """Run prefill + generation for each sample; persist .npz and .json artifacts.
 
-    scored_samples = []
-    for sample in hidden_artifact["samples"]:
-        if sample["mode"] == "paired":
-            layer_indices = sample["factual"]["layer_indices"]
-            aligned = align_banks_to_layers(banks, layer_indices)
-            div = compute_layer_divergences(
-                h_ref=sample["factual"]["h_answer"],
-                h_cmp=sample["hallucinated"]["h_answer"],
-                mlp_keys=aligned, beta=beta, energy_mode=energy_mode,
-                active_threshold=active_threshold,
-                reference_label="factual", target_label="hallucinated",
+    For each sample the following files are written to *output*:
+        ``{sample_id}.npz``  — compressed metric arrays (prefill + generation)
+        ``{sample_id}.json`` — metadata (question, gold_answers, generated_text, …)
+
+    For the first *diagnostic_subset* samples (default 20) an additional
+        ``{sample_id}_hpre.npz`` — raw prefill h_pre, shape [L, d_m]
+    is saved for diagnostic inspection.
+
+    Sharding: set ``num_shards > 1`` and pass each worker a unique ``shard_id``
+    in ``[0, num_shards)`` to split the dataset across SLURM array tasks.
+    All shards write to the same *output* directory (per-sample filenames are
+    unique so there are no collisions).
+
+    Args:
+        model: Model alias or HuggingFace model ID.
+        dataset: Dataset name — 'triviaqa', 'nq', or 'truthfulqa'.
+        banks: Path to the .pt artifact produced by build_banks.
+        output: Directory for output artifacts.
+        beta: Hopfield inverse temperature.
+        threshold: Active-neuron threshold.
+        energy_mode: 'dot' (default) or 'cosine'.
+        max_samples: Cap on dataset size before sharding (None = all).
+        seed: RNG seed for deterministic subsampling.
+        max_new_tokens: Maximum tokens to generate per sample.
+        diagnostic_subset: Number of samples (shard-local index) for which
+            raw h_pre tensors are saved.
+        shard_id: 0-indexed shard index for this worker.
+        num_shards: Total shards; 1 = no sharding (all samples).
+        device: Target device (None = auto).
+        load_in_4bit: Use 4-bit NF4 quantization when available.
+
+    Returns:
+        Path to the output directory.
+    """
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load banks
+    banks_artifact = load_torch_artifact(banks)
+    banks_dict: dict[int, object] = banks_artifact["banks"]
+    model_summary = banks_artifact["model"]
+    model_alias = model_summary.get("alias") or model
+
+    # Load dataset then shard (stride-based so load is even across GPUs)
+    dataset_name = dataset.lower()
+    if dataset_name == "triviaqa":
+        ds = TriviaQADataset(max_samples=max_samples, seed=seed)
+    elif dataset_name == "nq":
+        ds = NaturalQuestionsDataset(max_samples=max_samples, seed=seed)
+    elif dataset_name == "truthfulqa":
+        ds = TruthfulQADataset(max_samples=max_samples, seed=seed)
+    else:
+        raise ValueError(
+            f"Unknown dataset: '{dataset}'. Use 'triviaqa', 'nq', or 'truthfulqa'."
+        )
+
+    samples = list(ds)
+    if num_shards > 1:
+        samples = samples[shard_id::num_shards]
+
+    log.info(
+        "run_trajectory: %d samples (shard %d/%d), model=%s, dataset=%s",
+        len(samples), shard_id, num_shards, model_alias, dataset_name,
+    )
+
+    # Load model
+    llm = HFLLM(
+        model_id=model,
+        device=device,
+        load_in_4bit=load_in_4bit,
+        output_hidden_states=False,
+    )
+    L = llm.n_layers
+
+    n_ok = 0
+    n_err = 0
+
+    bar = tqdm(
+        samples,
+        desc=f"trajectory[{shard_id}/{num_shards}]",
+        unit="sample",
+        dynamic_ncols=True,
+    )
+
+    for i, sample in enumerate(bar):
+        save_hpre = i < diagnostic_subset
+        try:
+            # Prefill pass
+            prefill_out = run_prefill_pass(
+                llm, sample.question, banks_dict,
+                beta=beta, threshold=threshold, energy_mode=energy_mode,
+                return_h_pre=save_hpre,
             )
-            metrics = {
-                "kl_fwd": div.kl_fwd.tolist(),
-                "kl_rev": div.kl_rev.tolist(),
-                "js": div.js.tolist(),
-                "hellinger": div.hellinger.tolist(),
-                "delta_entropy": div.delta_entropy.tolist(),
-                "delta_norm_entropy": div.delta_norm_entropy.tolist(),
-                "delta_energy": div.delta_energy.tolist(),
-                "delta_top_activation": div.delta_top_activation.tolist(),
-                "delta_mean_activation": div.delta_mean_activation.tolist(),
+            if save_hpre:
+                prefill_result, h_pre_raw = prefill_out
+            else:
+                prefill_result = prefill_out
+                h_pre_raw = None
+
+            # Generation pass
+            gen_result = run_generation_pass(
+                llm, sample.question, banks_dict,
+                beta=beta, threshold=threshold, energy_mode=energy_mode,
+                max_new_tokens=max_new_tokens,
+            )
+
+            # Save .npz
+            np.savez_compressed(
+                out_dir / f"{sample.id}.npz",
+                prefill_energy=prefill_result.energy,
+                prefill_entropy=prefill_result.entropy,
+                prefill_norm_entropy=prefill_result.norm_entropy,
+                prefill_lse=prefill_result.lse,
+                prefill_quadratic=prefill_result.quadratic,
+                prefill_top_act=prefill_result.top_act,
+                prefill_n_active=prefill_result.n_active,
+                gen_energy=gen_result.energy,
+                gen_entropy=gen_result.entropy,
+                gen_norm_entropy=gen_result.norm_entropy,
+                gen_lse=gen_result.lse,
+                gen_quadratic=gen_result.quadratic,
+                gen_top_act=gen_result.top_act,
+                gen_n_active=gen_result.n_active,
+                token_ids=gen_result.token_ids,
+            )
+
+            # Save .json
+            meta = {
+                "id": sample.id,
+                "source": sample.source,
+                "question": sample.question,
+                "gold_answers": sample.gold_answers,
+                "generated_text": gen_result.generated_text,
+                "model": model_alias,
+                "n_layers": L,
+                "n_tokens_generated": int(len(gen_result.token_ids)),
             }
-            score = hallucination_score(
-                div, metric=score_metric, aggregation=score_aggregation,
-                use_absolute=score_use_absolute,
+            with open(out_dir / f"{sample.id}.json", "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=2, ensure_ascii=False)
+
+            # Save diagnostic h_pre
+            if save_hpre and h_pre_raw is not None:
+                np.savez_compressed(
+                    out_dir / f"{sample.id}_hpre.npz",
+                    h_pre=h_pre_raw,
+                )
+
+            n_ok += 1
+            bar.set_postfix(ok=n_ok, err=n_err, refresh=False)
+
+        except Exception as exc:
+            n_err += 1
+            bar.set_postfix(ok=n_ok, err=n_err, refresh=False)
+            # Log the error type, message, and the single most relevant stack frame
+            tb = traceback.extract_tb(exc.__traceback__)
+            origin = tb[-1] if tb else None
+            loc = f"{origin.filename.split('/')[-1]}:{origin.lineno}" if origin else "?"
+            log.warning(
+                "SKIP %s — %s: %s  (at %s)",
+                sample.id, type(exc).__name__, exc, loc,
             )
-        else:
-            layer_indices = sample["hidden"]["layer_indices"]
-            aligned = align_banks_to_layers(banks, layer_indices)
-            profile = compute_layer_energy_profile(
-                h_state=sample["hidden"]["h_answer"],
-                mlp_keys=aligned, beta=beta, energy_mode=energy_mode,
-                active_threshold=active_threshold,
-            )
-            metrics = {k: v.tolist() for k, v in profile.items()}
-            score = None
 
-        scored_samples.append({
-            "id": sample["id"],
-            "mode": sample["mode"],
-            "question": sample["question"],
-            "category": sample.get("category", "unknown"),
-            "label": sample.get("label"),
-            "layer_indices": layer_indices,
-            "metrics": metrics,
-            "score": score,
-        })
-
-    score_values = [s["score"] for s in scored_samples if s["score"] is not None]
-    artifact = {
-        "artifact_type": "scores",
-        "memory_summary": {
-            "bank_name": memory_artifact.get("bank_name"),
-            "model": memory_artifact.get("model", {}),
-        },
-        "hidden_summary": {
-            "pooling": hidden_artifact.get("pooling"),
-            "layers": hidden_artifact.get("layers"),
-        },
-        "params": {
-            "beta": beta, "energy_mode": energy_mode,
-            "active_threshold": active_threshold,
-            "score_metric": score_metric,
-            "score_aggregation": score_aggregation,
-            "score_use_absolute": score_use_absolute,
-        },
-        "samples": scored_samples,
-        "summary": {
-            "n_samples": len(scored_samples),
-            "n_scored": len(score_values),
-            "score_mean": (
-                None if not score_values
-                else float(sum(score_values) / len(score_values))
-            ),
-        },
-    }
-    path = save_torch_artifact(artifact, output)
-    log.info("Stage 3 complete: scored %d samples → %s", len(scored_samples), path)
-    return path
-
-
-# ------------------------------------------------------------------
-# Stage 4 — Analysis
-# ------------------------------------------------------------------
-
-
-def _summarize_scalar(values: list[float]) -> dict[str, float | int] | None:
-    if not values:
-        return None
-    arr = np.asarray(values, dtype=np.float64)
-    return {
-        "count": int(arr.size),
-        "mean": float(arr.mean()),
-        "std": float(arr.std(ddof=0)),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
-    }
-
-
-def analyze_scores(scores: str | Path, output: str | Path) -> Path:
-    """Aggregate score artifact into dataset-level statistics."""
-    scores_artifact = load_torch_artifact(scores)
-    samples = scores_artifact.get("samples", [])
-
-    scalar_scores = [
-        float(s["score"]) for s in samples if s.get("score") is not None
-    ]
-
-    by_category: dict[str, list[float]] = defaultdict(list)
-    by_label: dict[str, list[float]] = defaultdict(list)
-    for sample in samples:
-        score = sample.get("score")
-        if score is None:
-            continue
-        by_category[str(sample.get("category", "unknown"))].append(float(score))
-        by_label[str(sample.get("label"))].append(float(score))
-
-    metric_buckets: dict[str, list[np.ndarray]] = defaultdict(list)
-    for sample in samples:
-        for name, values in sample.get("metrics", {}).items():
-            if isinstance(values, list):
-                metric_buckets[name].append(np.asarray(values, dtype=np.float64))
-
-    layer_metrics = {}
-    for name, arrays in metric_buckets.items():
-        if not arrays:
-            continue
-        stacked = np.vstack(arrays)
-        layer_metrics[name] = {
-            "mean": np.nanmean(stacked, axis=0).tolist(),
-            "std": np.nanstd(stacked, axis=0).tolist(),
-            "n_samples": int(stacked.shape[0]),
-        }
-
-    analysis = {
-        "artifact_type": "analysis",
-        "n_samples": len(samples),
-        "score_summary": _summarize_scalar(scalar_scores),
-        "score_by_category": {
-            k: _summarize_scalar(v) for k, v in sorted(by_category.items())
-        },
-        "score_by_label": {
-            k: _summarize_scalar(v) for k, v in sorted(by_label.items())
-        },
-        "layer_metrics": layer_metrics,
-        "source_summary": scores_artifact.get("summary", {}),
-    }
-    path = save_json_artifact(analysis, output)
-    log.info("Stage 4 complete: analysis → %s", path)
-    return path
-
-
-# ------------------------------------------------------------------
-# Stage 5 — Visualization
-# ------------------------------------------------------------------
-
-
-def visualize(analysis: str | Path, output: str | Path) -> Path:
-    """Render plots from analysis JSON."""
-    out = visualize_analysis(analysis, output)
-    log.info("Stage 5 complete: plots → %s", out)
-    return out
+    bar.close()
+    log.info(
+        "run_trajectory: finished — %d ok, %d errors → %s",
+        n_ok, n_err, out_dir,
+    )
+    return out_dir

@@ -1,56 +1,39 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=hopfield-models
-#SBATCH --output=slurm-models-%j.out
-#SBATCH --gres=gpu:1
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:a100_2g.10gb:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
-
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/models_%j.out
+#SBATCH --error=logs/models_%j.err
+#
+# Sequential model sweep on a single GPU.
+# For concurrent model runs submit one jobs/submit_pipeline.sh per model.
+#
 set -euo pipefail
 
+DATASET="${DATASET:-triviaqa}"
+MODELS="${MODELS:-qwen25_3b phi3_mini llama32_3b}"
+
 REPO_ROOT="${REPO_ROOT:-$SLURM_SUBMIT_DIR}"
-cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
+export HOPFIELD_ENV=hpc
 
 if [ -f "$HOME/micromamba/etc/profile.d/micromamba.sh" ]; then
     source "$HOME/micromamba/etc/profile.d/micromamba.sh"
     micromamba activate "${MAMBA_ENV_NAME:-hopfield-llm}"
 fi
 
-export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
+for model in $MODELS; do
+    BANKS="$SCRATCH/hopfield_cache/banks/${model}_banks.pt"
+    OUT="$SCRATCH/hopfield_results/${model}/${DATASET}"
+    mkdir -p "$OUT" logs
 
-PROMPTS="${PROMPTS:?Set PROMPTS=path/to/truthfulqa_paired.json}"
-BANK="${BANK:-gate}"
-
-for model in qwen25_3b phi3_mini llama32_3b; do
-    echo "[sweep_models] model=${model}..."
-    OUT_DIR="runs/slurm_multi_model/${model}"
-    BANK_PATH="data/cache/banks/${model}__${BANK}.pt"
-    HIDDEN_PATH="data/cache/hidden_states/${model}__mean.pt"
-
-    python -m hopfield_llm.cli.run build-memory \
-        --model "$model" \
-        --output "$BANK_PATH" \
-        --bank "$BANK"
-
-    python -m hopfield_llm.cli.run extract-hidden \
-        --memory "$BANK_PATH" \
-        --prompts "$PROMPTS" \
-        --output "$HIDDEN_PATH"
-
-    python -m hopfield_llm.cli.run score \
-        --memory "$BANK_PATH" \
-        --hidden "$HIDDEN_PATH" \
-        --output "${OUT_DIR}/scores.pt" \
-        --beta 15.0 \
-        --energy-mode cosine \
-        --score-metric js \
-        --score-aggregation mean
-
-    python -m hopfield_llm.cli.run analyze \
-        --scores "${OUT_DIR}/scores.pt" \
-        --output "${OUT_DIR}/analysis.json"
-
-    python -m hopfield_llm.cli.run visualize \
-        --analysis "${OUT_DIR}/analysis.json" \
-        --output "${OUT_DIR}/plots"
+    echo "=== $model / $DATASET ==="
+    hopfield-llm build-banks --model "$model" --output "$BANKS"
+    hopfield-llm run-trajectory \
+        --model "$model" --dataset "$DATASET" \
+        --banks "$BANKS" --output "$OUT"
+    echo "  → $OUT"
 done

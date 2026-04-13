@@ -13,9 +13,11 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/outputs/
 
 # Env files
 .env
+.env.*
 
 # Build
 build/
@@ -33,19 +35,24 @@ Thumbs.db
 # Logs
 *.log
 
-# Large experiment outputs
+# Large binary artifacts — PyTorch checkpoints, numpy arrays
+*.pt
+*.npz
+
+# Trajectory outputs and cached artifacts
+data/
 artifacts/
 runs/
-data/raw/
-data/cache/
-data/results/
-data/interim/
-data/processed/
 experiments/runs/
 
-# HPC
-.env.hpc
+# SLURM job output files (written to repo root or logs/)
+slurm-*.out
+slurm-*.err
 logs/
+
+# HuggingFace model cache (if symlinked into repo)
+hf_cache/
+model_cache/
 
 # Optional cache
 .cache/

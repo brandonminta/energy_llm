@@ -1,7 +1,0 @@
-model_alias: qwen25_7b
-model_id: Qwen/Qwen2.5-7B-Instruct
-load_in_4bit: true
-trust_remote_code: true
-output_hidden_states: true
-device: null
-notes: "HPC recommended. 7B, 28 layers, D=3584. ~4 GB in 4-bit NF4."

@@ -1,6 +1,0 @@
-model_alias: phi3_mini
-model_id: microsoft/Phi-3-mini-4k-instruct
-load_in_4bit: true
-trust_remote_code: true
-output_hidden_states: true
-device: null

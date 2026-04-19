@@ -1,3 +1,0 @@
-status: placeholder
-name: exp03_pooling_ablation
-notes: Intended for comparing mean/last/max/first hidden-state pooling.

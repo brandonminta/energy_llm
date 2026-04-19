@@ -1,7 +1,0 @@
-model_alias: llama31_8b
-model_id: meta-llama/Llama-3.1-8B-Instruct
-load_in_4bit: true
-trust_remote_code: false
-output_hidden_states: true
-device: null
-notes: "HPC recommended. 8B, 32 layers, D=4096. ~5 GB in 4-bit NF4. Requires HuggingFace access grant."

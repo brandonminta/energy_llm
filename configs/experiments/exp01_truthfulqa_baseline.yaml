@@ -1,25 +1,31 @@
-name: exp01_truthfulqa_baseline
-runner: exp1_factual_vs_hallucinated
-model_config: configs/models/qwen25_3b.yaml
-dataset_config: configs/datasets/truthfulqa.yaml
-output_dir: runs/exp01_truthfulqa_baseline
-bank:
-  name: gate
-  normalize: false
-  strict: true
-representation:
-  pooling: mean
-  layers: null
-  separator: "\n"
-divergence:
-  beta: 15.0
-  energy_mode: cosine
-  active_threshold: 0.1
-score:
-  metric: js
-  aggregation: mean
-  signal_zone: null
-  use_absolute: false
-runtime:
-  skip_on_error: true
-  verbose: true
+experiment:
+  name: exp01_truthfulqa_baseline
+  description: "Baseline energy trajectory on TruthfulQA with Qwen2.5-3B"
+
+model:
+  alias: qwen25_3b           # resolved via profiles.py → Qwen/Qwen2.5-3B-Instruct
+  load_in_4bit: true
+
+dataset:
+  name: truthfulqa            # triviaqa | nq | truthfulqa
+  max_samples: null           # null = all samples
+  seed: 42
+
+trajectory:
+  beta: 15.0                  # Hopfield inverse temperature
+  threshold: 0.1              # active-neuron threshold
+  energy_mode: dot            # dot | cosine
+  max_new_tokens: 50
+  diagnostic_subset: 20       # samples with raw h_pre saved
+
+analysis:
+  divergence_metrics: [kl_fwd, js, hellinger]
+  score_metric: js            # metric for scalar hallucination score
+  score_aggregation: mean     # mean | max | weighted
+  signal_zone: null           # [start, end] layer slice or null for all
+
+sharding:
+  num_shards: 1               # 1 = no sharding; set >1 for SLURM arrays
+
+output:
+  base_dir: runs              # run dir: {base_dir}/{name}/{timestamp}_{model}_{dataset}_{hash}/

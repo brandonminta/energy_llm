@@ -7,10 +7,12 @@ from hopfield_llm.metrics.divergences import (
     kl_divergence,
 )
 from hopfield_llm.metrics.hopfield import LayerEnergyResult, hopfield_energy_mlp
+from hopfield_llm.metrics.scoring import hallucination_score
 
 __all__ = [
     "LayerDivergenceResult",
     "LayerEnergyResult",
+    "hallucination_score",
     "hellinger",
     "hopfield_energy_mlp",
     "js_divergence",

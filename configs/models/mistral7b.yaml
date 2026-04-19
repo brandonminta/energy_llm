@@ -1,6 +1,0 @@
-model_alias: mistral7b
-model_id: mistralai/Mistral-7B-Instruct-v0.3
-load_in_4bit: false
-trust_remote_code: true
-output_hidden_states: true
-device: null

@@ -1,8 +1,0 @@
-loader: truthfulqa
-split: validation
-factual_strategy: best
-hallucinated_strategy: random_incorrect
-categories: null
-max_samples: 32
-seed: 42
-verbose: true

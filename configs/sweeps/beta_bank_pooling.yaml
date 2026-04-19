@@ -1,5 +1,0 @@
-experiment_config: configs/experiments/exp01_truthfulqa_baseline.yaml
-betas: [5.0, 10.0, 15.0, 20.0]
-banks: [gate]
-poolings: [mean, last]
-notes: Documented sweep definition for the current baseline.

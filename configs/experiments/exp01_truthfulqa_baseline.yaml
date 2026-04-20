@@ -12,6 +12,7 @@ dataset:
   seed: 42
 
 trajectory:
+  bank: down                  # memory bank: gate | up | down | gate_plus_up | gate_up_concat
   beta: 15.0                  # Hopfield inverse temperature
   threshold: 0.1              # active-neuron threshold
   energy_mode: dot            # dot | cosine
@@ -28,4 +29,4 @@ sharding:
   num_shards: 1               # 1 = no sharding; set >1 for SLURM arrays
 
 output:
-  base_dir: runs              # run dir: {base_dir}/{name}/{timestamp}_{model}_{dataset}_{hash}/
+  base_dir: outputs           # run dir: {base_dir}/{name}/{timestamp}_{model}_{dataset}_{hash}/

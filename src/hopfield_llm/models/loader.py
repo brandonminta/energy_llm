@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from hopfield_llm.models.arch import resolve_backbone, resolve_layers
 from hopfield_llm.models.profiles import (
     DEFAULT_MODEL_ALIAS,
     ModelProfile,
@@ -18,6 +19,13 @@ log = get_logger("models.loader")
 
 
 class HFLLM:
+    """Thin wrapper around AutoModelForCausalLM with architecture resolution.
+
+    Resolves the backbone and layer list across different model families
+    (Qwen, Llama, Phi, Gemma, Mistral, GPT-2, GPT-NeoX) so that hooks,
+    memory banks, and query extraction work consistently.
+    """
+
     def __init__(
         self,
         model_id: str = DEFAULT_MODEL_ALIAS,
@@ -38,17 +46,15 @@ class HFLLM:
 
         self.load_in_4bit_requested = load_in_4bit
         self.load_in_4bit_effective = self._resolve_effective_4bit(
-            requested=load_in_4bit,
-            device=self.device,
-            profile=self.profile,
+            requested=load_in_4bit, device=self.device, profile=self.profile,
         )
 
         self.tokenizer = self._load_tokenizer()
         self.quant_config = self._build_quant_config()
         self.model = self._load_model()
         self.model.eval()
-        self.backbone = self._resolve_backbone()
-        self.layers = self._resolve_layers()
+        self.backbone = resolve_backbone(self.model)
+        self.layers = resolve_layers(self.backbone)
         self.hidden_size = getattr(self.model.config, "hidden_size", None)
         self.num_hidden_layers = getattr(
             self.model.config, "num_hidden_layers", len(self.layers)
@@ -85,7 +91,7 @@ class HFLLM:
             return False
         if profile is not None and not profile.safe_4bit:
             log.warning(
-                "4-bit quantization disabled: safe_4bit=False for profile '%s'.",
+                "4-bit quantization disabled: safe_4bit=False for '%s'.",
                 profile.model_id,
             )
             return False
@@ -116,6 +122,25 @@ class HFLLM:
             bnb_4bit_quant_type="nf4",
         )
 
+    def _load_model(self):
+        kwargs = dict(
+            pretrained_model_name_or_path=self.model_id,
+            output_hidden_states=self.output_hidden_states,
+            trust_remote_code=self.trust_remote_code,
+        )
+        if self.quant_config is not None:
+            kwargs["quantization_config"] = self.quant_config
+            kwargs["device_map"] = "auto"
+        else:
+            kwargs["torch_dtype"] = self.dtype
+            if self.device == "cuda":
+                kwargs["device_map"] = "auto"
+        model = AutoModelForCausalLM.from_pretrained(**kwargs)
+        if self.quant_config is None and self.device != "cuda":
+            model.to(self.device)
+        self._maybe_resize_embeddings(model)
+        return model
+
     def _maybe_resize_embeddings(self, model):
         input_emb = model.get_input_embeddings()
         n_embed = input_emb.num_embeddings
@@ -126,61 +151,6 @@ class HFLLM:
             needs_resize = True
         if needs_resize:
             model.resize_token_embeddings(n_tok)
-
-    def _load_model(self):
-        model_kwargs = dict(
-            pretrained_model_name_or_path=self.model_id,
-            output_hidden_states=self.output_hidden_states,
-            trust_remote_code=self.trust_remote_code,
-        )
-        if self.quant_config is not None:
-            model_kwargs["quantization_config"] = self.quant_config
-            model_kwargs["device_map"] = "auto"
-        else:
-            model_kwargs["torch_dtype"] = self.dtype
-            if self.device == "cuda":
-                model_kwargs["device_map"] = "auto"
-        model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
-        if self.quant_config is None and self.device != "cuda":
-            model.to(self.device)
-        self._maybe_resize_embeddings(model)
-        return model
-
-    # ------------------------------------------------------------------
-    # Architecture resolution
-    # ------------------------------------------------------------------
-
-    def _resolve_backbone(self):
-        candidate_paths = [["model"], ["transformer"], ["gpt_neox"]]
-        for path in candidate_paths:
-            obj = self.model
-            ok = True
-            for attr in path:
-                if not hasattr(obj, attr):
-                    ok = False
-                    break
-                obj = getattr(obj, attr)
-            if ok:
-                return obj
-        raise AttributeError(
-            f"Cannot resolve backbone for {self.model.__class__.__name__}. "
-            f"Available attrs: {[a for a in dir(self.model) if not a.startswith('_')]}"
-        )
-
-    def _resolve_layers(self):
-        candidate_attrs = ["layers", "h", "block", "blocks"]
-        for attr in candidate_attrs:
-            if hasattr(self.backbone, attr):
-                layers = getattr(self.backbone, attr)
-                try:
-                    _ = len(layers)
-                    return layers
-                except TypeError:
-                    pass
-        raise AttributeError(
-            f"Cannot resolve layer list in backbone {self.backbone.__class__.__name__}. "
-            f"Available attrs: {[a for a in dir(self.backbone) if not a.startswith('_')]}"
-        )
 
     # ------------------------------------------------------------------
     # Inference
@@ -238,13 +208,8 @@ class HFLLM:
             "num_hidden_layers": self.num_hidden_layers,
             "n_layers_resolved": self.n_layers,
             "profile": (
-                None
-                if self.profile is None
-                else {
-                    "L": self.profile.L,
-                    "D": self.profile.D,
-                    "safe_4bit": self.profile.safe_4bit,
-                }
+                None if self.profile is None
+                else {"L": self.profile.L, "D": self.profile.D, "safe_4bit": self.profile.safe_4bit}
             ),
         }
 
@@ -252,9 +217,7 @@ class HFLLM:
         quant_desc = "4-bit NF4" if self.quant_config is not None else str(self.dtype)
         log.info("Loaded '%s' on %s (%s)", self.model_id, self.device, quant_desc)
         log.info(
-            "Resolved %d layers | hidden_size=%s | profile=%s | output_hidden_states=%s",
-            self.n_layers,
-            self.hidden_size,
+            "Resolved %d layers | hidden_size=%s | profile=%s",
+            self.n_layers, self.hidden_size,
             "yes" if self.profile is not None else "no",
-            self.output_hidden_states,
         )

@@ -15,11 +15,11 @@ env/
 .ipynb_checkpoints/
 notebooks/outputs/
 
-# Env files
+# Environment secrets — never commit
 .env
 .env.*
 
-# Build
+# Build artifacts
 build/
 dist/
 *.egg-info/
@@ -32,20 +32,20 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Log files (runtime logs go to outputs/, not the repo)
 *.log
 
 # Large binary artifacts — PyTorch checkpoints, numpy arrays
 *.pt
 *.npz
 
-# Trajectory outputs and cached artifacts
+# Experiment outputs, caches, and data (all runtime-generated)
 data/
-artifacts/
+outputs/
 runs/
-experiments/runs/
+artifacts/
 
-# SLURM job output files (written to repo root or logs/)
+# SLURM job output files
 slurm-*.out
 slurm-*.err
 logs/
@@ -54,9 +54,10 @@ logs/
 hf_cache/
 model_cache/
 
-# Optional cache
+# Tool caches
 .cache/
 .pytest_cache/
 .mypy_cache/
 
+# Project-specific AI guidance (not for public consumption)
 CLAUDE.md

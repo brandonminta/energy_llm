@@ -1,7 +1,7 @@
 """Environment detection and configuration loading.
 
-Automatically selects local vs HPC configuration based on the HOPFIELD_ENV
-environment variable or the presence of SLURM_JOB_ID.
+Auto-selects local vs HPC configuration based on the HOPFIELD_ENV env var
+or the presence of SLURM_JOB_ID.
 """
 
 from __future__ import annotations
@@ -20,18 +20,18 @@ log = get_logger("utils.env")
 
 @dataclass
 class EnvConfig:
-    environment: str        # "local" or "hpc"
-    device: str             # "cuda" or "cpu"
-    max_vram_gb: float
-    max_ram_gb: float
+    environment:        str    # "local" or "hpc"
+    device:             str    # "cuda" or "cpu"
+    max_vram_gb:        float
+    max_ram_gb:         float
     default_batch_size: int
-    use_4bit: bool
-    num_workers: int
-    cache_dir: Path
-    results_dir: Path
+    use_4bit:           bool
+    num_workers:        int
+    cache_dir:          Path
+    results_dir:        Path
 
     def resolve_batch_size(self, requested: int | None = None) -> int:
-        """Return the smaller of requested and environment default."""
+        """Return the smaller of requested and the environment default."""
         if requested is None:
             return self.default_batch_size
         return min(requested, self.default_batch_size)
@@ -47,11 +47,6 @@ def detect_environment() -> str:
     return "local"
 
 
-def _expand_env_vars(value: str) -> str:
-    """Expand $VAR and ${VAR} in a string value."""
-    return os.path.expandvars(value)
-
-
 def load_env_config(
     config_path: str | Path | None = None,
     environment: str | None = None,
@@ -59,22 +54,15 @@ def load_env_config(
     """Load environment configuration from YAML.
 
     Resolution order:
-        1. Explicit config_path
-        2. configs/environments/{environment}.yaml relative to repo root
-        3. Auto-detect environment and use default path
-
-    Args:
-        config_path: Explicit YAML path (overrides auto-detection).
-        environment: Force environment name (overrides auto-detection).
-
-    Returns:
-        EnvConfig dataclass.
+      1. Explicit config_path argument
+      2. configs/environments/{environment}.yaml relative to the project root
+      3. Hardcoded defaults for the detected environment
     """
     if environment is None:
         environment = detect_environment()
 
     if config_path is None:
-        # Look relative to the project root (3 levels up from this file)
+        # File lives at: src/hopfield_llm/utils/env.py → parents[3] = project root
         project_root = Path(__file__).resolve().parents[3]
         config_path = project_root / "configs" / "environments" / f"{environment}.yaml"
 
@@ -96,8 +84,8 @@ def load_env_config(
         default_batch_size=int(raw.get("default_batch_size", 1)),
         use_4bit=bool(raw.get("use_4bit", True)),
         num_workers=int(raw.get("num_workers", 4)),
-        cache_dir=Path(_expand_env_vars(str(raw.get("cache_dir", "./data/cache")))),
-        results_dir=Path(_expand_env_vars(str(raw.get("results_dir", "./data/results")))),
+        cache_dir=Path(os.path.expandvars(str(raw.get("cache_dir", "./data/cache")))),
+        results_dir=Path(os.path.expandvars(str(raw.get("results_dir", "./data/results")))),
     )
 
 

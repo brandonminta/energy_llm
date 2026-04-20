@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hopfield_llm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Energy-based hallucination detection for LLMs using Modern Hopfield networks."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,6 @@ keywords = [
   "mechanistic-interpretability",
   "hallucination-detection",
   "hopfield",
-  "hidden-states",
 ]
 
 [project.scripts]
@@ -27,9 +26,6 @@ hopfield-llm = "hopfield_llm.cli.run:main"
 dev = [
   "pytest>=8.0",
 ]
-
-[tool.setuptools]
-package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

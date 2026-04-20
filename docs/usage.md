@@ -1,128 +1,170 @@
 # Usage
 
-## CLI Pipeline
-
-The CLI exposes five stages that can be run independently:
+## CLI — pipeline stages
 
 ```bash
-# Stage 1: Extract MLP memory banks
-hopfield-llm build-memory --model qwen25_3b --output bank.pt
+# Stage 1: extract MLP memory banks
+hopfield-llm build-banks \
+    --model qwen25_3b \
+    --bank  down \           # gate | up | down | gate_plus_up | gate_up_concat
+    --output banks.pt
 
-# Stage 2: Extract hidden states from prompts
-hopfield-llm extract-hidden --memory bank.pt --prompts prompts.json --output hidden.pt
+# Stage 2: run prefill + generation for each sample
+hopfield-llm run-trajectory \
+    --model   qwen25_3b \
+    --dataset truthfulqa \
+    --banks   banks.pt \
+    --output  traj/
 
-# Stage 3: Compute divergence scores
-hopfield-llm score --memory bank.pt --hidden hidden.pt --output scores.pt
+# Stage 3: aggregate into analysis JSON (CPU-only)
+hopfield-llm analyze \
+    --trajectories traj/ \
+    --output       analysis.json \
+    --score-metric delta_energy   # or: js | kl_fwd | hellinger | ...
 
-# Stage 4: Aggregate statistics
-hopfield-llm analyze --scores scores.pt --output analysis.json
+# Stage 4: generate plots (CPU-only)
+hopfield-llm visualize \
+    --analysis analysis.json \
+    --output   plots/
 
-# Stage 5: Generate plots
-hopfield-llm visualize --analysis analysis.json --output plots/
+# All stages from a YAML config
+hopfield-llm run-experiment \
+    --config configs/experiments/exp01_truthfulqa_baseline.yaml \
+    --override beta=20.0 dataset_name=triviaqa
 ```
+
+---
+
+## Changing the memory bank
+
+The `--bank` flag controls which MLP projection forms the memory:
+
+```bash
+# Default: W_down (the down-projection)
+hopfield-llm build-banks --model qwen25_3b --bank down --output banks_down.pt
+
+# Gate projection
+hopfield-llm build-banks --model qwen25_3b --bank gate --output banks_gate.pt
+
+# Composite: normalised average of gate and up projections
+hopfield-llm build-banks --model qwen25_3b --bank gate_plus_up --output banks_gup.pt
+```
+
+Banks are stored as a dict `{layer_idx → Tensor[K, D]}`.  The rest of the
+pipeline (hooks, metrics, analysis) is unaffected by this choice.
+
+---
+
+## Changing the query extractor
+
+The query extractor selects which activation position becomes the retrieval
+query.  Pass a callable `[T, d_m] → [d_m]` as `query_fn`:
+
+```python
+from hopfield_llm.hooks.capture import capture_prefill
+from hopfield_llm.queries.extractors import mean_tokens, last_token, make_positional
+
+# Default: last question token
+result = capture_prefill(llm, question, banks, query_fn=last_token)
+
+# Alternative: mean over all question tokens
+result = capture_prefill(llm, question, banks, query_fn=mean_tokens)
+
+# Alternative: a specific token index
+result = capture_prefill(llm, question, banks, query_fn=make_positional(0))
+```
+
+---
 
 ## Python API
 
 ```python
-from hopfield_llm.models import HFLLM
-from hopfield_llm.extraction import extract_mlp_memory_bank, extract_segment_hidden_states
-from hopfield_llm.metrics import compute_layer_divergences, hallucination_score
-from hopfield_llm.extraction.hidden_states import align_banks_to_layers
+from hopfield_llm.models.loader import HFLLM
+from hopfield_llm.memory.banks import extract_banks
+from hopfield_llm.hooks.capture import capture_prefill, capture_generation
+from hopfield_llm.metrics.energy import compute_energy
+from hopfield_llm.pipeline.analysis import analyze_trajectories
 
 # Load model
 llm = HFLLM("qwen25_3b", load_in_4bit=True)
 
-# Extract banks
-banks = extract_mlp_memory_bank(llm, bank="gate")
+# Build memory banks
+banks = extract_banks(llm, bank="down")
 
-# Extract hidden states
-seg = extract_segment_hidden_states(
-    llm,
-    question="What is the capital of France?",
-    answer="Paris is the capital of France.",
-    pooling="mean",
+# Prefill pass
+prefill = capture_prefill(llm, "Who wrote Hamlet?", banks, beta=15.0)
+print(prefill.energy)   # [L] float32
+
+# Generation pass
+gen = capture_generation(llm, "Who wrote Hamlet?", banks, max_new_tokens=30)
+print(gen.generated_text)
+print(gen.energy)       # [L, T] float32
+
+# Analyze saved trajectories
+analyze_trajectories(
+    traj_dir="outputs/exp01/trajectories",
+    output="outputs/exp01/analysis.json",
+    score_metric="delta_energy",
 )
-
-# Compare factual vs hallucinated
-seg_f = extract_segment_hidden_states(llm, question=q, answer=factual_answer)
-seg_h = extract_segment_hidden_states(llm, question=q, answer=hallucinated_answer)
-
-aligned = align_banks_to_layers(banks, seg_f.layer_indices)
-div = compute_layer_divergences(seg_f.h_answer, seg_h.h_answer, aligned)
-score = hallucination_score(div, metric="js")
 ```
 
-## Batched Extraction
+---
 
-For GPU-rich environments (A100), use batched extraction for ~4-8x speedup:
+## Adding a new dataset
 
-```python
-from hopfield_llm.extraction import extract_hidden_states_batch
-
-samples = [(q1, a1), (q2, a2), (q3, a3), ...]
-results = extract_hidden_states_batch(llm, samples, batch_size=8)
-```
-
-## Adding a New Dataset
-
-Implement `BaseHallucinationDataset` and produce `DataSample` instances:
+Subclass `BaseDataset` and yield `DataSample` objects:
 
 ```python
-from hopfield_llm.datasets.base import BaseHallucinationDataset, DataSample
+from hopfield_llm.datasets.base import BaseDataset, DataSample
+from typing import Iterator
 
-class MyDataset(BaseHallucinationDataset):
-    def __init__(self, path: str):
-        self._samples = self._load(path)
-
+class MyDataset(BaseDataset):
     @property
     def name(self) -> str:
-        return "my_dataset"
+        return "mydataset"
 
-    def __iter__(self):
-        return iter(self._samples)
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._samples)
 
-    def _load(self, path):
-        # Load your data and produce DataSample instances
-        samples = []
-        for row in load_my_data(path):
-            samples.append(DataSample(
-                sample_id=f"my_{row['id']}_factual",
-                question=row["question"],
-                answer=row["correct_answer"],
-                label=1,
-                source_dataset="my_dataset",
-                metadata={"category": row.get("category", "unknown")},
-            ))
-            samples.append(DataSample(
-                sample_id=f"my_{row['id']}_hallucinated",
-                question=row["question"],
-                answer=row["wrong_answer"],
-                label=0,
-                source_dataset="my_dataset",
-                metadata={"category": row.get("category", "unknown")},
-            ))
-        return samples
+    def __iter__(self) -> Iterator[DataSample]:
+        return iter(self._samples)
 ```
 
-## Experiment Tracking
+Then register it in `pipeline/stages.py` inside `run_trajectory`.
 
+---
+
+## Experiment tracking
+
+`ExperimentTracker` creates a timestamped run directory with:
+```
+outputs/{name}/{timestamp}_{model}_{dataset}_{bank}_{beta}_{hash}/
+    config.yaml          — full config snapshot
+    git_info.json        — commit, branch, dirty flag
+    environment.yaml     — GPU name, VRAM, duration
+    metrics_log.json     — stage completion timestamps
+    trajectories/        — per-sample .npz + .json
+    analysis.json
+    plots/
+```
+
+To replay or inspect a previous run:
 ```python
 from hopfield_llm.utils.tracking import ExperimentTracker
-from pathlib import Path
-
-tracker = ExperimentTracker(base_dir=Path("experiments/runs"))
-run_dir = tracker.start(config={"model": "qwen25_3b", "dataset": "truthfulqa", ...})
-
-# During experiment
-tracker.log_metric("score_mean", 0.42, step=100)
-
-# After experiment
-tracker.finish(metrics_df=df)
-
-# Later: load for replay
-info = ExperimentTracker.load(run_dir)
+info = ExperimentTracker.load("outputs/exp01/...")
 print(info["config"])
 ```
+
+---
+
+## Security: Hugging Face tokens
+
+Models are downloaded from the HuggingFace Hub on first use.  If you need
+a private model (e.g. Llama 3), provide your access token via the environment:
+
+```bash
+export HF_TOKEN=hf_...
+```
+
+Never hardcode tokens in configs or scripts.  The `.env` file (if you use one)
+is gitignored by default.  See `.env.example` for the expected format.

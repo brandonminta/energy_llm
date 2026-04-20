@@ -5,12 +5,11 @@ from __future__ import annotations
 import logging
 import sys
 
-
 _CONFIGURED = False
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configure root logger for the package. Call once at entry point."""
+    """Configure the package root logger.  Call once at each entry point."""
     global _CONFIGURED
     if _CONFIGURED:
         return

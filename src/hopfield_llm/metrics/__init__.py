@@ -1,20 +1,10 @@
-"""Hopfield energy and divergence metrics."""
-
-from hopfield_llm.metrics.divergences import (
-    LayerDivergenceResult,
-    hellinger,
-    js_divergence,
-    kl_divergence,
-)
-from hopfield_llm.metrics.hopfield import LayerEnergyResult, hopfield_energy_mlp
+from hopfield_llm.metrics.energy import LayerEnergyResult, compute_energy
+from hopfield_llm.metrics.divergences import SampleDivergenceResult
 from hopfield_llm.metrics.scoring import hallucination_score
 
 __all__ = [
-    "LayerDivergenceResult",
     "LayerEnergyResult",
+    "compute_energy",
+    "SampleDivergenceResult",
     "hallucination_score",
-    "hellinger",
-    "hopfield_energy_mlp",
-    "js_divergence",
-    "kl_divergence",
 ]

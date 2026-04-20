@@ -73,13 +73,14 @@ dataset:
   max_samples: null
   seed: 42
 trajectory:
+  bank: down          # gate | up | down | gate_plus_up | gate_up_concat
   beta: 15.0
   energy_mode: dot    # dot | cosine
 analysis:
-  score_metric: js    # kl_fwd | js | hellinger | delta_energy | ...
+  score_metric: js    # js | kl_fwd | hellinger | delta_energy | ...
   score_aggregation: mean
 output:
-  base_dir: runs
+  base_dir: outputs
 ```
 
 Environment configs (`configs/environments/`) auto-detect local vs HPC via `HOPFIELD_ENV` or `SLURM_JOB_ID`.
@@ -89,25 +90,30 @@ Environment configs (`configs/environments/`) auto-detect local vs HPC via `HOPF
 ```
 src/hopfield_llm/          Python package
   cli/                      CLI entry point (5 subcommands)
-  models/                   HFLLM loader + model profiles
-  extraction/               MLP memory bank + h_pre extraction (prefill + generation)
-  metrics/                  Hopfield energy, divergences, hallucination scoring
-  datasets/                 Base class + TruthfulQA, TriviaQA, NQ adapters
-  pipeline/                 Stage functions, analysis, experiment config
-  utils/                    I/O, logging, environment config, experiment tracking
+  models/                   HFLLM loader + architecture resolution + model profiles
+  hooks/                    Forward-hook activation capture (prefill + generation)
+  memory/                   Memory bank construction from MLP weights
+  queries/                  Query extraction strategies (swappable)
+  metrics/                  Energy computation, divergences, hallucination scoring
+  datasets/                 BaseDataset + TruthfulQA, TriviaQA, NQ adapters
+  pipeline/                 Stage functions, analysis, ExperimentConfig
+  storage/                  Artifact save/load (torch + JSON)
+  utils/                    Logging, environment config, experiment tracking
   visualization/            Matplotlib plots from analysis JSON
 configs/
   environments/             local.yaml (RTX 2050) + hpc.yaml (A100)
   experiments/              Experiment YAML configs
-jobs/                       SLURM templates + submission script (3-stage pipeline)
+jobs/                       SLURM templates + submission script
 scripts/                    Local convenience scripts + result inspection
-runs/                       Experiment outputs (tracked run directories)
-tests/                      Unit tests
+outputs/                    Experiment outputs (tracked run directories, gitignored)
+tests/
+  unit/                     Pure function tests
+  integration/              Pipeline integration tests
+docs/                       Architecture, setup, and usage documentation
 ```
 
 ## Documentation
 
 - [Architecture](docs/architecture.md) — Module responsibilities, data flow, design decisions
 - [Setup](docs/setup.md) — Installation for local and HPC environments
-- [Usage](docs/usage.md) — CLI, Python API, adding datasets, experiment tracking
-- [HPC Workflow](docs/hpc_workflow.md) — SLURM submission, monitoring, troubleshooting
+- [Usage](docs/usage.md) — CLI, Python API, adding datasets, query extractors

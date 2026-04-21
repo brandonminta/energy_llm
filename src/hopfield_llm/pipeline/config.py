@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,17 @@ import yaml
 from hopfield_llm.utils.logging import get_logger
 
 log = get_logger("pipeline.config")
+
+
+@dataclass
+class ProbeConfig:
+    """Configuration for a single Hopfield probe (bank + hook placement)."""
+
+    bank: str = "up"
+    normalize: bool = True
+    hook_target: str = "mlp_input"   # "mlp_input" | "mlp_output"
+    normalize_query: bool = True
+    label: str = ""                  # human-readable tag used in artifact filenames
 
 
 @dataclass
@@ -41,26 +53,48 @@ class ExperimentConfig:
     max_new_tokens:     int   = 50
     diagnostic_subset:  int   = 20
 
-    # Memory bank
+    # Memory bank (legacy single-probe field)
     bank: str = "down"
 
     # Analysis parameters
     divergence_metrics: list[str] = field(
-        default_factory=lambda: ["js", "kl_fwd", "hellinger"]
+        default_factory=lambda: ["delta_energy", "energy_shift_l1", "gen_drift_mean"]
     )
-    score_metric:       str               = "js"
+    score_metric:       str               = "delta_energy"
     score_aggregation:  str               = "mean"
     signal_zone:        tuple[int, int] | None = None
 
     # Sharding (HPC)
     num_shards: int = 1
 
+    # Scores subset (limits which samples get raw score tensors saved)
+    scores_subset_size: int = 200
+
+    # Labeling / calibration
+    calibration_subset_size: int = 50
+
     # Output
     base_dir: str = "outputs"
 
+    # Probe configuration (new — optional dual-probe support)
+    primary_probe: ProbeConfig = field(default_factory=lambda: ProbeConfig(
+        bank="up", normalize=True, hook_target="mlp_input", label="key_space"
+    ))
+    secondary_probe: ProbeConfig | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a nested dict for config snapshots."""
-        return {
+
+        def _probe_dict(p: ProbeConfig) -> dict[str, Any]:
+            return {
+                "bank": p.bank,
+                "normalize": p.normalize,
+                "hook_target": p.hook_target,
+                "normalize_query": p.normalize_query,
+                "label": p.label,
+            }
+
+        d: dict[str, Any] = {
             "experiment": {"name": self.name, "description": self.description},
             "model":      {"alias": self.model_alias, "load_in_4bit": self.load_in_4bit},
             "dataset":    {"name": self.dataset_name, "max_samples": self.max_samples, "seed": self.seed},
@@ -68,6 +102,7 @@ class ExperimentConfig:
                 "beta": self.beta, "threshold": self.threshold,
                 "energy_mode": self.energy_mode, "max_new_tokens": self.max_new_tokens,
                 "diagnostic_subset": self.diagnostic_subset, "bank": self.bank,
+                "scores_subset_size": self.scores_subset_size,
             },
             "analysis": {
                 "divergence_metrics": self.divergence_metrics,
@@ -76,8 +111,32 @@ class ExperimentConfig:
                 "signal_zone": list(self.signal_zone) if self.signal_zone else None,
             },
             "sharding": {"num_shards": self.num_shards},
+            "labeling": {
+                "calibration": {"calibration_subset_size": self.calibration_subset_size}
+            },
             "output":   {"base_dir": self.base_dir},
+            "primary_probe": _probe_dict(self.primary_probe),
         }
+        if self.secondary_probe is not None:
+            d["secondary_probe"] = _probe_dict(self.secondary_probe)
+        return d
+
+
+# ---------------------------------------------------------------------------
+# YAML loader
+# ---------------------------------------------------------------------------
+
+
+def _parse_probe_section(raw: dict[str, Any] | None, defaults: ProbeConfig) -> ProbeConfig:
+    if raw is None:
+        return defaults
+    return ProbeConfig(
+        bank=raw.get("bank", defaults.bank),
+        normalize=bool(raw.get("normalize", defaults.normalize)),
+        hook_target=raw.get("hook_target", defaults.hook_target),
+        normalize_query=bool(raw.get("normalize_query", defaults.normalize_query)),
+        label=raw.get("label", defaults.label),
+    )
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
@@ -102,6 +161,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     analysis = raw.get("analysis", {})
     sharding = raw.get("sharding", {})
     output   = raw.get("output", {})
+    labeling = raw.get("labeling", {})
 
     sz_raw = analysis.get("signal_zone")
     signal_zone = None
@@ -110,6 +170,15 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             signal_zone = (int(sz_raw[0]), int(sz_raw[1]))
         else:
             raise ValueError(f"signal_zone must be null or [start, end], got {sz_raw}")
+
+    _prim_default = ProbeConfig(bank="up", normalize=True, hook_target="mlp_input", label="key_space")
+    primary_probe = _parse_probe_section(raw.get("primary_probe"), _prim_default)
+
+    sec_raw = raw.get("secondary_probe")
+    secondary_probe: ProbeConfig | None = None
+    if sec_raw is not None:
+        _sec_default = ProbeConfig(bank="down_values", normalize=True, hook_target="mlp_output", label="value_space")
+        secondary_probe = _parse_probe_section(sec_raw, _sec_default)
 
     config = ExperimentConfig(
         name=exp.get("name", "unnamed"),
@@ -125,12 +194,20 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         max_new_tokens=int(traj.get("max_new_tokens", 50)),
         diagnostic_subset=int(traj.get("diagnostic_subset", 20)),
         bank=traj.get("bank", "down"),
-        divergence_metrics=analysis.get("divergence_metrics", ["js", "kl_fwd", "hellinger"]),
-        score_metric=analysis.get("score_metric", "js"),
+        divergence_metrics=analysis.get(
+            "divergence_metrics", ["delta_energy", "energy_shift_l1", "gen_drift_mean"]
+        ),
+        score_metric=analysis.get("score_metric", "delta_energy"),
         score_aggregation=analysis.get("score_aggregation", "mean"),
         signal_zone=signal_zone,
         num_shards=int(sharding.get("num_shards", 1)),
+        scores_subset_size=int(traj.get("scores_subset_size", 200)),
+        calibration_subset_size=int(
+            labeling.get("calibration", {}).get("calibration_subset_size", 50)
+        ),
         base_dir=output.get("base_dir", "outputs"),
+        primary_probe=primary_probe,
+        secondary_probe=secondary_probe,
     )
 
     log.info("Loaded experiment config: %s (%s)", config.name, path)
@@ -180,3 +257,26 @@ def apply_overrides(config: ExperimentConfig, overrides: list[str]) -> Experimen
         log.info("Override: %s = %r", key, value)
 
     return config
+
+
+# ---------------------------------------------------------------------------
+# Convenience factory
+# ---------------------------------------------------------------------------
+
+
+def make_with_value_space_probe(base_config: ExperimentConfig) -> ExperimentConfig:
+    """Return a copy of base_config with secondary_probe set to the value-space probe.
+
+    The value-space probe uses bank='down_values' (W_down.T rows) and
+    hook_target='mlp_output' (captures FFN output y^l as the query), as
+    described in Geva et al. 2021 §4.
+    """
+    return dataclasses.replace(
+        base_config,
+        secondary_probe=ProbeConfig(
+            bank="down_values",
+            normalize=True,
+            hook_target="mlp_output",
+            label="value_space",
+        ),
+    )

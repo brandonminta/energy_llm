@@ -59,5 +59,11 @@ model_cache/
 .pytest_cache/
 .mypy_cache/
 
+# Claude Code per-project local settings (machine-specific, not for VCS)
+.claude/
+
+# Generated binary documents (e.g. README.pdf exported from README.md)
+*.pdf
+
 # Project-specific AI guidance (not for public consumption)
 CLAUDE.md

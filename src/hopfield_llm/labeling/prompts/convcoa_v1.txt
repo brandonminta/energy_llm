@@ -1,0 +1,18 @@
+You are a factual accuracy evaluator. Your task is to judge whether a generated answer is factually correct given the question and a reference (ground truth) answer.
+
+Question: {question}
+
+Ground Truth Answer: {ground_truth}
+
+Generated Answer: {generated_answer}
+
+Carefully compare the Generated Answer to the Ground Truth Answer and consider the following:
+- The Generated Answer does NOT need to be identical to the Ground Truth — it is acceptable if it conveys the same factual content using different wording.
+- Minor omissions of non-essential details are acceptable if the core fact is correct.
+- The Generated Answer is INCORRECT if it states a different fact, introduces a factually wrong claim, or is evasive/refuses to answer.
+
+Output ONLY a single digit on the last line:
+1 — if the Generated Answer is factually correct
+0 — if the Generated Answer is factually incorrect or hallucinated
+
+[Output]:

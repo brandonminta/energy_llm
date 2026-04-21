@@ -4,20 +4,16 @@ CPU-only — no model or GPU required.  Reads the per-sample .npz and .json
 files produced by ``run_trajectory`` and computes:
 
   1. Per-layer delta metrics (generation_mean[l] − prefill[l])
-  2. Global distribution divergences (KL, JS, Hellinger) per sample,
-     treating the layer axis as the probability space
+  2. Interpretable scalar summaries per sample (energy_shift_l1, etc.)
   3. Scalar hallucination scores per sample
   4. Dataset-level aggregation (mean/std per layer, score summary)
 
-Design note on divergences
---------------------------
-The global divergences (KL, JS, Hellinger) compare softmax(prefill_energy)
-and softmax(gen_energy_mean) where the probability space is the L-layer axis.
-They produce ONE scalar per sample, not per-layer values.  They are reported
-in the output JSON under ``global_divergences``.
-
-The genuine per-layer signals are the delta_* arrays and the raw energy/entropy
-trajectories.  These are in ``layer_metrics``.
+Per-layer KL/JS/Hellinger divergences require distributions saved during
+trajectory collection (save_distributions=True in capture_prefill /
+capture_generation).  The standard .npz files do not contain distributions,
+so those fields are NaN in the analysis output.  Run capture with
+save_distributions=True and pass them to compute_sample_divergences directly
+to get the full M2 divergence picture.
 """
 
 from __future__ import annotations
@@ -28,14 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
-from hopfield_llm.metrics.divergences import (
-    SampleDivergenceResult,
-    hellinger,
-    js_divergence,
-    kl_divergence,
-)
+from hopfield_llm.metrics.divergences import SampleDivergenceResult
 from hopfield_llm.metrics.scoring import hallucination_score
 from hopfield_llm.utils.logging import get_logger
 
@@ -43,66 +33,63 @@ log = get_logger("pipeline.analysis")
 
 
 def _load_sample(traj_dir: Path, sample_id: str) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    meta = json.loads((traj_dir / f"{sample_id}.json").read_text(encoding="utf-8"))
+    meta   = json.loads((traj_dir / f"{sample_id}.json").read_text(encoding="utf-8"))
     arrays = dict(np.load(traj_dir / f"{sample_id}.npz"))
     return meta, arrays
 
 
 def _compute_sample_divergence(arrays: dict[str, np.ndarray]) -> SampleDivergenceResult:
-    """Compute divergence metrics for one (prefill, generation) pair.
+    """Compute divergence metrics for one (prefill, generation) pair from .npz arrays.
 
-    Per-layer deltas are straightforward: gen_mean[l] − prefill[l].
-
-    Global divergences use the layer axis as the probability space:
-        p = softmax(−prefill_energy)   [L]
-        q = softmax(−gen_energy_mean)  [L]
-    This is a single scalar per sample, not a per-layer value.
+    Per-layer deltas: generation_mean[l] − prefill[l].
+    Per-layer KL/JS/Hellinger: NaN (distributions not stored in .npz).
+    Scalar summaries: computed from delta_energy.
     """
-    # Mean-pool generation over tokens → [L]
-    gen_energy_mean      = np.nanmean(arrays["gen_energy"],      axis=1)
-    gen_entropy_mean     = np.nanmean(arrays["gen_entropy"],     axis=1)
+    # Mean-pool generation metrics over tokens → [L]
+    gen_energy_mean       = np.nanmean(arrays["gen_energy"],       axis=1)
+    gen_entropy_mean      = np.nanmean(arrays["gen_entropy"],      axis=1)
     gen_norm_entropy_mean = np.nanmean(arrays["gen_norm_entropy"], axis=1)
-    gen_top_act_mean     = np.nanmean(arrays["gen_top_act"],     axis=1)
-    gen_lse_mean         = np.nanmean(arrays["gen_lse"],         axis=1)
+    gen_top_act_mean      = np.nanmean(arrays["gen_top_act"],      axis=1)
+    gen_lse_mean          = np.nanmean(arrays["gen_lse"],          axis=1)
 
-    # Per-layer delta arrays [L]
-    delta_energy         = gen_energy_mean      - arrays["prefill_energy"]
-    delta_entropy        = gen_entropy_mean     - arrays["prefill_entropy"]
-    delta_norm_entropy   = gen_norm_entropy_mean - arrays["prefill_norm_entropy"]
-    delta_top_activation = gen_top_act_mean     - arrays["prefill_top_act"]
-    delta_mean_activation = gen_lse_mean        - arrays["prefill_lse"]
+    delta_energy          = gen_energy_mean       - arrays["prefill_energy"]
+    delta_entropy         = gen_entropy_mean      - arrays["prefill_entropy"]
+    delta_norm_entropy    = gen_norm_entropy_mean - arrays["prefill_norm_entropy"]
+    delta_top_activation  = gen_top_act_mean      - arrays["prefill_top_act"]
+    delta_mean_activation = gen_lse_mean          - arrays["prefill_lse"]
 
-    # Global divergences: softmax of negated energies across the layer axis
-    prefill_e = torch.from_numpy(
-        np.nan_to_num(-arrays["prefill_energy"].astype(np.float64), nan=0.0)
-    )
-    gen_e = torch.from_numpy(
-        np.nan_to_num(-gen_energy_mean.astype(np.float64), nan=0.0)
-    )
-    p = torch.softmax(prefill_e, dim=0)
-    q = torch.softmax(gen_e, dim=0)
+    # Scalar energy summaries
+    de_abs           = np.abs(np.where(np.isnan(delta_energy), 0.0, delta_energy))
+    energy_shift_l1  = float(np.sum(de_abs))
+    energy_shift_l2  = float(np.sqrt(np.sum(de_abs ** 2)))
+    peak_delta_layer = int(np.argmax(de_abs))
 
-    kl_fwd, kl_rev = kl_divergence(p, q, direction="both")
-    js              = js_divergence(p, q)
-    hell            = hellinger(p, q)
+    # KL/JS/Hellinger are NaN — distributions not in .npz
+    L     = len(arrays["prefill_energy"])
+    T_gen = arrays["gen_energy"].shape[1]
+    nan_LT = np.full((L, T_gen), np.nan, dtype=np.float32)
 
     return SampleDivergenceResult(
-        kl_fwd=float(kl_fwd),
-        kl_rev=float(kl_rev),
-        js=float(js),
-        hellinger=float(hell),
         delta_energy=delta_energy.astype(np.float64),
         delta_entropy=delta_entropy.astype(np.float64),
         delta_norm_entropy=delta_norm_entropy.astype(np.float64),
         delta_top_activation=delta_top_activation.astype(np.float64),
         delta_mean_activation=delta_mean_activation.astype(np.float64),
+        kl_gen_to_prompt_per_layer=nan_LT,
+        js_gen_to_prompt_per_layer=nan_LT.copy(),
+        hellinger_gen_to_prompt_per_layer=nan_LT.copy(),
+        energy_shift_l1=energy_shift_l1,
+        energy_shift_l2=energy_shift_l2,
+        peak_delta_layer=peak_delta_layer,
+        gen_drift_mean=float(np.nan),
+        gen_drift_max=float(np.nan),
     )
 
 
 def analyze_trajectories(
     traj_dir: str | Path,
     output: str | Path,
-    score_metric: str = "js",
+    score_metric: str = "delta_energy",
     score_aggregation: str = "mean",
     signal_zone: tuple[int, int] | None = None,
 ) -> Path:
@@ -111,11 +98,11 @@ def analyze_trajectories(
     Writes a single ``analysis.json`` compatible with ``visualize_analysis``.
 
     Args:
-        traj_dir:         Directory containing .npz/.json trajectory pairs.
-        output:           Path for the output analysis JSON file.
-        score_metric:     Metric for the scalar hallucination score.
+        traj_dir:          Directory containing .npz/.json trajectory pairs.
+        output:            Path for the output analysis JSON file.
+        score_metric:      Metric for the scalar hallucination score.
         score_aggregation: Aggregation method (mean / max / weighted).
-        signal_zone:      Optional (start, end) layer slice for scoring.
+        signal_zone:       Optional (start, end) layer slice for scoring.
 
     Returns:
         Path to the written analysis JSON file.
@@ -167,8 +154,8 @@ def analyze_trajectories(
     if not all_divs:
         raise ValueError("No samples could be analyzed successfully")
 
-    n_scored = len(all_scores)
-    scores_arr = np.array(all_scores)
+    n_scored    = len(all_scores)
+    scores_arr  = np.array(all_scores)
 
     # -- Per-layer delta metrics: stack [N, L] → mean/std --
     LAYER_METRIC_NAMES = [
@@ -184,11 +171,14 @@ def analyze_trajectories(
             "n_samples": n_scored,
         }
 
-    # -- Global divergences: one scalar per sample → distribution over N --
-    GLOBAL_METRIC_NAMES = ["kl_fwd", "kl_rev", "js", "hellinger"]
+    # -- Interpretable scalar summaries: one value per sample → distribution --
+    SCALAR_METRIC_NAMES = [
+        "energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
+        "gen_drift_mean", "gen_drift_max",
+    ]
     global_divergences: dict[str, dict[str, Any]] = {}
-    for mn in GLOBAL_METRIC_NAMES:
-        vals = np.array([getattr(d, mn) for d in all_divs])
+    for mn in SCALAR_METRIC_NAMES:
+        vals = np.array([getattr(d, mn) for d in all_divs], dtype=np.float64)
         global_divergences[mn] = {
             "mean": float(np.nanmean(vals)),
             "std":  float(np.nanstd(vals)),
@@ -217,15 +207,15 @@ def analyze_trajectories(
         }
 
     analysis: dict[str, Any] = {
-        "artifact_type":     "analysis",
-        "n_samples":         len(sample_ids),
-        "n_scored":          n_scored,
-        "n_layers":          n_layers,
-        "score_metric":      score_metric,
-        "score_aggregation": score_aggregation,
-        "score_summary":     score_summary,
-        "score_by_category": score_by_category,
-        "layer_metrics":     layer_metrics,
+        "artifact_type":      "analysis",
+        "n_samples":          len(sample_ids),
+        "n_scored":           n_scored,
+        "n_layers":           n_layers,
+        "score_metric":       score_metric,
+        "score_aggregation":  score_aggregation,
+        "score_summary":      score_summary,
+        "score_by_category":  score_by_category,
+        "layer_metrics":      layer_metrics,
         "global_divergences": global_divergences,
     }
 

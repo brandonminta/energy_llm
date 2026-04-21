@@ -9,8 +9,17 @@ import numpy as np
 from hopfield_llm.metrics.divergences import SampleDivergenceResult
 
 
-# Per-layer metrics that can be aggregated across the layer axis
-LAYER_METRICS = (
+# Scalar metrics — already reduced to one number per sample
+SCALAR_METRICS = (
+    "energy_shift_l1",
+    "energy_shift_l2",
+    "peak_delta_layer",
+    "gen_drift_mean",
+    "gen_drift_max",
+)
+
+# Per-layer array metrics — shape [L] per sample
+PER_LAYER_METRICS = (
     "delta_energy",
     "delta_norm_entropy",
     "delta_entropy",
@@ -18,32 +27,47 @@ LAYER_METRICS = (
     "delta_mean_activation",
 )
 
-# Global scalar metrics (one number per sample, not per layer)
-GLOBAL_METRICS = ("kl_fwd", "kl_rev", "js", "hellinger")
+# Per-layer per-token array metrics — shape [L, T_gen] per sample
+PER_LAYER_PER_TOKEN_METRICS = (
+    "kl_gen_to_prompt_per_layer",
+    "js_gen_to_prompt_per_layer",
+    "hellinger_gen_to_prompt_per_layer",
+)
 
-ALL_METRICS = LAYER_METRICS + GLOBAL_METRICS
+# Kept for external callers that iterate over "layer metrics"
+LAYER_METRICS = PER_LAYER_METRICS + PER_LAYER_PER_TOKEN_METRICS
+
+ALL_METRICS = SCALAR_METRICS + LAYER_METRICS
 
 
 def hallucination_score(
     div: SampleDivergenceResult,
     signal_zone: tuple[int, int] | None = None,
-    metric: str = "js",
+    metric: str = "delta_energy",
     aggregation: Literal["mean", "max", "weighted"] = "mean",
     use_absolute: bool = False,
 ) -> float:
     """Aggregate divergence metrics into a scalar hallucination score.
 
-    For per-layer metrics (delta_*), aggregation is applied across the layer
-    axis (optionally restricted to signal_zone).  For global metrics
-    (kl_fwd, kl_rev, js, hellinger) the value is returned directly —
-    signal_zone and aggregation are ignored since they are already scalars.
+    Metric types and how they are reduced to a scalar:
+
+    SCALAR_METRICS (energy_shift_l1, gen_drift_mean, …):
+        Returned directly — signal_zone and aggregation are ignored.
+
+    PER_LAYER_METRICS (delta_energy, delta_entropy, …):
+        signal_zone slices the [L] array; aggregation is applied over layers.
+
+    PER_LAYER_PER_TOKEN_METRICS (kl_gen_to_prompt_per_layer, …):
+        The [L, T_gen] array is mean-pooled over the token axis first,
+        yielding [L]; then signal_zone + aggregation are applied.
+        Returns NaN if all values are NaN (e.g. distributions not saved).
 
     Args:
         div:          SampleDivergenceResult for one sample.
-        signal_zone:  Optional (start, end) layer slice for per-layer metrics.
+        signal_zone:  Optional (start, end) layer slice (PER_LAYER_* only).
         metric:       Which metric to use (see ALL_METRICS).
-        aggregation:  Aggregation for per-layer metrics: mean / max / weighted.
-        use_absolute: Apply abs() before aggregating (per-layer only).
+        aggregation:  Aggregation for array metrics: mean / max / weighted.
+        use_absolute: Apply abs() before aggregating (array metrics only).
 
     Returns:
         Scalar hallucination score.
@@ -51,10 +75,17 @@ def hallucination_score(
     if metric not in ALL_METRICS:
         raise ValueError(f"Unknown metric: '{metric}'. Valid: {ALL_METRICS}")
 
-    if metric in GLOBAL_METRICS:
+    # Scalar metrics: return directly
+    if metric in SCALAR_METRICS:
         return float(getattr(div, metric))
 
-    data: np.ndarray = getattr(div, metric)
+    # Per-layer per-token: reduce over token axis first → [L]
+    if metric in PER_LAYER_PER_TOKEN_METRICS:
+        raw: np.ndarray = getattr(div, metric)   # [L, T_gen]
+        data = np.nanmean(raw, axis=1)           # [L]
+    else:
+        data = getattr(div, metric)              # [L]
+
     if signal_zone is not None:
         start, end = signal_zone
         data = data[start:end]

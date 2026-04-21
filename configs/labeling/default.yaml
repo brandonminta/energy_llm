@@ -1,0 +1,15 @@
+heuristic:
+  enabled: true
+  threshold: 0.3            # F1 below this → is_hallucination = True
+
+llm_judge:
+  enabled: true
+  model_id: "gpt-4o-mini"  # or a local HuggingFace model path
+  api_base: "https://api.openai.com/v1"  # set to null for local HF backend
+  temperature: 0.0
+  max_retries: 3
+  template: "convcoa_v1.txt"
+
+calibration:
+  compute_cohen_kappa: true
+  calibration_subset_size: 200  # samples used for heuristic ↔ judge agreement

@@ -21,8 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = subparsers.add_parser("build-banks", help="Extract MLP weight banks → .pt")
     p.add_argument("--model",   required=True, help="Model alias or HuggingFace model ID")
     p.add_argument("--output",  required=True, help="Output path for banks .pt file")
-    p.add_argument("--bank",    default="down",
-                   choices=["gate", "up", "down", "gate_plus_up", "gate_up_concat"],
+    p.add_argument("--bank",    default="up",
+                   choices=["gate", "up", "down", "down_values",
+                            "gate_proj", "up_proj", "down_proj", "fc1", "fc2", "w1", "w2", "w3"],
                    help="MLP projection to use as the memory bank")
     p.add_argument("--device",  default=None)
     p.add_argument("--no-4bit", action="store_true", help="Disable 4-bit quantization")
@@ -53,10 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trajectories", required=True, help="Directory with .npz/.json files")
     p.add_argument("--output",       required=True, help="Output path for analysis JSON")
     p.add_argument(
-        "--score-metric", default="js", dest="score_metric",
-        choices=["js", "kl_fwd", "kl_rev", "hellinger",
-                 "delta_energy", "delta_norm_entropy", "delta_entropy",
-                 "delta_top_activation", "delta_mean_activation"],
+        "--score-metric", default="delta_energy", dest="score_metric",
+        choices=[
+            "delta_energy", "delta_norm_entropy", "delta_entropy",
+            "delta_top_activation", "delta_mean_activation",
+            "kl_gen_to_prompt_per_layer", "js_gen_to_prompt_per_layer",
+            "hellinger_gen_to_prompt_per_layer",
+            "energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
+            "gen_drift_mean", "gen_drift_max",
+        ],
     )
     p.add_argument("--score-aggregation", default="mean", dest="score_aggregation",
                    choices=["mean", "max", "weighted"])

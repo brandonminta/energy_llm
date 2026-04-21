@@ -42,22 +42,24 @@ def test_analysis_layer_metrics_are_delta_arrays(synthetic_trajectory_dir, tmp_d
         assert "mean" in lm[metric]
         assert len(lm[metric]["mean"]) == 4  # 4 layers in synthetic data
 
-    # KL/JS/Hellinger are NOT per-layer; they live in global_divergences
-    for global_metric in ("kl_fwd", "kl_rev", "js", "hellinger"):
-        assert global_metric not in lm, (
-            f"'{global_metric}' should be in global_divergences, not layer_metrics"
+    # Scalar summaries live in global_divergences, not layer_metrics
+    for scalar in ("energy_shift_l1", "energy_shift_l2", "gen_drift_mean"):
+        assert scalar not in lm, (
+            f"'{scalar}' should be in global_divergences, not layer_metrics"
         )
 
 
 def test_analysis_global_divergences(synthetic_trajectory_dir, tmp_dir):
+    """global_divergences must contain the interpretable scalar summaries."""
     output = tmp_dir / "analysis.json"
     analyze_trajectories(traj_dir=synthetic_trajectory_dir, output=output)
     analysis = json.loads(output.read_text())
     gd = analysis["global_divergences"]
-    for metric in ("kl_fwd", "kl_rev", "js", "hellinger"):
-        assert metric in gd
+    for metric in ("energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
+                   "gen_drift_mean", "gen_drift_max"):
+        assert metric in gd, f"Missing scalar summary: {metric}"
         assert "mean" in gd[metric]
-        assert "std" in gd[metric]
+        assert "std"  in gd[metric]
 
 
 def test_analysis_score_summary(synthetic_trajectory_dir, tmp_dir):

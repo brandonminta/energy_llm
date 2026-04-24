@@ -2,32 +2,46 @@
 
 ## Overview
 
-`hopfield_llm` is a 4-stage artifact-based pipeline for studying hallucination
-emergence in LLMs through a thermodynamic lens.
+`hopfield_llm` is a 6-stage artifact-based pipeline for energy-based hallucination detection in LLMs.
 
 ```
 Dataset + Model
       │
       ▼
  [Stage 1] build_banks
-      │   Extract per-layer memory banks (W_down weights)
-      │   Output: banks.pt
+      │   Extract per-layer memory banks (MLP weight matrices)
+      │   Options: W_gate, W_up, W_down, W_fc1, W_fc2, W_w1, W_w2, W_w3, ...
+      │   Output: banks.pt {layer_idx → Tensor[K, D]}
       │
       ▼
  [Stage 2] run_trajectory
       │   Hook into model; run prefill + autoregressive generation
-      │   Capture h_pre per layer; compute energy/entropy metrics
-      │   Output: {sample_id}.npz + {sample_id}.json per sample
+      │   Capture h_pre per layer per token; compute energy/entropy
+      │   Output: {sample_id}.npz (energy [L] and [L,T]) + {sample_id}.json (metadata)
       │
       ▼
- [Stage 3] analyze_trajectories
-      │   CPU-only. Read .npz files; compute divergences and scores
-      │   Output: analysis.json
+ [Stage 3] label_sample
+      │   Label each sample: is_hallucination (boolean)
+      │   Options: heuristic (F1-based) or llm_judge (external LLM)
+      │   Output: {sample_id}_label.json
       │
       ▼
- [Stage 4] visualize_analysis
-          Generate matplotlib plots from analysis JSON
-          Output: plots/*.png
+ [Stage 4] evaluate_features
+      │   Load trajectory artifacts + labels; bridge M2/M3 boundary
+      │   Extract baseline metrics (log-probability, entropy)
+      │   Output: feature dicts [{sample_id, is_hallucination, per_layer_features[L], ...}]
+      │
+      ▼
+ [Stage 5] evaluate_probes
+      │   Compute per-layer AUROC table (best feature per layer)
+      │   Fit logistic regression probe with stratified nested CV
+      │   Perform beta sweep over cached score tensors
+      │   Output: metrics dict with AUROC, probe results, beta sweep curves
+      │
+      ▼
+ [Stage 6] report
+          Build self-contained HTML report with plots and metrics
+          Output: report.html (AUROC table, probe AUROC, beta curves, baselines)
 ```
 
 Each stage writes artifacts to disk and can be run independently, making it
@@ -37,34 +51,68 @@ easy to re-run later stages without re-running expensive GPU stages.
 
 ## Package layout (`src/hopfield_llm/`)
 
-| Module | Responsibility |
-|--------|---------------|
-| `models/` | `HFLLM` wrapper, architecture resolution, model profile registry |
-| `hooks/` | Forward-pre-hook registration and h_pre capture during prefill and generation |
-| `memory/` | Memory bank construction from MLP weight matrices |
-| `queries/` | Query extraction strategies (which activation to use as the retrieval query) |
-| `metrics/` | Energy computation, KL/JS/Hellinger divergences, hallucination score aggregation |
-| `datasets/` | `BaseDataset` ABC, `DataSample` dataclass, TruthfulQA/TriviaQA/NQ adapters |
-| `pipeline/` | Stage functions, `ExperimentConfig`, YAML loader, analysis |
-| `storage/` | Artifact save/load (torch + JSON) |
-| `utils/` | Logging, environment config, experiment tracker |
-| `visualization/` | Matplotlib plots from analysis JSON |
-| `cli/` | Argparse CLI with 5 subcommands |
+### Core Inference Pipeline
+
+| Module | Exports | Responsibility |
+|--------|---------|-----------------|
+| `models/` | `HFLLM`, `ModelProfile` | HuggingFace model loader with 4-bit quantization, architecture layer resolution, model alias registry |
+| `hooks/` | `capture_prefill`, `capture_generation`, `PrefillResult`, `GenerationResult` | Forward-pre-hook registration; h_pre capture at last question token (prefill) and per-token (generation) |
+| `memory/` | `extract_banks` | Extract MLP weight matrices (W_gate, W_up, W_down, W_fc1, W_fc2, etc.) per layer as memory banks |
+| `queries/` | `last_token`, `mean_tokens`, `make_positional` | Query extraction strategies: produce [d_m] from [T, d_m] activations |
+| `metrics/` | `compute_energy`, `compute_entropy`, divergence functions, `hallucination_score` | Modern Hopfield energy/entropy primitives, KL/JS/Hellinger divergences, per-layer aggregation |
+| `datasets/` | `BaseDataset`, `DataSample` | Dataset abstraction + TruthfulQA/TriviaQA/NQ adapters; yields question, gold_answers, ID |
+| `pipeline/` | `build_banks`, `run_trajectory`, `analyze_trajectories`, `ExperimentConfig` | Stage orchestration, YAML config loader, per-sample divergence aggregation |
+| `storage/` | `save_torch_artifact`, `load_torch_artifact`, `save_json_artifact` | Persistent I/O for banks, trajectories, analysis JSON |
+| `utils/` | `ExperimentTracker`, `setup_logging`, `load_env_config` | Structured logging, experiment run tracking with git/environment metadata, auto-detect local vs HPC |
+| `cli/` | `build_parser`, `main` | Argparse CLI entry point (5 core subcommands) |
+| `visualization/` | `visualize_analysis` | Matplotlib plots from analysis JSON (layer metrics, divergences) |
+
+### Labeling & Evaluation
+
+| Module | Exports | Responsibility |
+|--------|---------|-----------------|
+| `labeling/` | `label_sample_heuristic`, `LLMJudge`, `label_sample_with_judge` | **Heuristic**: SQuAD F1-based binary classification (fast, no API). **LLMJudge**: External LLM or local HF model for binary judgment. Supports OpenAI-compatible APIs and HuggingFace models for air-gapped HPC. |
+| `analysis/` | `find_answer_span`, `content_token_mask`, `extract_answer_features` | Token-level alignment utilities. Match gold answers in generated text; extract per-layer features ([L] arrays) over answer spans via mean-pooling. |
+| `evaluation/` | Per-layer AUROC, logistic regression probe, beta sweep, report building | **features**: load trajectory artifacts + labels → unified feature dicts. **baselines**: seq_logprob, token entropy. **per_layer_auroc**: per-layer AUROC per feature (best layer per column). **probe**: logistic regression with stratified nested CV. **beta_sweep**: post-hoc recomputation from cached scores. **report**: HTML report with embedded plots. |
+
+---
+
+## Module Dependencies
+
+The architecture uses clean separation of concerns: each module is independent and swappable.
+
+```
+Dataset ─────┐
+             ├─► models/HFLLM ──► hooks/ (capture activations)
+Memory Bank ─┤                        ↓
+             └─► queries/ (extract query)
+                 ↓
+            metrics/ (compute energy/entropy)
+                 ↓
+            pipeline/stages (aggregate per sample)
+                 ├─► labeling/ (mark is_hallucination)
+                 └─► analysis/ (find answer spans, extract features)
+                        ↓
+                   evaluation/ (AUROC, probe, report)
+```
+
+The pipeline supports **post-hoc modification without recomputation**:
+- Change the labeling method without re-running GPU stages (labels are separate artifacts)
+- Swap evaluation metrics without re-running inference (features are cached)
+- Re-sweep beta values without re-running trajectory (raw scores cached)
 
 ---
 
 ## Separation of concerns
 
-The architecture is designed so that changing one concern does not require
-touching unrelated modules:
-
 | Concern | Location | Change impact |
 |---------|----------|--------------|
-| Which weights form the memory | `memory/banks.py` | Zero — hooks and metrics are unaffected |
-| Which activation is the query | `queries/extractors.py` | Zero — pass a different `query_fn` to `capture_prefill` |
-| How energy is computed | `metrics/energy.py` | Zero — banks and hooks don't know the formula |
-| Adding a new dataset | `datasets/` | Zero — implement `BaseDataset`, plug into `run_trajectory` |
-| Adding new metrics | `metrics/` | Zero — only `pipeline/analysis.py` needs updating |
+| Which weights form the memory | `memory/banks.py` | Zero — hooks and metrics unaffected; re-run `build-banks` only |
+| Which activation is the query | `queries/extractors.py` | Zero — pass `query_fn` to `capture_prefill`; re-run `run-trajectory` only |
+| How energy is computed | `metrics/energy.py` | Zero — banks and hooks unaffected; re-run `run-trajectory` and `analyze` only |
+| Adding a new dataset | `datasets/` | Zero — subclass `BaseDataset`, register in `run_trajectory` |
+| Changing labeling method | `labeling/` | Zero — label artifacts separate; re-label only |
+| Adding new evaluation metrics | `evaluation/` | Zero — features are cached; re-run evaluation pipeline only |
 
 ---
 

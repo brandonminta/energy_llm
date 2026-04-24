@@ -29,14 +29,14 @@ MODEL=qwen25_7b DATASET=nq NUM_SHARDS=16 \
 
 ## Pipeline Stages
 
-| Stage | Command | GPU | Input | Output |
-|-------|---------|-----|-------|--------|
-| 1 | `build-banks` | Yes | model alias | `banks.pt` (MLP W_down weights) |
-| 2 | `run-trajectory` | Yes | banks + dataset | `.npz` + `.json` per sample |
-| 3 | `analyze` | No | trajectory dir | `analysis.json` (divergences, scores) |
-| 4 | `visualize` | No | analysis JSON | `plots/` (PNG layer-metric plots) |
+| Stage | Command | GPU | Input | Output | Purpose |
+|-------|---------|-----|-------|--------|---------|
+| 1 | `build-banks` | Yes | model alias | `banks.pt` | Extract MLP weight matrices as memory banks |
+| 2 | `run-trajectory` | Yes | banks + dataset | `.npz` + `.json` per sample | Capture h_pre activations; compute energy/entropy during prefill and generation |
+| 3 | `analyze` | No | trajectory dir | `analysis.json` | Aggregate trajectories; compute per-sample divergences and scores |
+| 4 | `visualize` | No | analysis JSON | `plots/` | Generate matplotlib plots of layer metrics |
 
-Each stage runs independently. `run-experiment` orchestrates all 4 from a YAML config with full experiment tracking (config snapshot, git info, timing, GPU metadata).
+Each stage runs independently and writes artifacts to disk, allowing re-running of downstream stages without GPU cost. `run-experiment` orchestrates all 4 from a YAML config with full experiment tracking (config snapshot, git info, timing, GPU metadata).
 
 ## Supported Models
 

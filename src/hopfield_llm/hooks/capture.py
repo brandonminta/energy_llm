@@ -172,9 +172,9 @@ def _fill_result_arrays(
             top_act_arr[l_idx, t]      = r.top_act
             n_active_arr[l_idx, t]     = r.n_active
             if dists_arr is not None and r.distribution is not None:
-                dists_arr[l_idx, t] = r.distribution.numpy().astype(np.float16)
+                dists_arr[l_idx, t] = r.distribution.cpu().numpy().astype(np.float16)
             if scores_arr is not None and r.scores is not None:
-                scores_arr[l_idx, t] = r.scores.numpy().astype(np.float16)
+                scores_arr[l_idx, t] = r.scores.cpu().numpy().astype(np.float16)
 
     metrics = (
         energy_arr, entropy_arr, norm_entropy_arr,
@@ -247,7 +247,7 @@ def capture_prefill(
     def _make_pre_hook(layer_idx: int):
         def _hook(module, args):
             h = args[0]                                          # [B, T, d]
-            x = h[0].detach().to(torch.float32).cpu()           # [T, d]
+            x = h[0].detach().to(torch.float32)                  # [T, d] on GPU
             if reduce_in_hook:
                 q = query_fn(x)                                  # [d]
                 if normalize_query:
@@ -262,7 +262,7 @@ def capture_prefill(
     def _make_post_hook(layer_idx: int):
         def _hook(module, args, output):
             h = output if isinstance(output, torch.Tensor) else output[0]
-            x = h[0].detach().to(torch.float32).cpu()           # [T, d]
+            x = h[0].detach().to(torch.float32)                  # [T, d] on GPU
             if reduce_in_hook:
                 q = query_fn(x)
                 if normalize_query:
@@ -321,16 +321,18 @@ def capture_prefill(
                 T_p, d = sample.shape
                 x_stacked = np.zeros((L, T_p, d), dtype=np.float32)
                 for l_idx, v in x_buf.items():
-                    x_stacked[l_idx] = v.numpy()
+                    x_stacked[l_idx] = v.cpu().numpy()
             else:
                 d = sample.shape[0]
                 x_stacked = np.zeros((L, 1, d), dtype=np.float32)
                 for l_idx, v in x_buf.items():
-                    x_stacked[l_idx, 0] = v.numpy()
+                    x_stacked[l_idx, 0] = v.cpu().numpy()
         else:
             x_stacked = np.empty((L, 0, 0), dtype=np.float32)
+        del x_buf
         return result, x_stacked
 
+    del x_buf
     return result
 
 
@@ -404,7 +406,7 @@ def capture_generation(
                 return           # prefill phase — skip
             step = step_counter[0]
             if layer_idx in banks:
-                q = h[0, 0, :].detach().to(torch.float32).cpu()
+                q = h[0, 0, :].detach().to(torch.float32)
                 if normalize_query:
                     q = F.normalize(q, dim=-1)
                 r = compute_energy(q, banks[layer_idx],
@@ -418,11 +420,11 @@ def capture_generation(
                 if save_distributions and r.distribution is not None:
                     if step not in dist_buf:
                         dist_buf[step] = {}
-                    dist_buf[step][layer_idx] = r.distribution.numpy().astype(np.float16)
+                    dist_buf[step][layer_idx] = r.distribution.cpu().numpy().astype(np.float16)
                 if save_scores and r.scores is not None:
                     if step not in score_buf:
                         score_buf[step] = {}
-                    score_buf[step][layer_idx] = r.scores.numpy().astype(np.float16)
+                    score_buf[step][layer_idx] = r.scores.cpu().numpy().astype(np.float16)
             if layer_idx == L - 1:
                 step_counter[0] += 1
         return _hook
@@ -434,7 +436,7 @@ def capture_generation(
                 return           # prefill phase — skip
             step = step_counter[0]
             if layer_idx in banks:
-                q = h[0, 0, :].detach().to(torch.float32).cpu()
+                q = h[0, 0, :].detach().to(torch.float32)
                 if normalize_query:
                     q = F.normalize(q, dim=-1)
                 r = compute_energy(q, banks[layer_idx],
@@ -448,11 +450,11 @@ def capture_generation(
                 if save_distributions and r.distribution is not None:
                     if step not in dist_buf:
                         dist_buf[step] = {}
-                    dist_buf[step][layer_idx] = r.distribution.numpy().astype(np.float16)
+                    dist_buf[step][layer_idx] = r.distribution.cpu().numpy().astype(np.float16)
                 if save_scores and r.scores is not None:
                     if step not in score_buf:
                         score_buf[step] = {}
-                    score_buf[step][layer_idx] = r.scores.numpy().astype(np.float16)
+                    score_buf[step][layer_idx] = r.scores.cpu().numpy().astype(np.float16)
             if layer_idx == L - 1:
                 step_counter[0] += 1
         return _hook
@@ -516,6 +518,7 @@ def capture_generation(
             h.remove()
 
     gen_ids = output_ids[0, prompt_len:].cpu()
+    del output_ids  # release GPU memory for the full sequence before post-processing
     token_ids = gen_ids.numpy().astype(np.int32)
     generated_text = llm.tokenizer.decode(gen_ids, skip_special_tokens=True)
     T = len(token_ids)
@@ -528,6 +531,7 @@ def capture_generation(
     top_act_arr      = np.full((L, T), np.nan, dtype=np.float32)
     n_active_arr     = np.zeros((L, T), dtype=np.int32)
 
+    n_captured_steps = len(result_buf)
     for t, step_results in result_buf.items():
         if t >= T:
             continue
@@ -539,10 +543,11 @@ def capture_generation(
             quadratic_arr[l_idx, t]    = r.quadratic
             top_act_arr[l_idx, t]      = r.top_act
             n_active_arr[l_idx, t]     = r.n_active
+    del result_buf
 
     log.debug(
         "Generation: %d tokens, step_counter=%d, captured_steps=%d",
-        T, step_counter[0], len(result_buf),
+        T, step_counter[0], n_captured_steps,
     )
 
     gen_dists:      np.ndarray | None = None
@@ -564,6 +569,7 @@ def capture_generation(
                     continue
                 for l_idx, s in layer_scores.items():
                     gen_raw_scores[l_idx, t] = s
+    del dist_buf, score_buf
 
     gen_cfg = {
         "max_new_tokens": max_new_tokens,

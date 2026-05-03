@@ -5,5 +5,5 @@ max_ram_gb: 60
 default_batch_size: 8
 use_4bit: true            # also on HPC for larger models
 num_workers: 8
-cache_dir: $SCRATCH/hopfield_cache
-results_dir: $SCRATCH/hopfield_results
+cache_dir: $HOME/hopfield_cache
+results_dir: $HOME/hopfield_results

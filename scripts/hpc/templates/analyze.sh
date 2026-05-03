@@ -23,10 +23,8 @@ REPO_ROOT="${REPO_ROOT:-$SLURM_SUBMIT_DIR}"
 
 export HOPFIELD_ENV=hpc
 
-if [ -f "$HOME/micromamba/etc/profile.d/micromamba.sh" ]; then
-    source "$HOME/micromamba/etc/profile.d/micromamba.sh"
-    micromamba activate "${MAMBA_ENV_NAME:-hopfield-llm}"
-fi
+eval "$($HOME/.local/bin/micromamba shell hook --shell bash)"
+micromamba activate "${MAMBA_ENV_NAME:-hopfield-llm}"
 
 mkdir -p logs
 

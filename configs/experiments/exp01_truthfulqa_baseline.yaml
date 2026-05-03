@@ -12,7 +12,7 @@ dataset:
   seed: 42
 
 trajectory:
-  bank: down                  # memory bank: gate | up | down | gate_plus_up | gate_up_concat
+  bank: up                    # memory bank: up | gate | down_values (down is deprecated — wrong shape)
   beta: 15.0                  # Hopfield inverse temperature
   threshold: 0.1              # active-neuron threshold
   energy_mode: dot            # dot | cosine

@@ -307,10 +307,28 @@ def run_trajectory(
     )
     L = llm.n_layers
 
+    # Move banks to GPU so compute_energy matmul stays on device (~10× speedup).
+    prim_banks = {k: v.to(llm.device) for k, v in prim_banks.items()}
+    if sec_banks is not None:
+        sec_banks = {k: v.to(llm.device) for k, v in sec_banks.items()}
+
     if scores_subset_size == -1:
         log.warning(
             "scores_subset_size=-1: saving raw scores for all samples — expect large disk usage."
         )
+
+    # Detect already-completed samples so a resumed run can skip them.
+    if _probe_mode:
+        _done_suffix = f"_{prim_label}.json"
+        done_ids: set[str] = {
+            p.name[: -len(_done_suffix)]
+            for p in out_dir.glob(f"*{_done_suffix}")
+        }
+    else:
+        done_ids = {p.stem for p in out_dir.glob("*.json")}
+    n_skipped = len(done_ids)
+    if n_skipped:
+        log.info("run_trajectory: resuming — skipping %d already-processed samples", n_skipped)
 
     n_ok = n_err = 0
     bar = tqdm(
@@ -321,6 +339,15 @@ def run_trajectory(
     )
 
     for i, sample in enumerate(bar):
+        # Resume: skip samples whose JSON artifact already exists on disk.
+        if _probe_mode:
+            _done_path = out_dir / f"{sample.id}_{prim_label}.json"
+        else:
+            _done_path = out_dir / f"{sample.id}.json"
+        if _done_path.exists():
+            bar.set_postfix(ok=n_ok, skip=n_skipped, err=n_err, refresh=False)
+            continue
+
         if h_pre_mode == "off":
             save_hpre = False
         elif h_pre_mode == "diagnostic":
@@ -473,7 +500,16 @@ def run_trajectory(
                     json.dump(sec_meta, fh, indent=2, ensure_ascii=False)
 
             n_ok += 1
-            bar.set_postfix(ok=n_ok, err=n_err, refresh=False)
+            bar.set_postfix(ok=n_ok, skip=n_skipped, err=n_err, refresh=False)
+
+            # Free large intermediate objects and release the PyTorch CUDA
+            # allocator's cached blocks so they don't accumulate across hundreds
+            # of samples and eventually trigger an OOM kill.
+            del prefill_result, gen_result
+            if h_pre_raw is not None:
+                del h_pre_raw
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as exc:
             n_err += 1

@@ -109,19 +109,26 @@ def _fill_result_arrays(
     save_distributions: bool = False,
     save_scores: bool = False,
     m_per_layer: dict[int, float] = {},
-) -> tuple[tuple[np.ndarray, ...], np.ndarray | None, np.ndarray | None]:
+    accumulate_mean_dist: bool = False,
+) -> tuple[tuple[np.ndarray, ...], np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Compute per-layer per-token energy metrics from a captured query buffer.
 
     Each value in x_buf is expected to be [T, d] (full prompt trajectory).
 
+    Args:
+        accumulate_mean_dist: When True, compute the mean softmax distribution
+            [L, K] via a streaming accumulator instead of materialising the full
+            [L, T, K] tensor.  Peak memory is O(L×K) regardless of prompt length.
+            The result is returned as the fourth element of the return tuple.
+
     Returns:
-        (metrics_tuple, dists, raw_scores)
+        (metrics_tuple, dists, raw_scores, mean_dist)
 
-        metrics_tuple contains 7 arrays each of shape [L, T]:
+        metrics_tuple: 7 arrays each of shape [L, T]:
             energy, entropy, norm_entropy, lse, quadratic, top_act, n_active.
-
-        dists:      float16 [L, T, K] or None.
-        raw_scores: float16 [L, T, K] or None.
+        dists:     float16 [L, T, K] or None  (only when save_distributions=True).
+        raw_scores: float16 [L, T, K] or None (only when save_scores=True).
+        mean_dist: float32 [L, K] or None     (only when accumulate_mean_dist=True).
     """
     # Determine T from x_buf values
     T = 1
@@ -146,6 +153,16 @@ def _fill_result_arrays(
         np.zeros((L, T, K), dtype=np.float16) if save_scores and K > 0 else None
     )
 
+    # Streaming mean-distribution accumulators: [L, K] float64, O(L×K) memory.
+    # Never materialises the full [L, T, K] tensor even for long prompts.
+    _need_dist = save_distributions or accumulate_mean_dist
+    mean_dist_sum:   np.ndarray | None = (
+        np.zeros((L, K), dtype=np.float64) if accumulate_mean_dist and K > 0 else None
+    )
+    mean_dist_count: np.ndarray | None = (
+        np.zeros(L, dtype=np.int64) if accumulate_mean_dist else None
+    )
+
     for l_idx in range(L):
         if l_idx not in x_buf or l_idx not in banks:
             continue
@@ -156,7 +173,7 @@ def _fill_result_arrays(
                 x[t], banks[l_idx],
                 beta=beta, threshold=threshold, mode=mode,
                 M=m_per_layer.get(l_idx),
-                return_distribution=save_distributions,
+                return_distribution=_need_dist,
                 return_scores=save_scores,
             )
             energy_arr[l_idx, t]       = r.energy
@@ -166,16 +183,27 @@ def _fill_result_arrays(
             quadratic_arr[l_idx, t]    = r.quadratic
             top_act_arr[l_idx, t]      = r.top_act
             n_active_arr[l_idx, t]     = r.n_active
-            if dists_arr is not None and r.distribution is not None:
-                dists_arr[l_idx, t] = r.distribution.cpu().numpy().astype(np.float16)
+            if r.distribution is not None:
+                if dists_arr is not None:
+                    dists_arr[l_idx, t] = r.distribution.cpu().numpy().astype(np.float16)
+                if mean_dist_sum is not None and mean_dist_count is not None:
+                    mean_dist_sum[l_idx] += r.distribution.cpu().numpy().astype(np.float64)
+                    mean_dist_count[l_idx] += 1
             if scores_arr is not None and r.scores is not None:
                 scores_arr[l_idx, t] = r.scores.cpu().numpy().astype(np.float16)
+
+    # Normalise accumulated mean distribution → [L, K] float32
+    mean_dist: np.ndarray | None = None
+    if mean_dist_sum is not None and mean_dist_count is not None:
+        counts = mean_dist_count[:, None].clip(1)
+        mean_dist = (mean_dist_sum / counts).astype(np.float32)
+        mean_dist /= mean_dist.sum(axis=-1, keepdims=True).clip(1e-10, None)
 
     metrics = (
         energy_arr, entropy_arr, norm_entropy_arr,
         lse_arr, quadratic_arr, top_act_arr, n_active_arr,
     )
-    return metrics, dists_arr, scores_arr
+    return metrics, dists_arr, scores_arr, mean_dist
 
 
 # ------------------------------------------------------------------
@@ -281,21 +309,18 @@ def capture_prefill(
         for h in hooks:
             h.remove()
 
-    _internal_save_dists = save_distributions or compute_p_ref
-    metrics, dists_arr, scores_arr = _fill_result_arrays(
+    # Use streaming accumulator for p_ref so we never materialise [L, T, K].
+    # dists_arr is only allocated when the caller explicitly wants it
+    # (save_distributions=True); p_ref always uses the O(L×K) path.
+    metrics, dists_arr, scores_arr, mean_dist = _fill_result_arrays(
         x_buf, banks, L, beta, threshold, energy_mode,
-        save_distributions=_internal_save_dists,
+        save_distributions=save_distributions,
         save_scores=save_scores,
         m_per_layer=m_per_layer,
+        accumulate_mean_dist=compute_p_ref,
     )
 
-    p_ref: np.ndarray | None = None
-    if compute_p_ref and dists_arr is not None:
-        p_ref = dists_arr.astype(np.float32).mean(axis=1)   # [L, K]
-        p_ref /= p_ref.sum(axis=-1, keepdims=True).clip(1e-10, None)
-
-    if compute_p_ref and not save_distributions:
-        dists_arr = None
+    p_ref: np.ndarray | None = mean_dist  # [L, K] float32 or None
 
     energy_arr = metrics[0]  # [L, T]
     result = PrefillResult(

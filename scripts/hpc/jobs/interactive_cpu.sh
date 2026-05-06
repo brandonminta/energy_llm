@@ -19,9 +19,9 @@ NODE="${NODE:-compute-0-1}"
 echo "Requesting: $PARTITION | $NODE | $CPUS CPUs | $MEM RAM | $TIME"
 echo "Waiting for allocation..."
 
-# Write the activation script to a temp file so bash --init-file can source
-# it on the compute node (process substitution doesn't cross node boundaries).
-INIT=$(mktemp /tmp/hopfield_init_XXXX.sh)
+# Write the activation script to $HOME (NFS-mounted, visible on all nodes).
+# /tmp is node-local so the compute node can't read a file created there.
+INIT="$HOME/.hopfield_interactive_init.sh"
 cat > "$INIT" << EOF
 eval "\$(\$HOME/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate "\${MAMBA_ENV_NAME:-hopfield-llm}"

@@ -16,6 +16,9 @@ dataset:
 trajectory:
   bank: up
   beta: 15.0
+  calibrate_beta: true
+  calibration_samples: 30
+  beta_target: 0.55
   threshold: 0.1
   energy_mode: dot
   max_new_tokens: 50

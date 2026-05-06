@@ -58,7 +58,7 @@ class ExperimentConfig:
 
     # Analysis parameters
     divergence_metrics: list[str] = field(
-        default_factory=lambda: ["delta_energy", "energy_shift_l1", "gen_drift_mean"]
+        default_factory=lambda: ["delta_energy", "energy_shift_l1"]
     )
     score_metric:       str               = "delta_energy"
     score_aggregation:  str               = "mean"
@@ -221,7 +221,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         diagnostic_subset=int(traj.get("diagnostic_subset", 20)),
         bank=traj.get("bank", "up"),
         divergence_metrics=analysis.get(
-            "divergence_metrics", ["delta_energy", "energy_shift_l1", "gen_drift_mean"]
+            "divergence_metrics", ["delta_energy", "energy_shift_l1"]
         ),
         score_metric=analysis.get("score_metric", "delta_energy"),
         score_aggregation=analysis.get("score_aggregation", "mean"),

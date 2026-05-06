@@ -153,7 +153,6 @@ def load_sample_features(
     de = gen_energy_layer_mean - prefill_energy_last
     de_abs = np.abs(np.where(np.isnan(de), 0.0, de))
     energy_shift_l1 = float(np.sum(de_abs))
-    gen_drift_mean  = _NAN  # requires per-layer KL over time
 
     # ── Pre-computed baselines (NaN when absent) ───────────────────────────
     baselines_path = artifact_dir / f"{sample_id}_baselines.json"

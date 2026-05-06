@@ -43,7 +43,7 @@ def test_analysis_layer_metrics_are_delta_arrays(synthetic_trajectory_dir, tmp_d
         assert len(lm[metric]["mean"]) == 4  # 4 layers in synthetic data
 
     # Scalar summaries live in global_divergences, not layer_metrics
-    for scalar in ("energy_shift_l1", "energy_shift_l2", "gen_drift_mean"):
+    for scalar in ("energy_shift_l1", "energy_shift_l2", "peak_delta_layer"):
         assert scalar not in lm, (
             f"'{scalar}' should be in global_divergences, not layer_metrics"
         )
@@ -55,8 +55,7 @@ def test_analysis_global_divergences(synthetic_trajectory_dir, tmp_dir):
     analyze_trajectories(traj_dir=synthetic_trajectory_dir, output=output)
     analysis = json.loads(output.read_text())
     gd = analysis["global_divergences"]
-    for metric in ("energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
-                   "gen_drift_mean", "gen_drift_max"):
+    for metric in ("energy_shift_l1", "energy_shift_l2", "peak_delta_layer"):
         assert metric in gd, f"Missing scalar summary: {metric}"
         assert "mean" in gd[metric]
         assert "std"  in gd[metric]

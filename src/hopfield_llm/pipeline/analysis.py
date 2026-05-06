@@ -350,7 +350,6 @@ def analyze_trajectories(
     # -- Interpretable scalar summaries: one value per sample → distribution --
     SCALAR_METRIC_NAMES = [
         "energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
-        "gen_drift_mean", "gen_drift_max",
     ]
     global_divergences: dict[str, dict[str, Any]] = {}
     for mn in SCALAR_METRIC_NAMES:

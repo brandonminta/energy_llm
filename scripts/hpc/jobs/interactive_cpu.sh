@@ -1,7 +1,10 @@
 #!/bin/bash
 #
-# Interactive CPU session — allocates a node and activates the environment.
-# Use this for CPU-only work: analyze, visualize, label, evaluate, debugging.
+# Interactive session — allocates a GPU node and activates the environment.
+# Use for CPU-only work (analyze, visualize, label, evaluate, debugging).
+#
+# Must use a GPU node (gpu-dev) even for CPU work because the CPU partition
+# nodes run an older glibc that is incompatible with pyarrow/bitsandbytes.
 #
 # Usage:
 #   bash scripts/hpc/jobs/interactive_cpu.sh
@@ -10,14 +13,16 @@
 #   CPUS=8 MEM=16G TIME=01:00:00 bash scripts/hpc/jobs/interactive_cpu.sh
 #
 CPUS="${CPUS:-4}"
-MEM="${MEM:-8G}"
+MEM="${MEM:-16G}"
 TIME="${TIME:-00:30:00}"
-PARTITION="${PARTITION:-cpu-dev}"
+PARTITION="${PARTITION:-gpu-dev}"
+GPU="${GPU:-a100_1g.5gb}"   # smallest slice — enough for CPU work, fast to allocate
 
-echo "Requesting: $PARTITION | $CPUS CPUs | $MEM RAM | $TIME"
+echo "Requesting: $PARTITION | $CPUS CPUs | $MEM RAM | $TIME | GPU: $GPU (for glibc compat)"
 echo "Waiting for allocation..."
 
 salloc -p "$PARTITION" -c "$CPUS" --mem="$MEM" --time="$TIME" \
+    --gres=gpu:"$GPU":1 \
     --job-name=hopfield-interactive \
     bash --rcfile <(cat <<'EOF'
 eval "$($HOME/.local/bin/micromamba shell hook --shell bash)"

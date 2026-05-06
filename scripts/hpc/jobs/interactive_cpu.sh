@@ -16,8 +16,8 @@ CPUS="${CPUS:-4}"
 MEM="${MEM:-16G}"
 TIME="${TIME:-00:30:00}"
 PARTITION="${PARTITION:-gpu-dev}"
-GPU="${GPU:-a100_1g.5gb}"        # smallest slice on compute-0-0, allocates fast
-NODE="${NODE:-compute-0-0}"      # has 24 a100_1g.5gb slices, least contention
+GPU="${GPU:-a100-sxm4-40gb}"     # compute-0-1 only has full a100-sxm4-40gb
+NODE="${NODE:-compute-0-1}"      # faster to allocate in practice
 
 echo "Requesting: $PARTITION | $NODE | $CPUS CPUs | $MEM RAM | $TIME | GPU: $GPU"
 echo "Waiting for allocation..."

@@ -46,6 +46,44 @@ log = get_logger("pipeline.stages")
 # ------------------------------------------------------------------
 
 
+def _topk_compress(
+    scores: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compress a [..., K] scores tensor into top-k values + indices + tail-max.
+
+    Approximates the softmax over the K axis when ``β·tail_max < β·top1`` —
+    typically true for any β ≥ 1 with a well-trained model.  The tail max
+    lets downstream code reconstruct ``log(Σ_{i∉topk} exp(β·s_i)) ≈ log(K-k)
+    + β·tail_max``, which suffices for the lse and entropy fallback.
+
+    Returns:
+        (topk_values [..., k] float16,
+         topk_indices [..., k] int32,
+         tail_max [...] float16)
+    """
+    sc = scores.astype(np.float32)
+    K = sc.shape[-1]
+    k = min(int(k), K)
+    # np.argpartition: O(K) per row; sort only the top-k slice afterwards.
+    part = np.argpartition(sc, K - k, axis=-1)
+    top_idx_unsorted = part[..., K - k:]  # [..., k]
+    top_vals = np.take_along_axis(sc, top_idx_unsorted, axis=-1)
+    order = np.argsort(-top_vals, axis=-1)
+    top_vals = np.take_along_axis(top_vals, order, axis=-1)
+    top_idx  = np.take_along_axis(top_idx_unsorted, order, axis=-1)
+    if k < K:
+        tail_idx = part[..., : K - k]
+        tail_vals = np.take_along_axis(sc, tail_idx, axis=-1)
+        tail_max = tail_vals.max(axis=-1)
+    else:
+        tail_max = np.full(sc.shape[:-1], -np.inf, dtype=np.float32)
+    return (
+        top_vals.astype(np.float16),
+        top_idx.astype(np.int32),
+        tail_max.astype(np.float16),
+    )
+
+
 def _load_m_per_layer(meta_path: Path) -> dict[int, float]:
     """Load per-layer M values from a bank metadata JSON file."""
     m: dict[int, float] = {}
@@ -179,7 +217,14 @@ def run_trajectory(
     load_in_4bit: bool = True,
     primary_probe: ProbeConfig | None = None,
     secondary_probe: ProbeConfig | None = None,
-    scores_subset_size: int = 200,
+    scores_subset_size: int = 50,
+    score_capture: str = "full",
+    score_topk: int = 256,
+    enable_logit_lens: bool = False,
+    enable_null_control: bool = False,
+    calibrate_beta: bool = False,
+    calibration_samples: int = 20,
+    beta_target: float = 0.55,
 ) -> Path:
     """Run prefill + generation for each sample; persist .npz and .json artifacts.
 
@@ -231,7 +276,8 @@ def run_trajectory(
         secondary_probe:  ProbeConfig for the teacher-forcing secondary pass.
 
     Returns:
-        Path to the output directory.
+        Tuple of (output_directory, calibrated_beta). calibrated_beta is None
+        when calibrate_beta=False or calibration was not requested.
     """
     if h_pre_mode not in {"off", "diagnostic", "all"}:
         raise ValueError(f"h_pre_mode must be 'off', 'diagnostic', or 'all'; got {h_pre_mode!r}")
@@ -317,6 +363,20 @@ def run_trajectory(
             "scores_subset_size=-1: saving raw scores for all samples — expect large disk usage."
         )
 
+    calibrated_beta: float | None = None
+    if calibrate_beta:
+        from hopfield_llm.metrics.calibration import calibrate_beta as _cal_beta
+        _cal_questions = [s.question for s in samples[:calibration_samples]]
+        beta, _cal_info = _cal_beta(
+            llm, prim_banks, _cal_questions,
+            target_fraction=beta_target,
+            hook_target=prim_hook_target,
+            normalize_query=prim_nrm_query,
+        )
+        calibrated_beta = beta
+        save_json_artifact(_cal_info, out_dir / "calibration_beta.json")
+        log.info("calibrate_beta: using β=%.2f for this run (saved calibration_beta.json)", beta)
+
     # Detect already-completed samples so a resumed run can skip them.
     if _probe_mode:
         _done_suffix = f"_{prim_label}.json"
@@ -355,12 +415,17 @@ def run_trajectory(
         else:  # "all"
             save_hpre = True
 
-        save_scores_this_sample = (scores_subset_size == -1 or i < scores_subset_size)
-        if i == scores_subset_size:
-            log.info(
-                "scores_subset_size=%d reached; raw scores will no longer be saved.",
-                scores_subset_size,
-            )
+        if score_capture == "off" or scores_subset_size == 0:
+            save_scores_this_sample = False
+        elif scores_subset_size == -1:
+            save_scores_this_sample = True
+        else:
+            save_scores_this_sample = i < scores_subset_size
+            if i == scores_subset_size:
+                log.info(
+                    "scores_subset_size=%d reached; raw scores will no longer be saved.",
+                    scores_subset_size,
+                )
 
         try:
             # ── Primary probe: prefill ──────────────────────────────────────
@@ -370,6 +435,7 @@ def run_trajectory(
                 return_x=save_hpre, m_per_layer=prim_m,
                 hook_target=prim_hook_target, normalize_query=prim_nrm_query,
                 save_scores=save_scores_this_sample,
+                compute_p_ref=True,
             )
             if save_hpre:
                 prefill_result, h_pre_raw = prefill_out
@@ -384,6 +450,7 @@ def run_trajectory(
                 max_new_tokens=max_new_tokens, m_per_layer=prim_m,
                 hook_target=prim_hook_target, normalize_query=prim_nrm_query,
                 save_scores=save_scores_this_sample,
+                p_ref=prefill_result.p_ref,
             )
             gen_cfg = gen_result.generation_config
             sample = dataclasses.replace(sample, generation_config=gen_cfg)
@@ -395,15 +462,18 @@ def run_trajectory(
                 npz_stem = sample.id
 
             # ── Save primary probe artifacts ────────────────────────────────
-            np.savez_compressed(
-                out_dir / f"{npz_stem}.npz",
+            _npz_kw = dict(
                 prefill_energy=prefill_result.energy_last,
                 prefill_energy_mean=prefill_result.energy_mean,
                 prefill_entropy=prefill_result.entropy[:, -1],
+                prefill_entropy_mean=np.nanmean(prefill_result.entropy, axis=1),
                 prefill_norm_entropy=prefill_result.norm_entropy[:, -1],
+                prefill_norm_entropy_mean=np.nanmean(prefill_result.norm_entropy, axis=1),
                 prefill_lse=prefill_result.lse[:, -1],
+                prefill_lse_mean=np.nanmean(prefill_result.lse, axis=1),
                 prefill_quadratic=prefill_result.quadratic[:, -1],
                 prefill_top_act=prefill_result.top_act[:, -1],
+                prefill_top_act_mean=np.nanmean(prefill_result.top_act, axis=1),
                 prefill_n_active=prefill_result.n_active[:, -1],
                 gen_energy=gen_result.energy,
                 gen_entropy=gen_result.entropy,
@@ -415,20 +485,38 @@ def run_trajectory(
                 token_ids=gen_result.token_ids,
                 generation_config_json=np.array(json.dumps(gen_cfg)),
             )
+            if gen_result.js_per_layer is not None:
+                _npz_kw["gen_js"] = gen_result.js_per_layer
+            if gen_result.hellinger_per_layer is not None:
+                _npz_kw["gen_hellinger"] = gen_result.hellinger_per_layer
+            np.savez_compressed(out_dir / f"{npz_stem}.npz", **_npz_kw)
 
             _pref_scores = prefill_result.scores
             _gen_scores = gen_result.scores
             if _pref_scores is not None or _gen_scores is not None:
                 _scores_kw: dict = {}
-                if _pref_scores is not None:
-                    _scores_kw["prefill_scores"] = _pref_scores
-                if _gen_scores is not None:
-                    _scores_kw["gen_scores"] = _gen_scores
+                if score_capture == "topk":
+                    if _pref_scores is not None:
+                        topv, topi, tail_max = _topk_compress(_pref_scores, score_topk)
+                        _scores_kw["prefill_scores_topk"]      = topv
+                        _scores_kw["prefill_scores_topk_idx"]  = topi
+                        _scores_kw["prefill_scores_tail_max"]  = tail_max
+                    if _gen_scores is not None:
+                        topv, topi, tail_max = _topk_compress(_gen_scores, score_topk)
+                        _scores_kw["gen_scores_topk"]      = topv
+                        _scores_kw["gen_scores_topk_idx"]  = topi
+                        _scores_kw["gen_scores_tail_max"]  = tail_max
+                else:  # "full"
+                    if _pref_scores is not None:
+                        _scores_kw["prefill_scores"] = _pref_scores
+                    if _gen_scores is not None:
+                        _scores_kw["gen_scores"] = _gen_scores
                 np.savez_compressed(out_dir / f"{npz_stem}_scores.npz", **_scores_kw)
 
             meta = {
                 "id": sample.id,
                 "source": sample.source,
+                "category": sample.category,
                 "question": sample.question,
                 "gold_answers": sample.gold_answers,
                 "generated_text": gen_result.generated_text,
@@ -443,21 +531,71 @@ def run_trajectory(
             if save_hpre and h_pre_raw is not None:
                 np.savez_compressed(out_dir / f"{npz_stem}_hpre.npz", h_pre=h_pre_raw)
 
+            # ── Optional: logit-lens entropy (parallel signal, no banks) ────
+            if enable_logit_lens:
+                from hopfield_llm.metrics.logit_lens import compute_logit_lens
+                ll = compute_logit_lens(
+                    llm,
+                    question=sample.question,
+                    generated_text=gen_result.generated_text,
+                    apply_chat_template=True,
+                )
+                np.savez_compressed(
+                    out_dir / f"{npz_stem}_logit_lens.npz",
+                    prefill_logit_entropy=ll.prefill_entropy,
+                    prefill_logit_top_prob=ll.prefill_top_prob,
+                    gen_logit_entropy=ll.gen_entropy,
+                    gen_logit_top_prob=ll.gen_top_prob,
+                )
+
+            # ── Optional: shuffled-bank null control ────────────────────────
+            if enable_null_control:
+                from hopfield_llm.metrics.null_control import compute_shuffled_bank_energy
+                null_pref, null_gen = compute_shuffled_bank_energy(
+                    llm,
+                    question=sample.question,
+                    generated_text=gen_result.generated_text,
+                    banks=prim_banks,
+                    beta=beta,
+                    threshold=threshold,
+                    energy_mode=energy_mode,
+                    m_per_layer=prim_m,
+                    hook_target=prim_hook_target,
+                    normalize_query=prim_nrm_query,
+                    seed=int(seed) + i,
+                )
+                np.savez_compressed(
+                    out_dir / f"{npz_stem}_null_control.npz",
+                    prefill_energy_shuffled=null_pref,    # [L]
+                    gen_energy_shuffled=null_gen,         # [L, T]
+                )
+
             # ── Secondary probe: teacher-forcing pass ───────────────────────
             if _probe_mode and secondary_probe is not None and sec_banks is not None:
-                # T_prompt = number of tokens in the question alone
+                # Build the full sequence the model actually saw at generation
+                # time: chat_template(question) + generated_text.  T_prompt
+                # is the length of the chat-templated question alone.
+                if hasattr(llm.tokenizer, "apply_chat_template"):
+                    prompt_text = llm.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": sample.question}],
+                        tokenize=False, add_generation_prompt=True,
+                    )
+                else:
+                    prompt_text = sample.question
                 _tok = llm.tokenizer(
-                    sample.question, return_tensors="pt", add_special_tokens=False
+                    prompt_text, return_tensors="pt", add_special_tokens=False
                 )
                 T_prompt = _tok["input_ids"].shape[1]
+                full_text = prompt_text + gen_result.generated_text
 
-                full_text = sample.question + gen_result.generated_text
+                # Pass apply_chat_template=False because we already templated.
                 sec_full = capture_prefill(
                     llm, full_text, sec_banks,
                     beta=beta, threshold=threshold, energy_mode=energy_mode,
                     hook_target=secondary_probe.hook_target,
                     normalize_query=secondary_probe.normalize_query,
                     m_per_layer=sec_m,
+                    apply_chat_template=False,
                 )
 
                 T_total = sec_full.energy.shape[1]
@@ -470,10 +608,14 @@ def run_trajectory(
                     prefill_energy=sec_full.energy[:, pref_idx],
                     prefill_energy_mean=np.nanmean(sec_full.energy[:, pref_slice], axis=1),
                     prefill_entropy=sec_full.entropy[:, pref_idx],
+                    prefill_entropy_mean=np.nanmean(sec_full.entropy[:, pref_slice], axis=1),
                     prefill_norm_entropy=sec_full.norm_entropy[:, pref_idx],
+                    prefill_norm_entropy_mean=np.nanmean(sec_full.norm_entropy[:, pref_slice], axis=1),
                     prefill_lse=sec_full.lse[:, pref_idx],
+                    prefill_lse_mean=np.nanmean(sec_full.lse[:, pref_slice], axis=1),
                     prefill_quadratic=sec_full.quadratic[:, pref_idx],
                     prefill_top_act=sec_full.top_act[:, pref_idx],
+                    prefill_top_act_mean=np.nanmean(sec_full.top_act[:, pref_slice], axis=1),
                     prefill_n_active=sec_full.n_active[:, pref_idx],
                     gen_energy=sec_full.energy[:, T_p:],
                     gen_entropy=sec_full.entropy[:, T_p:],
@@ -488,6 +630,7 @@ def run_trajectory(
                 sec_meta = {
                     "id": sample.id,
                     "source": sample.source,
+                    "category": sample.category,
                     "question": sample.question,
                     "gold_answers": sample.gold_answers,
                     "generated_text": gen_result.generated_text,
@@ -521,7 +664,7 @@ def run_trajectory(
 
     bar.close()
     log.info("run_trajectory: finished — %d ok, %d errors → %s", n_ok, n_err, out_dir)
-    return out_dir
+    return out_dir, calibrated_beta
 
 
 # ------------------------------------------------------------------

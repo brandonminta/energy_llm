@@ -1,0 +1,35 @@
+experiment:
+  name: exp04_qwen_chat_template_fix
+  description: |
+    Replication of exp02 (Qwen2.5-3B, 500 TruthfulQA) AFTER the prefill chat-template fix.
+    Identical config except prefill now sees the same chat-templated prompt as generation.
+    Establishes whether the prompt asymmetry alone explains exp02's null result.
+
+model:
+  alias: qwen25_3b
+  load_in_4bit: true
+
+dataset:
+  name: truthfulqa
+  max_samples: 500
+  seed: 42
+
+trajectory:
+  bank: up
+  beta: 15.0
+  threshold: 0.1
+  energy_mode: dot
+  max_new_tokens: 50
+  diagnostic_subset: 0       # we're not analysing raw h_pre this time
+  scores_subset_size: 50     # only enough for a beta sweep on a small calibration set
+
+analysis:
+  score_metric: delta_energy
+  score_aggregation: mean
+  signal_zone: null
+
+sharding:
+  num_shards: 1
+
+output:
+  base_dir: outputs   # override at submit time

@@ -22,35 +22,29 @@ Hook targets
     Captures output tensor shape [B, T, d] — the FFN output y^l.
     Correct query for value-space probe (bank="down_values").
 
-Full-trajectory prefill (M4)
------------------------------
+Full-trajectory prefill
+-----------------------
 ``capture_prefill`` captures the complete [T_prompt, d] activation at every
 layer — no reduction inside the hook.  ``PrefillResult`` fields are therefore
 [L, T_prompt] shaped.  Reduced [L] scalars ``energy_last`` and ``energy_mean``
-are provided for backward compatibility.
-
-Pass ``reduce_in_hook=True`` (deprecated) to revert to the old single-vector
-behaviour using ``query_fn``.
+are provided for downstream convenience.
 
 Tokenization note
 -----------------
-Both capture functions use add_special_tokens=False so that last_token
-selection points to a content token deterministically regardless of whether
-the tokenizer adds a leading BOS token.
+Both capture functions use add_special_tokens=False.  Chat-template wrapping
+is on by default so prefill and generation observe the same tokenized prompt.
 """
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from hopfield_llm.metrics.energy import LayerEnergyResult, compute_energy
-from hopfield_llm.queries.extractors import last_token
 from hopfield_llm.utils.logging import get_logger
 
 log = get_logger("hooks.capture")
@@ -77,6 +71,7 @@ class PrefillResult:
     # Optional dense outputs — None unless save_distributions / save_scores
     distributions: np.ndarray | None = None  # float16 [L, T_prompt, K]
     scores:        np.ndarray | None = None  # float16 [L, T_prompt, K]
+    p_ref:         np.ndarray | None = None  # float32 [L, K] mean-pooled prefill reference distribution
 
 
 @dataclass
@@ -95,6 +90,8 @@ class GenerationResult:
     # Optional dense outputs — None unless save_distributions / save_scores
     distributions:   np.ndarray | None = None  # float16 [L, T, K]
     scores:          np.ndarray | None = None  # float16 [L, T, K]
+    js_per_layer:        np.ndarray | None = None   # float32 [L, T_gen]
+    hellinger_per_layer: np.ndarray | None = None   # float32 [L, T_gen]
 
 
 # ------------------------------------------------------------------
@@ -152,9 +149,7 @@ def _fill_result_arrays(
     for l_idx in range(L):
         if l_idx not in x_buf or l_idx not in banks:
             continue
-        x = x_buf[l_idx]            # [T, d] or [d]
-        if x.ndim == 1:
-            x = x.unsqueeze(0)      # [1, d]
+        x = x_buf[l_idx]            # [T, d]
         t_actual = min(x.shape[0], T)
         for t in range(t_actual):
             r: LayerEnergyResult = compute_energy(
@@ -196,16 +191,22 @@ def capture_prefill(
     beta: float = 15.0,
     threshold: float = 0.1,
     energy_mode: str = "dot",
-    query_fn: Callable[[torch.Tensor], torch.Tensor] = last_token,
     return_x: bool = False,
     hook_target: Literal["mlp_input", "mlp_output"] = "mlp_input",
     normalize_query: bool = True,
     save_distributions: bool = False,
     save_scores: bool = False,
-    reduce_in_hook: bool = False,
     m_per_layer: dict[int, float] = {},
+    apply_chat_template: bool = True,
+    compute_p_ref: bool = False,
 ) -> PrefillResult | tuple[PrefillResult, np.ndarray]:
     """Forward pass on the question; capture full FFN activation trajectories per layer.
+
+    Prefill must observe the *same* tokenized prompt that generation will see;
+    otherwise prefill→generation deltas mix two different forward passes.  By
+    default the question is wrapped in the tokenizer's chat template, matching
+    capture_generation.  Pass apply_chat_template=False to tokenize the raw
+    question (e.g. for base, non-instruct models).
 
     Args:
         llm:               HFLLM instance.
@@ -214,7 +215,6 @@ def capture_prefill(
         beta:              Hopfield inverse temperature.
         threshold:         Active-neuron count threshold.
         energy_mode:       'dot' (default) or 'cosine'.
-        query_fn:          [Deprecated] Only used when reduce_in_hook=True.
         return_x:          If True, also return raw query tensor stacked as [L, T, d].
         hook_target:       'mlp_input'  — pre-hook; captures FFN input x^l.
                            'mlp_output' — post-hook; captures FFN output y^l.
@@ -223,55 +223,36 @@ def capture_prefill(
                            to result.distributions.
         save_scores:       If True, attach float16 [L, T_prompt, K] raw dot-product
                            scores to result.scores.
-        reduce_in_hook:    [Deprecated] When True, applies query_fn inside the hook
-                           to collapse [T, d] → [d] (old single-vector behaviour).
-                           Default False captures the full [T_prompt, d] trajectory.
+        apply_chat_template: If True, wrap question in the tokenizer's chat template
+                           (single user turn, with assistant generation prompt).
+                           Defaults to True so prefill matches the prompt observed
+                           by capture_generation.
 
     Returns:
         PrefillResult with 2-D metric arrays [L, T_prompt] and backward-compat
         scalars energy_last / energy_mean [L].
         When return_x=True, returns (PrefillResult, x_array [L, T_prompt, d]).
     """
-    if reduce_in_hook:
-        warnings.warn(
-            "reduce_in_hook=True is deprecated. The default full-trajectory capture "
-            "(reduce_in_hook=False) provides richer [L, T_prompt] metrics.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
     L = len(llm.layers)
-    x_buf: dict[int, torch.Tensor] = {}  # layer_idx → [T, d] or [d] (deprecated path)
+    x_buf: dict[int, torch.Tensor] = {}  # layer_idx → [T, d]
     hooks = []
 
     def _make_pre_hook(layer_idx: int):
         def _hook(module, args):
             h = args[0]                                          # [B, T, d]
             x = h[0].detach().to(torch.float32)                  # [T, d] on GPU
-            if reduce_in_hook:
-                q = query_fn(x)                                  # [d]
-                if normalize_query:
-                    q = F.normalize(q, dim=-1)
-                x_buf[layer_idx] = q
-            else:
-                if normalize_query:
-                    x = F.normalize(x, dim=-1)                   # row-wise
-                x_buf[layer_idx] = x                             # [T, d]
+            if normalize_query:
+                x = F.normalize(x, dim=-1)                       # row-wise
+            x_buf[layer_idx] = x                                 # [T, d]
         return _hook
 
     def _make_post_hook(layer_idx: int):
         def _hook(module, args, output):
             h = output if isinstance(output, torch.Tensor) else output[0]
             x = h[0].detach().to(torch.float32)                  # [T, d] on GPU
-            if reduce_in_hook:
-                q = query_fn(x)
-                if normalize_query:
-                    q = F.normalize(q, dim=-1)
-                x_buf[layer_idx] = q
-            else:
-                if normalize_query:
-                    x = F.normalize(x, dim=-1)
-                x_buf[layer_idx] = x
+            if normalize_query:
+                x = F.normalize(x, dim=-1)
+            x_buf[layer_idx] = x
         return _hook
 
     for l_idx in range(L):
@@ -285,19 +266,36 @@ def capture_prefill(
             )
 
     try:
-        inputs = llm.tokenizer(question, return_tensors="pt", add_special_tokens=False)
+        if apply_chat_template and hasattr(llm.tokenizer, "apply_chat_template"):
+            prompt = llm.tokenizer.apply_chat_template(
+                [{"role": "user", "content": question}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = question
+        inputs = llm.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         inputs = {k: v.to(llm.device) for k, v in inputs.items()}
         llm.model(**inputs, output_hidden_states=False)
     finally:
         for h in hooks:
             h.remove()
 
+    _internal_save_dists = save_distributions or compute_p_ref
     metrics, dists_arr, scores_arr = _fill_result_arrays(
         x_buf, banks, L, beta, threshold, energy_mode,
-        save_distributions=save_distributions,
+        save_distributions=_internal_save_dists,
         save_scores=save_scores,
         m_per_layer=m_per_layer,
     )
+
+    p_ref: np.ndarray | None = None
+    if compute_p_ref and dists_arr is not None:
+        p_ref = dists_arr.astype(np.float32).mean(axis=1)   # [L, K]
+        p_ref /= p_ref.sum(axis=-1, keepdims=True).clip(1e-10, None)
+
+    if compute_p_ref and not save_distributions:
+        dists_arr = None
 
     energy_arr = metrics[0]  # [L, T]
     result = PrefillResult(
@@ -312,21 +310,15 @@ def capture_prefill(
         energy_mean=np.nanmean(energy_arr, axis=1),
         distributions=dists_arr,
         scores=scores_arr,
+        p_ref=p_ref,
     )
 
     if return_x:
         if x_buf:
-            sample = next(iter(x_buf.values()))
-            if sample.ndim == 2:
-                T_p, d = sample.shape
-                x_stacked = np.zeros((L, T_p, d), dtype=np.float32)
-                for l_idx, v in x_buf.items():
-                    x_stacked[l_idx] = v.cpu().numpy()
-            else:
-                d = sample.shape[0]
-                x_stacked = np.zeros((L, 1, d), dtype=np.float32)
-                for l_idx, v in x_buf.items():
-                    x_stacked[l_idx, 0] = v.cpu().numpy()
+            T_p, d = next(iter(x_buf.values())).shape
+            x_stacked = np.zeros((L, T_p, d), dtype=np.float32)
+            for l_idx, v in x_buf.items():
+                x_stacked[l_idx] = v.cpu().numpy()
         else:
             x_stacked = np.empty((L, 0, 0), dtype=np.float32)
         del x_buf
@@ -359,6 +351,7 @@ def capture_generation(
     seed: int | None = None,
     apply_chat_template: bool = True,
     m_per_layer: dict[int, float] = {},
+    p_ref: np.ndarray | None = None,
 ) -> GenerationResult:
     """Autoregressive generation; capture FFN activations per layer per token.
 
@@ -397,7 +390,17 @@ def capture_generation(
     result_buf: dict[int, dict[int, LayerEnergyResult]] = {}
     dist_buf:   dict[int, dict[int, np.ndarray]] = {}
     score_buf:  dict[int, dict[int, np.ndarray]] = {}
+    js_buf:     dict[int, dict[int, float]] = {}
+    hell_buf:   dict[int, dict[int, float]] = {}
     hooks = []
+
+    p_ref_torch: dict[int, torch.Tensor] = {}
+    if p_ref is not None:
+        for l_idx in range(L):
+            if l_idx < p_ref.shape[0]:
+                p_ref_torch[l_idx] = torch.from_numpy(p_ref[l_idx]).to(llm.device)
+
+    _need_dist = save_distributions or (p_ref is not None)
 
     def _make_pre_hook(layer_idx: int):
         def _hook(module, args):
@@ -412,7 +415,7 @@ def capture_generation(
                 r = compute_energy(q, banks[layer_idx],
                                    beta=beta, threshold=threshold, mode=energy_mode,
                                    M=m_per_layer.get(layer_idx),
-                                   return_distribution=save_distributions,
+                                   return_distribution=_need_dist,
                                    return_scores=save_scores)
                 if step not in result_buf:
                     result_buf[step] = {}
@@ -425,6 +428,20 @@ def capture_generation(
                     if step not in score_buf:
                         score_buf[step] = {}
                     score_buf[step][layer_idx] = r.scores.cpu().numpy().astype(np.float16)
+                if p_ref is not None and r.distribution is not None and layer_idx in p_ref_torch:
+                    _p = r.distribution
+                    _q = p_ref_torch[layer_idx]
+                    eps = 1e-10
+                    _p_c = _p.clamp(min=eps)
+                    _q_c = _q.clamp(min=eps)
+                    _m = 0.5 * (_p_c + _q_c)
+                    js_val = float(
+                        0.5 * (_p_c * (_p_c / _m).log()).sum() +
+                        0.5 * (_q_c * (_q_c / _m).log()).sum()
+                    )
+                    hell_val = float((0.5 * (_p.sqrt() - _q.sqrt()).pow(2).sum()).sqrt())
+                    js_buf.setdefault(step, {})[layer_idx] = js_val
+                    hell_buf.setdefault(step, {})[layer_idx] = hell_val
             if layer_idx == L - 1:
                 step_counter[0] += 1
         return _hook
@@ -442,7 +459,7 @@ def capture_generation(
                 r = compute_energy(q, banks[layer_idx],
                                    beta=beta, threshold=threshold, mode=energy_mode,
                                    M=m_per_layer.get(layer_idx),
-                                   return_distribution=save_distributions,
+                                   return_distribution=_need_dist,
                                    return_scores=save_scores)
                 if step not in result_buf:
                     result_buf[step] = {}
@@ -455,6 +472,20 @@ def capture_generation(
                     if step not in score_buf:
                         score_buf[step] = {}
                     score_buf[step][layer_idx] = r.scores.cpu().numpy().astype(np.float16)
+                if p_ref is not None and r.distribution is not None and layer_idx in p_ref_torch:
+                    _p = r.distribution
+                    _q = p_ref_torch[layer_idx]
+                    eps = 1e-10
+                    _p_c = _p.clamp(min=eps)
+                    _q_c = _q.clamp(min=eps)
+                    _m = 0.5 * (_p_c + _q_c)
+                    js_val = float(
+                        0.5 * (_p_c * (_p_c / _m).log()).sum() +
+                        0.5 * (_q_c * (_q_c / _m).log()).sum()
+                    )
+                    hell_val = float((0.5 * (_p.sqrt() - _q.sqrt()).pow(2).sum()).sqrt())
+                    js_buf.setdefault(step, {})[layer_idx] = js_val
+                    hell_buf.setdefault(step, {})[layer_idx] = hell_val
             if layer_idx == L - 1:
                 step_counter[0] += 1
         return _hook
@@ -571,6 +602,20 @@ def capture_generation(
                     gen_raw_scores[l_idx, t] = s
     del dist_buf, score_buf
 
+    js_arr = hell_arr = None
+    if p_ref is not None and T > 0:
+        js_arr   = np.full((L, T), np.nan, dtype=np.float32)
+        hell_arr = np.full((L, T), np.nan, dtype=np.float32)
+        for t, layer_js in js_buf.items():
+            if t < T:
+                for l_idx, v in layer_js.items():
+                    js_arr[l_idx, t] = v
+        for t, layer_hell in hell_buf.items():
+            if t < T:
+                for l_idx, v in layer_hell.items():
+                    hell_arr[l_idx, t] = v
+    del js_buf, hell_buf
+
     gen_cfg = {
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
@@ -587,4 +632,6 @@ def capture_generation(
         generation_config=gen_cfg,
         distributions=gen_dists,
         scores=gen_raw_scores,
+        js_per_layer=js_arr,
+        hellinger_per_layer=hell_arr,
     )

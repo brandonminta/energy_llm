@@ -53,3 +53,9 @@ DEFAULT_MODEL_ALIAS = "qwen25_3b"
 
 def resolve_model_profile(model_id_or_alias: str) -> ModelProfile | None:
     return MODEL_PROFILES.get(model_id_or_alias.lower())
+
+
+def resolve_model_id(model_id_or_alias: str) -> str:
+    """Map an alias to its HuggingFace model_id; pass non-alias strings through."""
+    profile = MODEL_PROFILES.get(model_id_or_alias.lower())
+    return profile.model_id if profile is not None else model_id_or_alias

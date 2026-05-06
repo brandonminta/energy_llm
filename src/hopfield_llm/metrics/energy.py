@@ -89,8 +89,10 @@ def compute_energy(
             f"Dimension mismatch: memory={tuple(memory.shape)}, query={tuple(query.shape)}"
         )
 
-    query = query.to(torch.float32)
-    memory = memory.to(torch.float32)
+    query  = query.to(torch.float32)
+    # Coerce memory to query.device so callers can pass CPU banks against a
+    # GPU query (or vice versa) without a device-mismatch crash.
+    memory = memory.to(device=query.device, dtype=torch.float32)
 
     K = memory.shape[0]
     if K <= 0:

@@ -29,6 +29,7 @@ class DataSample:
     source:       str            # "triviaqa" | "nq" | "truthfulqa" | ...
     question:     str            # prompt / question text
     gold_answers: list[str]      # reference answer(s) for evaluation
+    category:     str | None = None  # dataset-specific subcategory (e.g. TruthfulQA Adversarial/Misconceptions)
     model:        str = ""       # filled at run time by the pipeline
     metadata:     dict[str, Any] = field(default_factory=dict)
 

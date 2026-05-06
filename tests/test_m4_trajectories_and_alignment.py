@@ -179,18 +179,14 @@ def test_capture_prefill_energy_mean_consistency():
     np.testing.assert_allclose(result.energy_mean, expected_mean, rtol=1e-5)
 
 
-def test_capture_prefill_reduce_in_hook_deprecation():
-    """reduce_in_hook=True should emit a DeprecationWarning."""
+def test_capture_prefill_rejects_removed_reduce_in_hook():
+    """reduce_in_hook was removed in favour of full-trajectory capture."""
     n_layers, T, d = 2, 3, 8
     llm = _FakeLLM(n_layers=n_layers, T=T, d=d)
     banks = _make_banks(n_layers, K=4, d=d)
 
-    with pytest.warns(DeprecationWarning, match="reduce_in_hook"):
-        result = capture_prefill(llm, "q", banks, reduce_in_hook=True)
-
-    # With reduce_in_hook=True the query collapses to [1, d] → T_effective == 1
-    assert result.energy.shape[0] == n_layers
-    assert result.energy_last.shape == (n_layers,)
+    with pytest.raises(TypeError, match="reduce_in_hook"):
+        capture_prefill(llm, "q", banks, reduce_in_hook=True)
 
 
 # ------------------------------------------------------------------

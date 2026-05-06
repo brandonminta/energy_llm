@@ -20,8 +20,7 @@ trajectory:
   diagnostic_subset: 20
 
 analysis:
-  divergence_metrics: [kl_fwd, js, hellinger]
-  score_metric: js
+  score_metric: delta_energy
   score_aggregation: mean
   signal_zone: null
 

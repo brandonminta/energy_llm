@@ -8,12 +8,9 @@ files produced by ``run_trajectory`` and computes:
   3. Scalar hallucination scores per sample
   4. Dataset-level aggregation (mean/std per layer, score summary)
 
-Per-layer KL/JS/Hellinger divergences require distributions saved during
-trajectory collection (save_distributions=True in capture_prefill /
-capture_generation).  The standard .npz files do not contain distributions,
-so those fields are NaN in the analysis output.  Run capture with
-save_distributions=True and pass them to compute_sample_divergences directly
-to get the full M2 divergence picture.
+JS/Hellinger divergences are computed inline during trajectory collection and
+stored in the .npz.  The legacy distribution-based KL/JS/Hellinger per-token
+fields have been removed.
 """
 
 from __future__ import annotations
@@ -25,65 +22,186 @@ from typing import Any
 
 import numpy as np
 
-from hopfield_llm.metrics.divergences import SampleDivergenceResult
+from hopfield_llm.analysis.alignment import (
+    content_token_mask,
+    find_answer_span,
+)
+from hopfield_llm.metrics.divergences import (
+    SampleDivergenceResult,
+    compute_sample_divergences,
+)
 from hopfield_llm.metrics.scoring import hallucination_score
 from hopfield_llm.utils.logging import get_logger
 
 log = get_logger("pipeline.analysis")
 
 
-def _load_sample(traj_dir: Path, sample_id: str) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+# Generation arrays masked along the T axis to NaN outside the answer span.
+_GEN_ARRAY_KEYS = (
+    "gen_energy", "gen_entropy", "gen_norm_entropy",
+    "gen_top_act", "gen_lse",
+    "gen_js", "gen_hellinger",
+)
+
+
+def _answer_token_mask(
+    meta: dict[str, Any],
+    T_gen: int,
+    tokenizer,
+) -> np.ndarray | None:
+    """Build a boolean [T_gen] mask selecting the answer-span tokens.
+
+    Falls back to the content-token mask when no gold answer matches.
+    Returns None when generated_text is empty (caller should keep the full mean).
+    """
+    text = meta.get("generated_text") or ""
+    if not text or tokenizer is None:
+        return None
+    gold = meta.get("gold_answers") or []
+    span = find_answer_span(text, gold, tokenizer)
+    if span is not None:
+        s, e = span
+        if 0 <= s < e <= T_gen:
+            mask = np.zeros(T_gen, dtype=bool)
+            mask[s:e] = True
+            return mask
+    cmask = content_token_mask(text, tokenizer)
+    if cmask.shape[0] >= T_gen:
+        return cmask[:T_gen]
+    out = np.zeros(T_gen, dtype=bool)
+    out[: cmask.shape[0]] = cmask
+    return out
+
+
+def _apply_answer_mask(
+    arrays: dict[str, np.ndarray], mask: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Return a shallow copy of arrays with non-answer columns NaNed in gen_*."""
+    masked = dict(arrays)
+    keep = mask.astype(bool)
+    if not keep.any():
+        return masked
+    for k in _GEN_ARRAY_KEYS:
+        a = arrays.get(k)
+        if a is None or a.ndim != 2:
+            continue
+        T = a.shape[1]
+        m = keep[:T] if keep.shape[0] >= T else np.pad(keep, (0, T - keep.shape[0]))
+        a2 = a.astype(np.float32, copy=True)
+        a2[:, ~m] = np.nan
+        masked[k] = a2
+    return masked
+
+
+def _load_sample(
+    traj_dir: Path, sample_id: str
+) -> tuple[
+    dict[str, Any],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray] | None,
+    dict[str, np.ndarray] | None,
+    dict[str, np.ndarray] | None,
+]:
+    """Load metadata, main npz, and the optional sidecar arrays.
+
+    Sidecars (each may be missing):
+      {id}_scores.npz       — raw [L, T, K] scores for beta sweep / top-k gap
+      {id}_logit_lens.npz   — per-layer logit-lens entropy and top_prob
+      {id}_null_control.npz — per-layer energy under shuffled bank
+    """
     meta   = json.loads((traj_dir / f"{sample_id}.json").read_text(encoding="utf-8"))
     arrays = dict(np.load(traj_dir / f"{sample_id}.npz"))
-    return meta, arrays
 
+    def _load_optional(name: str) -> dict[str, np.ndarray] | None:
+        p = traj_dir / f"{sample_id}_{name}.npz"
+        return dict(np.load(p)) if p.exists() else None
 
-def _compute_sample_divergence(arrays: dict[str, np.ndarray]) -> SampleDivergenceResult:
-    """Compute divergence metrics for one (prefill, generation) pair from .npz arrays.
-
-    Per-layer deltas: generation_mean[l] − prefill[l].
-    Per-layer KL/JS/Hellinger: NaN (distributions not stored in .npz).
-    Scalar summaries: computed from delta_energy.
-    """
-    # Mean-pool generation metrics over tokens → [L]
-    gen_energy_mean       = np.nanmean(arrays["gen_energy"],       axis=1)
-    gen_entropy_mean      = np.nanmean(arrays["gen_entropy"],      axis=1)
-    gen_norm_entropy_mean = np.nanmean(arrays["gen_norm_entropy"], axis=1)
-    gen_top_act_mean      = np.nanmean(arrays["gen_top_act"],      axis=1)
-    gen_lse_mean          = np.nanmean(arrays["gen_lse"],          axis=1)
-
-    delta_energy          = gen_energy_mean       - arrays["prefill_energy"]
-    delta_entropy         = gen_entropy_mean      - arrays["prefill_entropy"]
-    delta_norm_entropy    = gen_norm_entropy_mean - arrays["prefill_norm_entropy"]
-    delta_top_activation  = gen_top_act_mean      - arrays["prefill_top_act"]
-    delta_mean_activation = gen_lse_mean          - arrays["prefill_lse"]
-
-    # Scalar energy summaries
-    de_abs           = np.abs(np.where(np.isnan(delta_energy), 0.0, delta_energy))
-    energy_shift_l1  = float(np.sum(de_abs))
-    energy_shift_l2  = float(np.sqrt(np.sum(de_abs ** 2)))
-    peak_delta_layer = int(np.argmax(de_abs))
-
-    # KL/JS/Hellinger are NaN — distributions not in .npz
-    L     = len(arrays["prefill_energy"])
-    T_gen = arrays["gen_energy"].shape[1]
-    nan_LT = np.full((L, T_gen), np.nan, dtype=np.float32)
-
-    return SampleDivergenceResult(
-        delta_energy=delta_energy.astype(np.float64),
-        delta_entropy=delta_entropy.astype(np.float64),
-        delta_norm_entropy=delta_norm_entropy.astype(np.float64),
-        delta_top_activation=delta_top_activation.astype(np.float64),
-        delta_mean_activation=delta_mean_activation.astype(np.float64),
-        kl_gen_to_prompt_per_layer=nan_LT,
-        js_gen_to_prompt_per_layer=nan_LT.copy(),
-        hellinger_gen_to_prompt_per_layer=nan_LT.copy(),
-        energy_shift_l1=energy_shift_l1,
-        energy_shift_l2=energy_shift_l2,
-        peak_delta_layer=peak_delta_layer,
-        gen_drift_mean=float(np.nan),
-        gen_drift_max=float(np.nan),
+    return (
+        meta,
+        arrays,
+        _load_optional("scores"),
+        _load_optional("logit_lens"),
+        _load_optional("null_control"),
     )
+
+
+def _top_act_gap_per_layer(gen_scores: np.ndarray) -> np.ndarray:
+    """Mean over T of (top1 − top2) of gen_scores[L, T, K].
+
+    A small gap means retrieval is "confused" — many bank rows are similarly
+    activated.  A large gap means one row dominates.
+    """
+    sc = gen_scores.astype(np.float32)            # [L, T, K]
+    if sc.ndim != 3 or sc.shape[2] < 2:
+        return np.full(sc.shape[0] if sc.ndim >= 1 else 0, np.nan, dtype=np.float64)
+    # Partition is O(K log 2); avoids a full sort along the K axis.
+    top2 = np.partition(sc, -2, axis=-1)[..., -2:]   # [L, T, 2]
+    gap  = top2[..., 1] - top2[..., 0]               # [L, T] (top1 - top2)
+    return np.nanmean(gap.astype(np.float64), axis=1)  # [L]
+
+
+def _top_act_gap_per_layer_topk(topk_values: np.ndarray) -> np.ndarray:
+    """Same gap from topk-compressed scores.
+
+    topk_values has shape [L, T, k] with values pre-sorted descending along
+    the last axis.  Top1 is column 0, top2 column 1.
+    """
+    v = topk_values.astype(np.float32)
+    if v.ndim != 3 or v.shape[2] < 2:
+        return np.full(v.shape[0] if v.ndim >= 1 else 0, np.nan, dtype=np.float64)
+    gap = v[..., 0] - v[..., 1]                       # [L, T]
+    return np.nanmean(gap.astype(np.float64), axis=1)  # [L]
+
+
+def _compute_sample_divergence(
+    arrays: dict[str, np.ndarray],
+    scores: dict[str, np.ndarray] | None = None,
+    logit_lens: dict[str, np.ndarray] | None = None,
+    null_control: dict[str, np.ndarray] | None = None,
+) -> SampleDivergenceResult:
+    """Wrap metrics.divergences.compute_sample_divergences for one .npz dict."""
+    div = compute_sample_divergences(
+        prompt_energy=arrays.get("prefill_energy_mean", arrays["prefill_energy"]),
+        gen_energy=arrays["gen_energy"],
+        prompt_entropy=arrays.get("prefill_entropy_mean"),
+        prompt_norm_entropy=arrays.get("prefill_norm_entropy_mean"),
+        prompt_top_act=arrays.get("prefill_top_act_mean"),
+        prompt_lse=arrays.get("prefill_lse_mean"),
+        gen_entropy=arrays.get("gen_entropy"),
+        gen_norm_entropy=arrays.get("gen_norm_entropy"),
+        gen_top_act=arrays.get("gen_top_act"),
+        gen_lse=arrays.get("gen_lse"),
+        gen_js=arrays.get("gen_js"),
+        gen_hellinger=arrays.get("gen_hellinger"),
+    )
+    if scores is not None:
+        if "gen_scores" in scores:
+            div.top_act_gap_mean = _top_act_gap_per_layer(scores["gen_scores"])
+        elif "gen_scores_topk" in scores:
+            div.top_act_gap_mean = _top_act_gap_per_layer_topk(scores["gen_scores_topk"])
+
+    # Logit-lens sidecar
+    if logit_lens is not None:
+        gen_ent = logit_lens.get("gen_logit_entropy")        # [L, T]
+        pre_ent = logit_lens.get("prefill_logit_entropy")    # [L]
+        gen_top = logit_lens.get("gen_logit_top_prob")       # [L, T]
+        if gen_ent is not None and pre_ent is not None and gen_ent.ndim == 2:
+            gen_ent_mean = np.nanmean(gen_ent.astype(np.float64), axis=1)
+            div.delta_logit_entropy    = gen_ent_mean - pre_ent.astype(np.float64)
+            div.gen_logit_entropy_mean = gen_ent_mean
+        if gen_top is not None and gen_top.ndim == 2 and gen_top.shape[1] > 0:
+            div.gen_logit_top_prob_min = np.nanmin(gen_top.astype(np.float64), axis=1)
+
+    # Null-control sidecar: compute the same delta_energy on the shuffled bank
+    if null_control is not None:
+        pref_n = null_control.get("prefill_energy_shuffled")
+        gen_n  = null_control.get("gen_energy_shuffled")
+        if pref_n is not None and gen_n is not None and gen_n.ndim == 2:
+            div.delta_energy_null = (
+                np.nanmean(gen_n.astype(np.float64), axis=1) - pref_n.astype(np.float64)
+            )
+
+    return div
 
 
 def analyze_trajectories(
@@ -92,6 +210,8 @@ def analyze_trajectories(
     score_metric: str = "delta_energy",
     score_aggregation: str = "mean",
     signal_zone: tuple[int, int] | None = None,
+    pool_over_answer: bool = False,
+    tokenizer_id: str | None = None,
 ) -> Path:
     """Aggregate trajectory .npz/.json files into an analysis JSON.
 
@@ -103,6 +223,14 @@ def analyze_trajectories(
         score_metric:      Metric for the scalar hallucination score.
         score_aggregation: Aggregation method (mean / max / weighted).
         signal_zone:       Optional (start, end) layer slice for scoring.
+        pool_over_answer:  When True, pool generation metrics only over the
+                           tokens that span the gold answer (or the content
+                           tokens as fallback) instead of all generation tokens.
+                           Loads a tokenizer matching the model recorded in the
+                           sample metadata; pass ``tokenizer_id`` to override.
+        tokenizer_id:      HuggingFace model id or alias used to load a
+                           tokenizer when ``pool_over_answer=True``.  Defaults
+                           to the model alias in the first sample's metadata.
 
     Returns:
         Path to the written analysis JSON file.
@@ -123,6 +251,23 @@ def analyze_trajectories(
 
     log.info("Analyzing %d samples from %s", len(sample_ids), traj_dir)
 
+    tokenizer = None
+    if pool_over_answer:
+        # Load a tokenizer once (no model weights).  Resolve via model profile
+        # so callers can pass an alias like "qwen25_3b".
+        from hopfield_llm.models.profiles import resolve_model_id
+        from transformers import AutoTokenizer  # noqa: WPS433
+        first_meta = json.loads(
+            (traj_dir / f"{sample_ids[0]}.json").read_text(encoding="utf-8")
+        )
+        alias = tokenizer_id or first_meta.get("model") or "qwen25_3b"
+        try:
+            hf_id = resolve_model_id(alias)
+        except Exception:
+            hf_id = alias
+        log.info("pool_over_answer=True: loading tokenizer for %s (%s)", alias, hf_id)
+        tokenizer = AutoTokenizer.from_pretrained(hf_id, use_fast=True)
+
     all_divs:   list[SampleDivergenceResult] = []
     all_scores: list[float]                  = []
     all_metas:  list[dict[str, Any]]         = []
@@ -131,12 +276,25 @@ def analyze_trajectories(
 
     for sample_id in sample_ids:
         try:
-            meta, arrays = _load_sample(traj_dir, sample_id)
+            meta, arrays, scores, logit_lens, null_control = _load_sample(
+                traj_dir, sample_id
+            )
             all_metas.append(meta)
             if n_layers is None:
                 n_layers = arrays["prefill_energy"].shape[0]
 
-            div = _compute_sample_divergence(arrays)
+            if pool_over_answer and tokenizer is not None:
+                T_gen = arrays["gen_energy"].shape[1]
+                mask = _answer_token_mask(meta, T_gen, tokenizer)
+                if mask is not None and mask.any():
+                    arrays = _apply_answer_mask(arrays, mask)
+
+            div = _compute_sample_divergence(
+                arrays,
+                scores=scores,
+                logit_lens=logit_lens,
+                null_control=null_control,
+            )
             all_divs.append(div)
 
             score = hallucination_score(
@@ -146,7 +304,10 @@ def analyze_trajectories(
                 aggregation=score_aggregation,
             )
             all_scores.append(score)
-            category_scores[meta.get("source", "unknown")].append(score)
+            # Prefer dataset-specific category (e.g. TruthfulQA category field);
+            # fall back to source name (dataset alias) when no category is set.
+            cat_key = meta.get("category") or meta.get("source") or "unknown"
+            category_scores[cat_key].append(score)
 
         except Exception as exc:
             log.warning("Skipping %s: %s", sample_id, exc)
@@ -160,15 +321,30 @@ def analyze_trajectories(
     # -- Per-layer delta metrics: stack [N, L] → mean/std --
     LAYER_METRIC_NAMES = [
         "delta_energy", "delta_entropy", "delta_norm_entropy",
-        "delta_top_activation", "delta_mean_activation",
+        "delta_top_activation", "delta_lse",
+        # Per-layer temporal metrics (always populated from gen_energy [L, T])
+        "energy_slope", "energy_var", "energy_spread",
+        # Per-layer top1-top2 gap (NaN when scores not saved for this sample)
+        "top_act_gap_mean",
+        # Logit-lens metrics (NaN when enable_logit_lens=False at capture)
+        "delta_logit_entropy", "gen_logit_entropy_mean", "gen_logit_top_prob_min",
+        # Shuffled-bank null control (NaN when enable_null_control=False)
+        "delta_energy_null",
+        # Inline JS and Hellinger divergences (NaN when p_ref not computed)
+        "js_mean_per_layer", "js_max_per_layer",
+        "hellinger_mean_per_layer", "hellinger_max_per_layer",
     ]
     layer_metrics: dict[str, dict[str, Any]] = {}
     for mn in LAYER_METRIC_NAMES:
-        stacked = np.stack([getattr(d, mn) for d in all_divs], axis=0)  # [N, L]
+        cols = []
+        for d in all_divs:
+            v = getattr(d, mn, None)
+            cols.append(v if v is not None else np.full(n_layers, np.nan, dtype=np.float64))
+        stacked = np.stack(cols, axis=0)  # [N, L]
         layer_metrics[mn] = {
             "mean": np.nanmean(stacked, axis=0).tolist(),
             "std":  np.nanstd(stacked,  axis=0).tolist(),
-            "n_samples": n_scored,
+            "n_samples": int(np.sum(np.any(np.isfinite(stacked), axis=1))),
         }
 
     # -- Interpretable scalar summaries: one value per sample → distribution --

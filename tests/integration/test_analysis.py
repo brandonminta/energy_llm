@@ -35,7 +35,7 @@ def test_analysis_layer_metrics_are_delta_arrays(synthetic_trajectory_dir, tmp_d
 
     expected = [
         "delta_energy", "delta_entropy", "delta_norm_entropy",
-        "delta_top_activation", "delta_mean_activation",
+        "delta_top_activation", "delta_lse",
     ]
     for metric in expected:
         assert metric in lm, f"Missing per-layer metric: {metric}"

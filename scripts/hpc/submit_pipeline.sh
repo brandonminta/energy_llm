@@ -32,7 +32,7 @@ export ENERGY_MODE="${ENERGY_MODE:-dot}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-50}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$SCRATCH/hopfield_results/${MODEL}/${DATASET}}"
 export BANKS_PATH="${BANKS_PATH:-$SCRATCH/hopfield_cache/banks/${MODEL}_banks.pt}"
-export SCORE_METRIC="${SCORE_METRIC:-js}"
+export SCORE_METRIC="${SCORE_METRIC:-delta_energy}"
 export SCORE_AGGREGATION="${SCORE_AGGREGATION:-mean}"
 
 mkdir -p logs

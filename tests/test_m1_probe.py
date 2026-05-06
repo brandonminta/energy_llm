@@ -105,18 +105,13 @@ def test_bank_metadata_has_M(llm):
         assert meta[l_idx]["M"] > 0.0, f"Layer {l_idx}: M={meta[l_idx]['M']} is not positive"
 
 
-def test_down_bank_emits_future_warning(llm):
-    """bank='down' must emit FutureWarning pointing to down_values."""
-    import warnings
+def test_down_bank_is_rejected(llm):
+    """bank='down' must be rejected with a hard ValueError pointing to down_values."""
+    import pytest as _pytest
     from hopfield_llm.memory.banks import extract_banks
 
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
+    with _pytest.raises(ValueError, match="down_values"):
         extract_banks(llm, bank="down", normalize=True)
-
-    future_warnings = [x for x in w if issubclass(x.category, FutureWarning)]
-    assert future_warnings, "No FutureWarning emitted for bank='down'"
-    assert "down_values" in str(future_warnings[0].message)
 
 
 # ------------------------------------------------------------------

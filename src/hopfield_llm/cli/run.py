@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 from hopfield_llm.pipeline.analysis import analyze_trajectories
-from hopfield_llm.pipeline.stages import build_banks, run_trajectory
+from hopfield_llm.pipeline.stages import build_banks, label_trajectory, run_trajectory
 from hopfield_llm.utils.logging import setup_logging
 
 
@@ -22,8 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model",   required=True, help="Model alias or HuggingFace model ID")
     p.add_argument("--output",  required=True, help="Output path for banks .pt file")
     p.add_argument("--bank",    default="up",
-                   choices=["gate", "up", "down", "down_values",
-                            "gate_proj", "up_proj", "down_proj", "fc1", "fc2", "w1", "w2", "w3"],
+                   choices=["gate", "up", "down_values",
+                            "gate_proj", "up_proj", "fc1", "w1", "w3"],
                    help="MLP projection to use as the memory bank")
     p.add_argument("--device",  default=None)
     p.add_argument("--no-4bit", action="store_true", help="Disable 4-bit quantization")
@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-shards", type=int, default=1, dest="num_shards")
     p.add_argument("--device",   default=None)
     p.add_argument("--no-4bit",  action="store_true")
+    p.add_argument("--calibrate-beta", action="store_true", dest="calibrate_beta",
+                   help="Auto-calibrate β before the run to hit 55%% of max entropy")
+    p.add_argument("--calibration-samples", type=int, default=20, dest="calibration_samples",
+                   help="Number of samples used for beta calibration (default: 20)")
+    p.add_argument("--beta-target", type=float, default=0.55, dest="beta_target",
+                   help="Target norm_entropy fraction for beta calibration (default: 0.55)")
 
     # ── Stage 3 — analysis ────────────────────────────────────────────────────
     p = subparsers.add_parser("analyze", help="Aggregate trajectories → analysis JSON (CPU-only)")
@@ -57,22 +63,63 @@ def build_parser() -> argparse.ArgumentParser:
         "--score-metric", default="delta_energy", dest="score_metric",
         choices=[
             "delta_energy", "delta_norm_entropy", "delta_entropy",
-            "delta_top_activation", "delta_mean_activation",
-            "kl_gen_to_prompt_per_layer", "js_gen_to_prompt_per_layer",
-            "hellinger_gen_to_prompt_per_layer",
+            "delta_top_activation", "delta_lse",
+            # Temporal metrics over generation tokens
+            "energy_slope", "energy_var", "energy_spread",
+            # Retrieval-confidence metric (requires saved scores)
+            "top_act_gap_mean",
+            # Logit-lens metrics (require enable_logit_lens=True at capture)
+            "delta_logit_entropy", "gen_logit_entropy_mean", "gen_logit_top_prob_min",
+            # Shuffled-bank null control
+            "delta_energy_null",
             "energy_shift_l1", "energy_shift_l2", "peak_delta_layer",
-            "gen_drift_mean", "gen_drift_max",
         ],
     )
     p.add_argument("--score-aggregation", default="mean", dest="score_aggregation",
-                   choices=["mean", "max", "weighted"])
+                   choices=["mean", "max"])
     p.add_argument("--signal-zone", type=int, nargs=2, default=None, dest="signal_zone",
                    metavar=("START", "END"))
+    p.add_argument("--pool-over-answer", action="store_true", dest="pool_over_answer",
+                   help="Pool generation metrics only over the gold-answer span "
+                        "(falls back to content tokens). Loads a tokenizer.")
+    p.add_argument("--tokenizer-id", default=None, dest="tokenizer_id",
+                   help="Override the model alias used to load a tokenizer "
+                        "for --pool-over-answer.")
 
     # ── Stage 4 — visualization ───────────────────────────────────────────────
     p = subparsers.add_parser("visualize", help="Generate plots from analysis JSON (CPU-only)")
     p.add_argument("--analysis", required=True)
     p.add_argument("--output",   required=True, help="Output directory for plots")
+
+    # ── Stage 5 — labeling (heuristic + LLM judge) ────────────────────────────
+    p = subparsers.add_parser(
+        "label",
+        help="Label each sample with F1 heuristic + LLM judge (CPU-only API or local HF)",
+    )
+    p.add_argument("--trajectories", required=True, help="Trajectory directory (output of run-trajectory)")
+    p.add_argument("--output",       required=True, help="Directory for {id}_labeled.json + calibration.json")
+    p.add_argument("--judge-model",  default="gpt-4o-mini", dest="judge_model")
+    p.add_argument("--api-base",     default="https://api.openai.com/v1", dest="api_base",
+                   help="OpenAI-compatible API base URL; pass empty string '' to use a local HF model")
+    p.add_argument("--api-key",      default=None, dest="api_key",
+                   help="API key (defaults to OPENAI_API_KEY env var)")
+    p.add_argument("--heuristic-threshold", type=float, default=0.3, dest="heuristic_threshold")
+    p.add_argument("--calibration-subset-size", type=int, default=50, dest="calibration_subset_size")
+    p.add_argument("--temperature",  type=float, default=0.0)
+
+    # ── Stage 6 — evaluation report ───────────────────────────────────────────
+    p = subparsers.add_parser(
+        "evaluate",
+        help="Per-layer AUROC + logistic probe + baselines → HTML report (CPU-only)",
+    )
+    p.add_argument("--trajectories", required=True, help="Trajectory directory")
+    p.add_argument("--labels",       default=None,
+                   help="Label directory ({id}_label.json); defaults to --trajectories")
+    p.add_argument("--output",       required=True, help="Output HTML path")
+    p.add_argument("--beta",         type=float, default=15.0,
+                   help="Beta used during capture (centres the post-hoc beta sweep)")
+    p.add_argument("--dataset-name", default="dataset", dest="dataset_name",
+                   help="Display name in the report header")
 
     # ── Convenience — run full experiment from config ─────────────────────────
     p = subparsers.add_parser("run-experiment",
@@ -127,7 +174,7 @@ def _run_experiment(args: argparse.Namespace) -> int:
             )
             tracker.log_metric("stage1_complete", 1.0)
 
-        run_trajectory(
+        _, calibrated_beta = run_trajectory(
             model=cfg.model_alias, dataset=cfg.dataset_name,
             banks=str(banks_path), output=str(traj_dir),
             beta=cfg.beta, threshold=cfg.threshold, energy_mode=cfg.energy_mode,
@@ -135,7 +182,18 @@ def _run_experiment(args: argparse.Namespace) -> int:
             max_new_tokens=cfg.max_new_tokens, diagnostic_subset=cfg.diagnostic_subset,
             shard_id=shard_id, num_shards=cfg.num_shards,
             device=device, load_in_4bit=cfg.load_in_4bit,
+            scores_subset_size=cfg.scores_subset_size,
+            score_capture=cfg.score_capture,
+            score_topk=cfg.score_topk,
+            enable_logit_lens=cfg.enable_logit_lens,
+            enable_null_control=cfg.enable_null_control,
+            calibrate_beta=cfg.calibrate_beta,
+            calibration_samples=cfg.calibration_samples,
+            beta_target=cfg.beta_target,
         )
+        if calibrated_beta is not None:
+            tracker.patch_config({"trajectory": {"beta": calibrated_beta}})
+            tracker.log_metric("calibrated_beta", calibrated_beta)
         tracker.log_metric("stage2_complete", 1.0)
 
         if cfg.num_shards <= 1:
@@ -180,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
             diagnostic_subset=args.diagnostic_subset,
             shard_id=args.shard_id, num_shards=args.num_shards,
             device=args.device, load_in_4bit=not args.no_4bit,
+            calibrate_beta=args.calibrate_beta,
+            calibration_samples=args.calibration_samples,
+            beta_target=args.beta_target,
         )
     elif args.command == "analyze":
         signal_zone = tuple(args.signal_zone) if args.signal_zone else None
@@ -187,10 +248,38 @@ def main(argv: list[str] | None = None) -> int:
             traj_dir=args.trajectories, output=args.output,
             score_metric=args.score_metric, score_aggregation=args.score_aggregation,
             signal_zone=signal_zone,
+            pool_over_answer=args.pool_over_answer,
+            tokenizer_id=args.tokenizer_id,
         )
     elif args.command == "visualize":
         from hopfield_llm.visualization.plots import visualize_analysis
         visualize_analysis(args.analysis, args.output)
+    elif args.command == "label":
+        import os
+        from hopfield_llm.labeling.llm_judge import LLMJudge
+        api_base = args.api_base if args.api_base else None
+        judge = LLMJudge(
+            model_id=args.judge_model,
+            api_base=api_base,
+            api_key=args.api_key or os.environ.get("OPENAI_API_KEY"),
+            temperature=args.temperature,
+        )
+        label_trajectory(
+            traj_dir=args.trajectories,
+            output=args.output,
+            judge=judge,
+            heuristic_threshold=args.heuristic_threshold,
+            calibration_subset_size=args.calibration_subset_size,
+        )
+    elif args.command == "evaluate":
+        from hopfield_llm.evaluation.report import build_eval_report
+        build_eval_report(
+            artifact_dir=Path(args.trajectories),
+            labels_dir=Path(args.labels or args.trajectories),
+            out_path=Path(args.output),
+            beta=args.beta,
+            dataset_name=args.dataset_name,
+        )
     elif args.command == "run-experiment":
         return _run_experiment(args)
     else:

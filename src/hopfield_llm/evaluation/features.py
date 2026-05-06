@@ -148,18 +148,6 @@ def load_sample_features(
 
     delta_energy = (gen_energy_answer - prefill_energy_last).astype(np.float32)
 
-    # ── KL divergence [L] (NaN unless pre-computed with save_distributions) ─
-    kl_path = artifact_dir / f"{sample_id}_kl.npz"
-    if kl_path.exists():
-        kl_arr = dict(np.load(kl_path)).get("kl_gen_to_prompt_per_layer")
-        kl_gen_to_prompt_mean = (
-            np.nanmean(kl_arr, axis=1).astype(np.float32)
-            if kl_arr is not None
-            else np.full(L, np.nan, np.float32)
-        )
-    else:
-        kl_gen_to_prompt_mean = np.full(L, np.nan, np.float32)
-
     # ── Scalar energy summaries (recomputed from arrays) ───────────────────
     gen_energy_layer_mean = np.nanmean(gen_energy, axis=1)  # [L]
     de = gen_energy_layer_mean - prefill_energy_last
@@ -194,11 +182,9 @@ def load_sample_features(
         "gen_entropy_answer":     gen_entropy_answer.astype(np.float32),
         "gen_top_act_answer":     gen_top_act_answer.astype(np.float32),
         "gen_mean_act_answer":    gen_mean_act_answer.astype(np.float32),
-        "delta_energy":           delta_energy,
-        "kl_gen_to_prompt_mean":  kl_gen_to_prompt_mean,
+        "delta_energy":    delta_energy,
         # Scalar divergences
         "energy_shift_l1": energy_shift_l1,
-        "gen_drift_mean":  gen_drift_mean,
         # Baselines (scalar, NaN when not pre-computed)
         "seq_logprob_mean":   float(bl.get("seq_logprob_mean",   _NAN)),
         "token_entropy_mean": float(bl.get("token_entropy_mean", _NAN)),

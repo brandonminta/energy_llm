@@ -20,7 +20,7 @@ def test_load_default_config():
     assert cfg.energy_mode == "dot"
     assert cfg.load_in_4bit is True
     assert cfg.seed == 42
-    assert "js" in cfg.divergence_metrics
+    assert cfg.score_metric == "delta_energy"
     assert cfg.signal_zone is None
 
 

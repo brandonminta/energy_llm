@@ -18,11 +18,15 @@ trajectory:
   energy_mode: dot            # dot | cosine
   max_new_tokens: 50
   diagnostic_subset: 20       # samples with raw h_pre saved
+  calibrate_beta: false       # auto-calibrate β to target 55% of max entropy
+  calibration_samples: 20     # samples used for calibration
+  beta_target: 0.55           # target norm_entropy fraction
 
 analysis:
-  divergence_metrics: [kl_fwd, js, hellinger]
-  score_metric: js            # metric for scalar hallucination score
-  score_aggregation: mean     # mean | max | weighted
+  # Use delta_energy (always populated). Inline JS/Hellinger variants
+  # (js_mean_per_layer, hellinger_mean_per_layer) are also available.
+  score_metric: delta_energy
+  score_aggregation: mean     # mean | max
   signal_zone: null           # [start, end] layer slice or null for all
 
 sharding:

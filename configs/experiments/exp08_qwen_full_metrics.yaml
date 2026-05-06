@@ -1,0 +1,52 @@
+experiment:
+  name: exp08_qwen_full_metrics
+  description: |
+    Same trajectory capture as exp04, but turns on EVERY new metric from the
+    metrics audit (block E):
+
+      - prefill / generation observe the chat-templated prompt (E0, default)
+      - per-layer temporal energy: slope, variance, spread (E2, free)
+      - top1-top2 retrieval gap (E3, requires saved scores)
+      - logit-lens entropy + top-1 prob (E5, +1 forward pass per sample)
+      - shuffled-bank null control (E6, +1 forward pass per sample)
+      - top-K compressed scores instead of full [L, T, K] (E7, ~40x less disk)
+
+    Use this config to find out which (if any) of the new metrics carries
+    hallucination signal that the original delta_energy did not.
+
+model:
+  alias: qwen25_3b
+  load_in_4bit: true
+
+dataset:
+  name: truthfulqa
+  max_samples: 500
+  seed: 42
+
+trajectory:
+  bank: up
+  beta: 15.0
+  threshold: 0.1
+  energy_mode: dot
+  max_new_tokens: 50
+  diagnostic_subset: 0
+
+  # Storage: top-256 + tail-max instead of full [L, T, K] saves ~95% disk.
+  scores_subset_size: 200          # save scores for the first 200 samples
+  score_capture: topk
+  score_topk: 256
+
+  # New parallel signals
+  enable_logit_lens: true          # +1 forward pass per sample
+  enable_null_control: true        # +1 forward pass per sample (small bank shuffle)
+
+analysis:
+  score_metric: delta_logit_entropy   # the most likely-to-find-signal new metric
+  score_aggregation: mean
+  signal_zone: null
+
+sharding:
+  num_shards: 1
+
+output:
+  base_dir: outputs

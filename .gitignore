@@ -35,9 +35,13 @@ Thumbs.db
 # Log files (runtime logs go to outputs/, not the repo)
 *.log
 
-# Large binary artifacts — PyTorch checkpoints, numpy arrays
+# Large binary artifacts — PyTorch checkpoints, numpy arrays, HF weights
 *.pt
 *.npz
+*.npy
+*.safetensors
+*.pkl
+*.pickle
 
 # Experiment outputs, caches, and data (all runtime-generated)
 data/
@@ -58,6 +62,20 @@ model_cache/
 .cache/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# Test coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ML experiment tracking
+wandb/
+mlruns/
+
+# Profiling
+*.prof
 
 # Claude Code per-project local settings (machine-specific, not for VCS)
 .claude/

@@ -19,7 +19,6 @@ constitutes memory* without touching hooks, metrics, or the pipeline.
 
 from __future__ import annotations
 
-import warnings
 from typing import Any, Iterable
 
 import torch
@@ -84,9 +83,9 @@ def _resolve_proj(mlp: Any, bank: str) -> tuple[str, Any]:
         return _first_existing_attr(mlp, ("gate_proj", "fc1", "w1"), role="gate")
     if bank == "up":
         return _first_existing_attr(mlp, ("up_proj", "w3", "fc1"), role="up")
-    if bank in ("down", "down_values", "down_proj"):
+    if bank == "down_values":
         return _first_existing_attr(mlp, ("down_proj", "w2", "fc2"), role="down")
-    explicit = {"gate_proj", "up_proj", "fc1", "fc2", "w1", "w2", "w3"}
+    explicit = {"gate_proj", "up_proj", "fc1", "w1", "w3"}
     if bank in explicit:
         return _first_existing_attr(mlp, (bank,), role=bank)
     raise ValueError(f"Unknown bank='{bank}'")
@@ -96,20 +95,15 @@ def _resolve_proj(mlp: Any, bank: str) -> tuple[str, Any]:
 # Public API
 # ------------------------------------------------------------------
 
-# Supported single-projection banks (excludes removed composites)
+# Supported single-projection banks.  bank='down' is rejected with a hard
+# error in extract_banks(); 'down_values' is the principled value probe.
 _SINGLE_BANKS = {
-    "gate", "up", "down", "down_values",
-    "gate_proj", "up_proj", "down_proj",
-    "fc1", "fc2", "w1", "w2", "w3",
+    "gate", "up", "down_values",
+    "gate_proj", "up_proj",
+    "fc1", "w1", "w3",
 }
 
-# Expected (in_features, out_features) of the *original* weight [out, in]
-# for each bank name.  None means the config value is unavailable to check.
-#   key-space banks (W_up family): weight [d_m, d] → bank [d_m, d]
-#   value-space input banks (W_down family, raw rows): weight [d, d_m] → bank [d, d_m]
-#   down_values: weight [d, d_m] transposed → bank [d_m, d]
 _KEY_SPACE   = {"gate", "up", "gate_proj", "up_proj", "fc1", "w1", "w3"}
-_VALUE_RAW   = {"down", "down_proj", "fc2", "w2"}
 _VALUE_TRANS = {"down_values"}
 
 
@@ -129,11 +123,6 @@ def extract_banks(
 
     Value-space (query = FFN output):
         down_values  — rows of W_down.T; theoretically correct value probe
-        down         — rows of W_down (deprecated; use down_values instead)
-        down_proj, fc2, w2
-
-    Removed (raise ValueError):
-        gate_plus_up, gate_up_concat  — not among standard Shazeer 2020 identities
 
     Args:
         llm:             HFLLM instance with resolved ``layers`` attribute.
@@ -146,25 +135,16 @@ def extract_banks(
         banks: dict[layer_idx → Tensor[K, D]]
         metadata (optional): dict[layer_idx → info dict]
     """
-    if bank in {"gate_plus_up", "gate_up_concat"}:
+    if bank in ("down", "down_proj", "fc2", "w2"):
         raise ValueError(
-            f"bank='{bank}' has been removed. It is not among Shazeer (2020) "
-            "SwiGLU identities. Use bank='up' for the key-space probe or "
-            "bank='down_values' for the value-space probe."
+            f"bank='{bank}' is not supported. Raw W_down rows are output projection "
+            "weights, not value vectors. Use bank='down_values' (rows of W_down.T) "
+            "for the value-space probe, or bank='up' for the key-space probe."
         )
 
     if bank not in _SINGLE_BANKS:
         raise ValueError(
             f"Unknown bank='{bank}'. Supported: {sorted(_SINGLE_BANKS)}"
-        )
-
-    if bank == "down":
-        warnings.warn(
-            "bank='down' is deprecated. Rows of W_down are the *output* projection "
-            "weights, not value vectors. Use bank='down_values' (rows of W_down.T) "
-            "for the theoretically correct value-space probe.",
-            FutureWarning,
-            stacklevel=2,
         )
 
     banks: dict[int, torch.Tensor] = {}
@@ -202,20 +182,6 @@ def extract_banks(
                     )
                 w = w_raw  # [d_m, d] — rows are key vectors
 
-            elif bank in _VALUE_RAW:
-                # W_down: maps intermediate → hidden; weight [d, d_m]
-                if config_intermediate is not None and in_f != config_intermediate:
-                    raise ValueError(
-                        f"Layer {i}: in_features={in_f} != intermediate_size={config_intermediate} "
-                        f"for bank='{bank}'"
-                    )
-                if config_hidden is not None and out_f != config_hidden:
-                    raise ValueError(
-                        f"Layer {i}: out_features={out_f} != hidden_size={config_hidden} "
-                        f"for bank='{bank}'"
-                    )
-                w = w_raw  # [d, d_m] — rows are NOT value vectors (deprecated path)
-
             elif bank in _VALUE_TRANS:
                 # down_values: W_down.T; original weight [d, d_m], transposed → [d_m, d]
                 if config_intermediate is not None and in_f != config_intermediate:
@@ -231,17 +197,26 @@ def extract_banks(
                 w = w_raw.T.contiguous()  # [d_m, d] — rows are value vectors
 
             else:
-                # Explicit name aliases (gate_proj, up_proj, etc.) — best-effort check
                 w = w_raw
 
-            # Compute M = max_i ||row_i|| of the raw (non-normalised) bank
-            M_val = float(w.norm(dim=1).max())
-            log.debug("Layer %d: bank='%s', M=%.4f, shape=%s", i, bank, M_val, tuple(w.shape))
+            # M_raw: max row norm of the unnormalised weight (model property,
+            # useful as a diagnostic across layers).
+            M_raw = float(w.norm(dim=1).max())
 
             source = source_name if bank not in _VALUE_TRANS else f"{source_name}.T"
 
             if normalize:
                 w = _normalize_rows(w)
+
+            # M_used: max row norm of the *actual* matrix used for retrieval.
+            # When normalize=True this is 1.0 by construction.  This is the
+            # value compute_energy needs for the 0.5*M^2 term in Eq. 1 of
+            # Ramsauer et al. 2020 — "M of the matrix actually being used".
+            M_used = float(w.norm(dim=1).max())
+            log.debug(
+                "Layer %d: bank='%s', M_raw=%.4f, M_used=%.4f, shape=%s",
+                i, bank, M_raw, M_used, tuple(w.shape),
+            )
 
             banks[i] = w
             metadata[i] = {
@@ -252,7 +227,8 @@ def extract_banks(
                 "dtype": str(w.dtype),
                 "K": int(w.shape[0]),
                 "D": int(w.shape[1]),
-                "M": M_val,
+                "M":     M_used,   # used by compute_energy
+                "M_raw": M_raw,    # diagnostic only
             }
 
         except Exception as exc:

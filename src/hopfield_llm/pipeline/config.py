@@ -67,8 +67,31 @@ class ExperimentConfig:
     # Sharding (HPC)
     num_shards: int = 1
 
-    # Scores subset (limits which samples get raw score tensors saved)
-    scores_subset_size: int = 200
+    # Raw [L, T, K] score tensors are large (~30-40 MB compressed per Qwen-3B
+    # sample).  scores_subset_size caps how many samples get full scores;
+    # score_capture chooses HOW the scores are encoded:
+    #   "full"  - all K rows (~38 MB compressed per sample, default)
+    #   "topk"  - top-256 rows + tail max + tail count (~1 MB per sample)
+    #   "off"   - never save scores; disables top1-top2 gap and beta sweep
+    # Set scores_subset_size to 0 to disable, -1 to save every sample.
+    scores_subset_size: int = 50
+    score_capture: str = "full"
+    score_topk: int = 256
+
+    # Logit-lens entropy as a parallel hallucination signal.  Adds one
+    # teacher-forced forward pass per sample (≈ +25-50% of run_trajectory
+    # wall-clock for short generations).  No banks involved.
+    enable_logit_lens: bool = False
+
+    # Shuffled-bank null control: recompute energy against a per-layer
+    # randomly permuted bank.  Distinguishes "the bank identity matters" from
+    # "any bank gives this delta".  Adds ~5-10% wall-clock.
+    enable_null_control: bool = False
+
+    # Beta calibration
+    calibrate_beta:      bool  = False
+    calibration_samples: int   = 20
+    beta_target:         float = 0.55
 
     # Labeling / calibration
     calibration_subset_size: int = 50
@@ -103,6 +126,9 @@ class ExperimentConfig:
                 "energy_mode": self.energy_mode, "max_new_tokens": self.max_new_tokens,
                 "diagnostic_subset": self.diagnostic_subset, "bank": self.bank,
                 "scores_subset_size": self.scores_subset_size,
+                "calibrate_beta":      self.calibrate_beta,
+                "calibration_samples": self.calibration_samples,
+                "beta_target":         self.beta_target,
             },
             "analysis": {
                 "divergence_metrics": self.divergence_metrics,
@@ -193,7 +219,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         energy_mode=traj.get("energy_mode", "dot"),
         max_new_tokens=int(traj.get("max_new_tokens", 50)),
         diagnostic_subset=int(traj.get("diagnostic_subset", 20)),
-        bank=traj.get("bank", "down"),
+        bank=traj.get("bank", "up"),
         divergence_metrics=analysis.get(
             "divergence_metrics", ["delta_energy", "energy_shift_l1", "gen_drift_mean"]
         ),
@@ -201,7 +227,14 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         score_aggregation=analysis.get("score_aggregation", "mean"),
         signal_zone=signal_zone,
         num_shards=int(sharding.get("num_shards", 1)),
-        scores_subset_size=int(traj.get("scores_subset_size", 200)),
+        scores_subset_size=int(traj.get("scores_subset_size", 50)),
+        score_capture=str(traj.get("score_capture", "full")),
+        score_topk=int(traj.get("score_topk", 256)),
+        enable_logit_lens=bool(traj.get("enable_logit_lens", False)),
+        enable_null_control=bool(traj.get("enable_null_control", False)),
+        calibrate_beta=bool(traj.get("calibrate_beta", False)),
+        calibration_samples=int(traj.get("calibration_samples", 20)),
+        beta_target=float(traj.get("beta_target", 0.55)),
         calibration_subset_size=int(
             labeling.get("calibration", {}).get("calibration_subset_size", 50)
         ),

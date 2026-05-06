@@ -33,7 +33,6 @@ _PER_LAYER_KEYS = [
     "gen_energy_answer",
     "gen_entropy_answer",
     "delta_energy",
-    "kl_gen_to_prompt_mean",
 ]
 
 _SCALAR_BASELINE_KEYS = [

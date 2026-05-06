@@ -22,6 +22,9 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 
 export HOPFIELD_ENV=hpc
 
+eval "$($HOME/.local/bin/micromamba shell hook --shell bash)"
+micromamba activate "${MAMBA_ENV_NAME:-hopfield-llm}"
+
 mkdir -p "$OUTPUT_DIR" logs
 
 OUTPUT="$OUTPUT_DIR/${MODEL}_banks.pt"

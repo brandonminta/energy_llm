@@ -60,11 +60,13 @@ class TruthfulQADataset(BaseDataset):
                 skipped += 1
                 continue
 
+            cat = row.get("category")
             samples.append(DataSample(
                 id=f"truthfulqa_{idx}",
                 source="truthfulqa",
                 question=question,
                 gold_answers=gold,
+                category=cat.strip() if isinstance(cat, str) and cat.strip() else None,
             ))
 
         if self._max_samples is not None and self._max_samples < len(samples):

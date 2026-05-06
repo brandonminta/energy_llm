@@ -22,6 +22,14 @@ def _short_hash(text: str, length: int = 6) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:length]
 
 
+def _deep_merge(base: dict, updates: dict) -> None:
+    for k, v in updates.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
 def _git_info() -> dict[str, Any]:
     info: dict[str, Any] = {}
     try:
@@ -105,6 +113,21 @@ class ExperimentTracker:
         if self._log_path is not None:
             with open(self._log_path, "a", encoding="utf-8") as f:
                 f.write(f"  [{key}] step={step} value={value:.6f}\n")
+
+    def patch_config(self, updates: dict[str, Any]) -> None:
+        """Deep-merge *updates* into the saved config.yaml snapshot.
+
+        Call this after any post-start mutation (e.g. calibrated beta) so the
+        on-disk snapshot reflects the values actually used in the run.
+        """
+        assert self.run_dir is not None, "Call start() before patch_config()"
+        config_path = self.run_dir / "config.yaml"
+        if not config_path.exists():
+            return
+        snap: dict[str, Any] = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        _deep_merge(snap, updates)
+        config_path.write_text(yaml.dump(snap, default_flow_style=False), encoding="utf-8")
+        log.info("Config snapshot patched with: %s", updates)
 
     def finish(self, metrics_df=None) -> Path:
         """Finalise: save environment info, metrics, and duration.

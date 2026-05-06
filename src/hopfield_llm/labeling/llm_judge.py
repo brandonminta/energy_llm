@@ -11,7 +11,6 @@ different parser without re-querying the judge.
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -176,7 +175,7 @@ class LLMJudge:
             model=self.model_id,
             messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
-            max_tokens=32,
+            max_completion_tokens=32,
         )
         return response.choices[0].message.content or ""
 

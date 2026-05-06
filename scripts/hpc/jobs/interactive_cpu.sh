@@ -16,13 +16,15 @@ CPUS="${CPUS:-4}"
 MEM="${MEM:-16G}"
 TIME="${TIME:-00:30:00}"
 PARTITION="${PARTITION:-gpu-dev}"
-GPU="${GPU:-a100_1g.5gb}"   # smallest slice — enough for CPU work, fast to allocate
+GPU="${GPU:-a100_1g.5gb}"        # smallest slice on compute-0-0, allocates fast
+NODE="${NODE:-compute-0-0}"      # has 24 a100_1g.5gb slices, least contention
 
-echo "Requesting: $PARTITION | $CPUS CPUs | $MEM RAM | $TIME | GPU: $GPU (for glibc compat)"
+echo "Requesting: $PARTITION | $NODE | $CPUS CPUs | $MEM RAM | $TIME | GPU: $GPU"
 echo "Waiting for allocation..."
 
 salloc -p "$PARTITION" -c "$CPUS" --mem="$MEM" --time="$TIME" \
     --gres=gpu:"$GPU":1 \
+    --nodelist="$NODE" \
     --job-name=hopfield-interactive \
     bash --rcfile <(cat <<'EOF'
 eval "$($HOME/.local/bin/micromamba shell hook --shell bash)"

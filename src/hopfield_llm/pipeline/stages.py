@@ -8,6 +8,7 @@ Each stage persists artifacts to disk and can be run independently:
 from __future__ import annotations
 
 import dataclasses
+import gc
 import json
 import traceback
 from pathlib import Path
@@ -490,6 +491,7 @@ def run_trajectory(
             if gen_result.hellinger_per_layer is not None:
                 _npz_kw["gen_hellinger"] = gen_result.hellinger_per_layer
             np.savez_compressed(out_dir / f"{npz_stem}.npz", **_npz_kw)
+            del _npz_kw
 
             _pref_scores = prefill_result.scores
             _gen_scores = gen_result.scores
@@ -512,6 +514,7 @@ def run_trajectory(
                     if _gen_scores is not None:
                         _scores_kw["gen_scores"] = _gen_scores
                 np.savez_compressed(out_dir / f"{npz_stem}_scores.npz", **_scores_kw)
+                del _scores_kw
 
             meta = {
                 "id": sample.id,
@@ -653,6 +656,10 @@ def run_trajectory(
                 del h_pre_raw
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Periodic GC to collect any reference cycles from HuggingFace
+            # internals that Python's reference counting won't catch.
+            if (n_ok + n_err) % 100 == 0:
+                gc.collect()
 
         except Exception as exc:
             n_err += 1

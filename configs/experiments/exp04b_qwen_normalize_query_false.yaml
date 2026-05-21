@@ -1,0 +1,49 @@
+experiment:
+  name: exp04b_qwen_normalize_query_false
+  description: |
+    Re-run of exp04 (Qwen2.5-3B, 500 TruthfulQA) with Bug A fixed and
+    normalize_query=false.  This makes the energy decomposition genuinely
+    empirical: E_quad = ½‖q‖² now varies per sample and layer, so
+    r(ΔE_lse, ΔE) is no longer algebraically guaranteed to be ≈-1.
+
+    Artifacts land in outputs/<run_id>/trajectories/ as
+    {sample_id}_key_space_no_norm_q.npz / .json.
+
+model:
+  alias: qwen25_3b
+  load_in_4bit: true
+
+dataset:
+  name: truthfulqa
+  max_samples: 500
+  seed: 42
+
+trajectory:
+  bank: up
+  beta: 15.0                  # starting point; overridden by calibration
+  calibrate_beta: true
+  calibration_samples: 30
+  beta_target: 0.55
+  threshold: 0.1
+  energy_mode: dot
+  max_new_tokens: 50
+  diagnostic_subset: 0
+  scores_subset_size: 50
+
+primary_probe:
+  bank: up
+  normalize: true
+  hook_target: mlp_input
+  normalize_query: false      # ← key change; queries are NOT L2-normalised
+  label: key_space_no_norm_q
+
+analysis:
+  score_metric: delta_energy
+  score_aggregation: mean
+  signal_zone: null
+
+sharding:
+  num_shards: 1
+
+output:
+  base_dir: outputs

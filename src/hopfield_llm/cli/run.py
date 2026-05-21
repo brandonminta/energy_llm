@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model",   required=True, help="Model alias or HuggingFace model ID")
     p.add_argument("--output",  required=True, help="Output path for banks .pt file")
     p.add_argument("--bank",    default="up",
-                   choices=["gate", "up", "down_values",
+                   choices=["gate", "up", "down_values", "gated_key",
                             "gate_proj", "up_proj", "fc1", "w1", "w3"],
                    help="MLP projection to use as the memory bank")
     p.add_argument("--device",  default=None)

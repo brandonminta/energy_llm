@@ -161,12 +161,12 @@ def _compute_sample_divergence(
 ) -> SampleDivergenceResult:
     """Wrap metrics.divergences.compute_sample_divergences for one .npz dict."""
     div = compute_sample_divergences(
-        prompt_energy=arrays.get("prefill_energy_mean", arrays["prefill_energy"]),
+        prompt_energy=arrays.get("prefill_energy", arrays.get("prefill_energy_mean")),
         gen_energy=arrays["gen_energy"],
-        prompt_entropy=arrays.get("prefill_entropy_mean"),
-        prompt_norm_entropy=arrays.get("prefill_norm_entropy_mean"),
-        prompt_top_act=arrays.get("prefill_top_act_mean"),
-        prompt_lse=arrays.get("prefill_lse_mean"),
+        prompt_entropy=arrays.get("prefill_entropy", arrays.get("prefill_entropy_mean")),
+        prompt_norm_entropy=arrays.get("prefill_norm_entropy", arrays.get("prefill_norm_entropy_mean")),
+        prompt_top_act=arrays.get("prefill_top_act", arrays.get("prefill_top_act_mean")),
+        prompt_lse=arrays.get("prefill_lse", arrays.get("prefill_lse_mean")),
         gen_entropy=arrays.get("gen_entropy"),
         gen_norm_entropy=arrays.get("gen_norm_entropy"),
         gen_top_act=arrays.get("gen_top_act"),

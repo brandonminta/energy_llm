@@ -163,14 +163,22 @@ def _run_experiment(args: argparse.Namespace) -> int:
     analysis_path = run_dir / "analysis.json"
     plots_dir     = run_dir / "plots"
 
+    # In probe mode build_banks writes banks_{label}.pt, not banks.pt.
+    _probe_bank_paths = [run_dir / f"banks_{cfg.primary_probe.label}.pt"]
+    if cfg.secondary_probe is not None:
+        _probe_bank_paths.append(run_dir / f"banks_{cfg.secondary_probe.label}.pt")
+    _banks_exist = banks_path.exists() or all(p.exists() for p in _probe_bank_paths)
+
     try:
-        if args.skip_banks and banks_path.exists():
+        if args.skip_banks and _banks_exist:
             from hopfield_llm.utils.logging import get_logger
             get_logger("cli").info("Skipping bank extraction (--skip-banks)")
         else:
             build_banks(
                 model=cfg.model_alias, output=str(banks_path),
                 bank=cfg.bank, device=device, load_in_4bit=cfg.load_in_4bit,
+                primary_probe=cfg.primary_probe,
+                secondary_probe=cfg.secondary_probe,
             )
             tracker.log_metric("stage1_complete", 1.0)
 
@@ -190,6 +198,8 @@ def _run_experiment(args: argparse.Namespace) -> int:
             calibrate_beta=cfg.calibrate_beta,
             calibration_samples=cfg.calibration_samples,
             beta_target=cfg.beta_target,
+            primary_probe=cfg.primary_probe,
+            secondary_probe=cfg.secondary_probe,
         )
         if calibrated_beta is not None:
             tracker.patch_config({"trajectory": {"beta": calibrated_beta}})

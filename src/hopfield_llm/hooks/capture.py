@@ -309,18 +309,32 @@ def capture_prefill(
         for h in hooks:
             h.remove()
 
-    # Use streaming accumulator for p_ref so we never materialise [L, T, K].
-    # dists_arr is only allocated when the caller explicitly wants it
-    # (save_distributions=True); p_ref always uses the O(L×K) path.
-    metrics, dists_arr, scores_arr, mean_dist = _fill_result_arrays(
+    metrics, dists_arr, scores_arr, _ = _fill_result_arrays(
         x_buf, banks, L, beta, threshold, energy_mode,
         save_distributions=save_distributions,
         save_scores=save_scores,
         m_per_layer=m_per_layer,
-        accumulate_mean_dist=compute_p_ref,
+        accumulate_mean_dist=False,
     )
 
-    p_ref: np.ndarray | None = mean_dist  # [L, K] float32 or None
+    # p_ref = last-prompt-token softmax distribution [L, K], not mean over all tokens.
+    # Mean-pooling inflates JS at L0 for every sample regardless of class (the mean of
+    # ~30 embeddings diverges sharply from any single generation-token embedding), which
+    # contaminates all-layer scalar averages with a class-invariant artefact.
+    p_ref: np.ndarray | None = None
+    if compute_p_ref and banks:
+        K = next(iter(banks.values())).shape[0]
+        last_dist = np.zeros((L, K), dtype=np.float32)
+        for l_idx in range(L):
+            if l_idx in x_buf and l_idx in banks:
+                x_last = x_buf[l_idx][-1]
+                r = compute_energy(
+                    x_last, banks[l_idx], beta=beta, mode=energy_mode,
+                    M=m_per_layer.get(l_idx), return_distribution=True,
+                )
+                if r.distribution is not None:
+                    last_dist[l_idx] = r.distribution.cpu().numpy()
+        p_ref = last_dist
 
     energy_arr = metrics[0]  # [L, T]
     result = PrefillResult(

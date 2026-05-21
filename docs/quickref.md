@@ -30,11 +30,11 @@ python -c "from hopfield_llm.models.loader import HFLLM; print('✓ OK')"
 ```bash
 hopfield-llm build-banks \
     --model qwen25_3b \
-    --bank down \
+    --bank up \
     --output banks.pt
 ```
 
-**Bank options**: `gate`, `up`, `down`, `down_values`, `gate_proj`, `up_proj`, `down_proj`, `fc1`, `fc2`, `w1`, `w2`, `w3`
+**Bank options**: `gate`, `up`, `down_values`, `gate_proj`, `up_proj`, `down_proj`, `fc1`, `fc2`, `w1`, `w2`, `w3`
 
 ### Stage 2: Capture Activations
 
@@ -185,7 +185,7 @@ dataset:
   name: truthfulqa
   max_samples: null
 trajectory:
-  bank: down
+  bank: up
   beta: 15.0
 analysis:
   score_metric: delta_energy

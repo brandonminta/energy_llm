@@ -8,13 +8,18 @@ Energy-based hallucination detection for LLMs using Modern Hopfield networks. Ex
 micromamba create -n hopfield-llm python=3.12 -y && micromamba activate hopfield-llm
 pip install -r requirements.txt && pip install -e .
 
-# Run stages individually
+# Core pipeline (GPU stages 1-2, CPU stages 3-4)
 hopfield-llm build-banks --model qwen25_3b --output banks.pt
 hopfield-llm run-trajectory --model qwen25_3b --dataset truthfulqa --banks banks.pt --output traj/
 hopfield-llm analyze --trajectories traj/ --output analysis.json
 hopfield-llm visualize --analysis analysis.json --output plots/
 
-# Or run everything from a config
+# Optional labeling + evaluation (CPU)
+export OPENAI_API_KEY=sk-...
+hopfield-llm label    --trajectories traj/ --output labels/
+hopfield-llm evaluate --trajectories traj/ --labels labels/ --output report.html
+
+# Or run stages 1-4 from a config
 hopfield-llm run-experiment --config configs/experiments/exp01_truthfulqa_baseline.yaml
 ```
 
@@ -32,11 +37,13 @@ MODEL=qwen25_7b DATASET=nq NUM_SHARDS=16 \
 | Stage | Command | GPU | Input | Output | Purpose |
 |-------|---------|-----|-------|--------|---------|
 | 1 | `build-banks` | Yes | model alias | `banks.pt` | Extract MLP weight matrices as memory banks |
-| 2 | `run-trajectory` | Yes | banks + dataset | `.npz` + `.json` per sample | Capture h_pre activations; compute energy/entropy during prefill and generation |
-| 3 | `analyze` | No | trajectory dir | `analysis.json` | Aggregate trajectories; compute per-sample divergences and scores |
+| 2 | `run-trajectory` | Yes | banks + dataset | `.npz` + `.json` per sample | Capture activations and Hopfield energy/entropy during prefill and generation; both observe the chat-templated prompt |
+| 3 | `analyze` | No | trajectory dir | `analysis.json` | Aggregate trajectories; compute per-layer deltas, score summary, score-by-category |
 | 4 | `visualize` | No | analysis JSON | `plots/` | Generate matplotlib plots of layer metrics |
+| 5 | `label` | No | trajectory dir | `{id}_labeled.json` + `calibration.json` | Heuristic F1 + LLM-judge labeling (optional) |
+| 6 | `evaluate` | No | trajectory + labels | `report.html` | Per-layer AUROC, logreg probe, baselines, β-sweep (optional) |
 
-Each stage runs independently and writes artifacts to disk, allowing re-running of downstream stages without GPU cost. `run-experiment` orchestrates all 4 from a YAML config with full experiment tracking (config snapshot, git info, timing, GPU metadata).
+Each stage runs independently and writes artifacts to disk, allowing re-running of downstream stages without GPU cost. `run-experiment` orchestrates stages 1–4 from a YAML config with full experiment tracking (config snapshot, git info, timing, GPU metadata). Stages 5 and 6 are explicitly opt-in.
 
 ## Supported Models
 
@@ -73,11 +80,13 @@ dataset:
   max_samples: null
   seed: 42
 trajectory:
-  bank: down          # gate | up | down | gate_plus_up | gate_up_concat
+  bank: up            # gate | up | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
   beta: 15.0
   energy_mode: dot    # dot | cosine
 analysis:
-  score_metric: js    # js | kl_fwd | hellinger | delta_energy | ...
+  # Distribution-based metrics (kl/js/hellinger) require save_distributions=True
+  # during trajectory capture. Default to delta_energy, which is always available.
+  score_metric: delta_energy
   score_aggregation: mean
 output:
   base_dir: outputs

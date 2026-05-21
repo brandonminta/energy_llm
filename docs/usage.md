@@ -6,7 +6,7 @@
 # Stage 1: extract MLP memory banks
 hopfield-llm build-banks \
     --model qwen25_3b \
-    --bank down \                    # gate | up | down | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
+    --bank up \                      # gate | up | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
     --output banks.pt
 
 # Stage 2: capture activations and compute energy/entropy
@@ -213,7 +213,7 @@ The `--bank` flag controls which MLP projection forms the memory:
 
 ```bash
 # W_down (down-projection, default)
-hopfield-llm build-banks --model qwen25_3b --bank down --output banks_down.pt
+hopfield-llm build-banks --model qwen25_3b --bank up --output banks_up.pt
 
 # W_gate (gate projection)
 hopfield-llm build-banks --model qwen25_3b --bank gate --output banks_gate.pt
@@ -431,7 +431,7 @@ dataset:
   max_samples: null
   seed: 42
 trajectory:
-  bank: down
+  bank: up
   beta: 15.0
   energy_mode: dot
 analysis:

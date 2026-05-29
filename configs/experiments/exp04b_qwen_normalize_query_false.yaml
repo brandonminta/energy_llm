@@ -1,10 +1,13 @@
 experiment:
-  name: exp06_qwen_value_space
+  name: exp04b_qwen_normalize_query_false
   description: |
-    Paired key-space (W_up rows) + value-space (W_down.T rows) probe on Qwen2.5-3B.
-    Geva et al. 2021 argue MLP value vectors carry semantic content; this is the
-    principled comparison against the key-space-only baseline. Both probes share
-    the same generation pass via teacher forcing — minimal extra GPU cost.
+    Re-run of exp04 (Qwen2.5-3B, 500 TruthfulQA) with Bug A fixed and
+    normalize_query=false.  This makes the energy decomposition genuinely
+    empirical: E_quad = ½‖q‖² now varies per sample and layer, so
+    r(ΔE_lse, ΔE) is no longer algebraically guaranteed to be ≈-1.
+
+    Artifacts land in outputs/<run_id>/trajectories/ as
+    {sample_id}_key_space_no_norm_q.npz / .json.
 
 model:
   alias: qwen25_3b
@@ -16,7 +19,7 @@ dataset:
   seed: 42
 
 trajectory:
-  bank: up                    # legacy field, primary_probe wins below
+  bank: up
   beta: 15.0                  # starting point; overridden by calibration
   calibrate_beta: true
   calibration_samples: 30
@@ -31,15 +34,8 @@ primary_probe:
   bank: up
   normalize: true
   hook_target: mlp_input
-  normalize_query: true
-  label: key_space
-
-secondary_probe:
-  bank: down_values
-  normalize: true
-  hook_target: mlp_output
-  normalize_query: true
-  label: value_space
+  normalize_query: false      # ← key change; queries are NOT L2-normalised
+  label: key_space_no_norm_q
 
 analysis:
   score_metric: delta_energy

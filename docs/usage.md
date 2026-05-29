@@ -6,7 +6,7 @@
 # Stage 1: extract MLP memory banks
 hopfield-llm build-banks \
     --model qwen25_3b \
-    --bank down \                    # gate | up | down | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
+    --bank up \                      # gate | up | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
     --output banks.pt
 
 # Stage 2: capture activations and compute energy/entropy
@@ -40,7 +40,7 @@ hopfield-llm visualize \
 ```bash
 # Run all stages from a YAML config with full experiment tracking
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01_truthfulqa_baseline.yaml \
+    --config configs/experiments/final_qwen_truthfulqa.yaml \
     --override beta=20.0 dataset_name=triviaqa \
     --skip-banks                     # Reuse existing banks.pt in run directory
 ```
@@ -139,8 +139,8 @@ After labeling, compute feature matrices and evaluation metrics:
 from hopfield_llm.evaluation.features import load_all_features
 
 samples = load_all_features(
-    artifact_dir="outputs/exp01/trajectories",  # .npz + .json files
-    labels_dir="outputs/exp01/trajectories",    # {sample_id}_label.json files
+    artifact_dir="outputs/final_qwen_truthfulqa/trajectories",  # .npz + .json files
+    labels_dir="outputs/final_qwen_truthfulqa/trajectories",    # {sample_id}_label.json files
 )
 
 print(f"Loaded {len(samples)} samples")
@@ -197,12 +197,12 @@ print(auroc_by_beta)  # {beta: {feature: auroc}}
 from hopfield_llm.evaluation.report import build_eval_report
 
 build_eval_report(
-    artifact_dir="outputs/exp01/trajectories",
-    labels_dir="outputs/exp01/trajectories",
-    output_path="outputs/exp01/report.html",
+    artifact_dir="outputs/final_qwen_truthfulqa/trajectories",
+    labels_dir="outputs/final_qwen_truthfulqa/trajectories",
+    output_path="outputs/final_qwen_truthfulqa/report.html",
 )
 
-print("Report written to outputs/exp01/report.html")
+print("Report written to outputs/final_qwen_truthfulqa/report.html")
 ```
 
 ---
@@ -213,7 +213,7 @@ The `--bank` flag controls which MLP projection forms the memory:
 
 ```bash
 # W_down (down-projection, default)
-hopfield-llm build-banks --model qwen25_3b --bank down --output banks_down.pt
+hopfield-llm build-banks --model qwen25_3b --bank up --output banks_up.pt
 
 # W_gate (gate projection)
 hopfield-llm build-banks --model qwen25_3b --bank gate --output banks_gate.pt
@@ -292,7 +292,7 @@ from hopfield_llm.pipeline.config import load_experiment_config
 from hopfield_llm.utils.tracking import ExperimentTracker
 
 # Load configuration
-cfg = load_experiment_config("configs/experiments/exp01_truthfulqa_baseline.yaml")
+cfg = load_experiment_config("configs/experiments/final_qwen_truthfulqa.yaml")
 
 # Initialize experiment tracker
 tracker = ExperimentTracker(cfg.experiment.name)
@@ -391,12 +391,12 @@ from hopfield_llm.utils.tracking import ExperimentTracker
 import json
 
 # Load metadata
-with open("outputs/exp01/.../git_info.json") as f:
+with open("outputs/final_qwen_truthfulqa/.../git_info.json") as f:
     git_info = json.load(f)
 print(f"Commit: {git_info['commit']}")
 
 # Load config
-with open("outputs/exp01/.../config.yaml") as f:
+with open("outputs/final_qwen_truthfulqa/.../config.yaml") as f:
     config = f.read()
 ```
 
@@ -431,7 +431,7 @@ dataset:
   max_samples: null
   seed: 42
 trajectory:
-  bank: down
+  bank: up
   beta: 15.0
   energy_mode: dot
 analysis:

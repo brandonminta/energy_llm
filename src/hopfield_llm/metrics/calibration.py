@@ -140,6 +140,7 @@ def _interpolate_beta(
             if span < 1e-10:
                 return float(b_low)
             frac = (e_low_beta - target) / span
-            return float(b_low + frac * (b_high - b_low))
+            log_b = math.log(b_low) + frac * (math.log(b_high) - math.log(b_low))
+            return float(math.exp(log_b))
 
     return float(candidates[-1])

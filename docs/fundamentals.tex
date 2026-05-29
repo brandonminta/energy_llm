@@ -1,0 +1,760 @@
+% =============================================================
+%  CHAPTER: Theoretical Framework
+%  Thesis: Hallucination Detection in Large Language Models
+%  Status: Revised draft — publication quality
+% =============================================================
+
+This chapter connects the internal computation of decoder-only Transformer language models with an energy-based view of associative retrieval. The central motivation is that the hidden state entering the feed-forward sublayer can be treated as a query over structured parametric memory. This interpretation is not adopted as a strict architectural identity, but rather as a theoretically motivated modeling perspective supported by prior work on feed-forward layers and associative memory~\cite{geva2021transformer, ramsauer2020hopfield}. On that basis, the chapter introduces a Modern Hopfield formulation used to define retrieval distributions and divergence-based indicators for hallucination detection.
+
+% =============================================================
+
+\section{The Transformer Architecture}
+\label{sec:transformer}
+% ================================================================
+
+The Transformer, introduced by \citet{vaswani2017attention}, replaced the sequential
+processing of recurrent networks with a fully parallel, attention-based computation.
+It has since become the architectural substrate of virtually all modern language
+models. Understanding its internal mechanics is essential to this work: the
+hallucination detection framework developed in Chapter~\ref{chap:methods} operates
+directly on the per-token hidden states produced at each layer of the forward pass.
+Figure~\ref{fig:transformer_block} provides an overview of the complete block
+structure; the subsections below describe each component in turn.
+
+% --- Figure 1: full Pre-LN decoder block ----------------------------
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/fig1_transformer_block.pdf}
+    \caption{%
+        A single decoder-only Transformer block using Pre-Layer Normalisation
+        (RMSNorm) and a SwiGLU feed-forward sublayer, as employed by Qwen2.5 and
+        Llama~3. Dashed lines denote residual (skip) connections. The hidden state
+        $\mathbf{h}_t^{(l)}$ at the output of the second RMSNorm—labelled
+        \emph{probe point}—is the representational signal analysed in
+        this work.%
+    }
+    \label{fig:transformer_block}
+\end{figure}
+% --------------------------------------------------------------------
+
+% ----------------------------------------------------------------
+\subsection{From Recurrent Networks to the Attention Mechanism}
+\label{subsec:rnn_to_attention}
+% ----------------------------------------------------------------
+
+Before the Transformer, sequence modelling relied on Recurrent Neural Networks
+(RNNs). At each time step an RNN takes the current input token and a hidden state
+carried over from the previous step, producing an updated state that summarises the
+sequence history \citep{tunstall2022natural}. Because each step depends on the
+previous one, computation cannot be parallelised across positions, which makes
+training on long sequences slow.
+
+In neural machine translation, an encoder RNN compressed the source sentence into a
+single fixed-length vector, which a decoder RNN then consumed token by token. The
+fundamental weakness of this design is that the decoder has access only to the
+\emph{last} encoder hidden state: for long inputs, compressing an arbitrarily long
+sequence into a fixed-dimensional vector causes significant information loss \citep{tunstall2022natural}.
+
+The attention mechanism resolved this bottleneck by granting the decoder direct
+access to \emph{all} encoder hidden states at every generation step, weighting each
+by its relevance to the current decoding context \citep{tunstall2022natural}. The
+Transformer generalises this idea by making attention the primary computational
+mechanism of the entire model, discarding recurrence altogether.
+
+% ----------------------------------------------------------------
+\subsection{Tokens, Embeddings, and Positional Encoding}
+\label{subsec:embeddings}
+% ----------------------------------------------------------------
+
+A Transformer operates on sequences of discrete units called \emph{tokens}, obtained
+by segmenting raw text through a tokenizer. Let $x_1, x_2, \ldots, x_T \in
+\mathcal{V}$ denote a sequence of $T$ tokens drawn from vocabulary $\mathcal{V}$.
+
+\paragraph{Token embeddings.}
+Each token $x_t$ is mapped to a dense vector via a learned embedding matrix
+$\mathbf{E} \in \mathbb{R}^{|\mathcal{V}| \times D}$, where $D$ is the model
+dimension. This converts discrete symbols into a continuous vector space amenable to
+gradient-based optimisation. The resulting embeddings are context-free---the same
+vector is assigned regardless of surrounding tokens---with context-sensitivity
+introduced later through self-attention (Section~\ref{subsec:self_attention}).
+
+\paragraph{Positional encoding.}
+Because the Transformer processes all positions in parallel, explicit positional
+information must be injected. The original formulation \citep{vaswani2017attention}
+used deterministic sinusoidal functions:
+\begin{equation}
+    \mathbf{p}_t^{(2k)} = \sin\!\left(\frac{t}{10000^{2k/D}}\right), \qquad
+    \mathbf{p}_t^{(2k+1)} = \cos\!\left(\frac{t}{10000^{2k/D}}\right),
+    \label{eq:sinusoidal_pe}
+\end{equation}
+where $k \in \{0, \ldots, D/2-1\}$ indexes the embedding dimension. Modern LLMs such as Qwen2.5 \citep{qwen2025qwen25} and Llama~3 \citep{grattafiori2024llama3}, which are the primary model families examined in this work, instead apply \emph{Rotary Positional Encoding} (RoPE) \citep{su2024roformer}. RoPE encodes relative position by rotating query and key vectors prior to their inner product, which improves generalisation to long sequences.
+
+The initial hidden state matrix for a sequence of $T$ tokens is:
+\begin{equation}
+    \mathbf{H}^{(0)} = \mathbf{E}[x_1, \ldots, x_T] + \mathbf{P},
+    \label{eq:initial_hidden}
+\end{equation}
+where $\mathbf{P} \in \mathbb{R}^{T \times D}$ collects the positional encodings and
+$\mathbf{H}^{(0)} \in \mathbb{R}^{T \times D}$ is the input to the first
+Transformer block.
+
+% ----------------------------------------------------------------
+% ----------------------------------------------------------------
+\subsection{Self-Attention}
+\label{subsec:self_attention}
+% ----------------------------------------------------------------
+
+Self-attention is a mechanism that produces a contextualised representation of each
+token by computing a weighted combination of all token representations in the
+sequence, where the weights reflect pairwise relevance. To compute these weights,
+each token simultaneously takes three roles: it generates a \emph{query} vector
+representing its informational need, a \emph{key} vector representing its content as
+a retrieval target, and a \emph{value} vector carrying the content it contributes to
+other tokens. These three vectors are obtained via independent learned linear
+projections of the hidden state matrix $\mathbf{H} \in \mathbb{R}^{T \times D}$:
+\begin{equation}
+    \mathbf{Q} = \mathbf{H}\mathbf{W}^Q, \qquad
+    \mathbf{K} = \mathbf{H}\mathbf{W}^K, \qquad
+    \mathbf{V} = \mathbf{H}\mathbf{W}^V,
+    \label{eq:qkv_projections}
+\end{equation}
+where $\mathbf{W}^Q, \mathbf{W}^K \in \mathbb{R}^{D \times d_k}$ and
+$\mathbf{W}^V \in \mathbb{R}^{D \times d_v}$ are learned weight matrices. The
+relevance of each key to a given query is measured by their scaled inner product;
+the resulting scores are normalised via softmax and used to compute a weighted sum
+of the value vectors:
+\begin{equation}
+    \text{Self-Attention}(\mathbf{H}) =
+    \text{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_k}}\right)\mathbf{V}.
+    \label{eq:self_attention}
+\end{equation}
+The $\sqrt{d_k}$ scaling factor prevents the inner products from growing large in
+high-dimensional spaces, which would push the softmax into regions of near-zero
+gradient. The output is a context-aware hidden state matrix in which each token's
+representation is a convex combination of all value vectors, with coefficients
+determined by its query-key compatibilities. Unlike recurrent networks, where context
+is accumulated sequentially, self-attention integrates information from any position
+in a single parallelisable operation \citep{vaswani2017attention}.
+
+\paragraph{Causal masking.}
+In autoregressive LLMs, the prediction of token $x_{t+1}$ must condition only on
+$x_1, \ldots, x_t$. This constraint is enforced during the forward pass by setting
+the pre-softmax logits to $-\infty$ for all positions $j > t$, driving the
+corresponding attention weights to zero. The resulting \emph{causal} or
+\emph{masked} self-attention ensures that no token attends to future positions. All
+models examined in this work apply causal masking throughout every layer, as
+illustrated in Figure~\ref{fig:transformer_block}.
+
+% ----------------------------------------------------------------
+\subsection{Multi-Head Attention}
+\label{subsec:mha}
+% ----------------------------------------------------------------
+
+A single attention head produces one weighted aggregation of the value vectors, which
+limits it to capturing a single pattern of pairwise relevance per layer. Natural
+language, however, requires reasoning over several types of dependency simultaneously:
+a token may need to resolve syntactic agreement, semantic relatedness, and coreference
+within the same layer. \citet{vaswani2017attention} addressed this by running $h$
+attention heads in parallel, each with its own learned projections operating in a
+lower-dimensional subspace of size $d_k = D/h$. The outputs are concatenated and
+projected back to the model dimension (Figure~\ref{fig:transformer_block}):
+\begin{equation}
+    \text{MHA}(\mathbf{H}) =
+    \text{Concat}(\text{head}_1, \ldots, \text{head}_h)\,\mathbf{W}^O,
+    \qquad
+    \text{head}_i = \text{Attention}\!\left(
+        \mathbf{H}\mathbf{W}^Q_i,\;
+        \mathbf{H}\mathbf{W}^K_i,\;
+        \mathbf{H}\mathbf{W}^V_i
+    \right),
+    \label{eq:mha}
+\end{equation}
+where $\mathbf{W}^O \in \mathbb{R}^{h d_v \times D}$ is the output projection. Each
+head specialises in a different relational pattern, and their combination yields a
+richer contextualised representation than any single head could produce alone.% ----------------------------------------------------------------
+\subsection{The Feed-Forward Sublayer}
+\label{subsec:ffn}
+% ----------------------------------------------------------------
+
+Following multi-head attention, each block applies a \emph{position-wise
+feed-forward network} (FFN) to every token representation independently. Unlike
+attention, which mixes information across positions, the FFN transforms each hidden
+state $\mathbf{h}_t^{(l)}$ in isolation, applying the same learned function to every
+position within a given layer. Its role is therefore complementary: whereas attention
+determines \emph{which} information is collected, the FFN determines \emph{how} that
+information is re-encoded at each position. This position-wise independence makes
+each $\mathbf{h}_t^{(l)}$ a clean unit of analysis, a property that this work
+exploits directly.
+
+In the original Transformer \citep{vaswani2017attention}, the FFN is a two-layer
+network with ReLU activation:
+\begin{equation}
+    \mathrm{FFN}\!\left(\mathbf{h}_t^{(l)}\right)
+    =
+    \max\!\left(\mathbf{0},\; \mathbf{h}_t^{(l)}\mathbf{W}_1 + \mathbf{b}_1\right)
+    \mathbf{W}_2 + \mathbf{b}_2,
+    \label{eq:ffn_original}
+\end{equation}
+where $\mathbf{W}_1 \in \mathbb{R}^{D \times D_{\mathrm{ff}}}$ and
+$\mathbf{W}_2 \in \mathbb{R}^{D_{\mathrm{ff}} \times D}$, with intermediate
+dimension $D_{\mathrm{ff}}$ typically set to $4D$.
+
+\paragraph{SwiGLU.}
+\citet{dauphin2017language} introduced \emph{Gated Linear Units} (GLU) in the
+context of gated convolutional language models: an element-wise product between a
+sigmoid-gated projection and a linear projection, giving the network an explicit
+mechanism for selective information flow. \citet{shazeer2020glu} subsequently
+adapted this gating principle to the Transformer FFN and proposed a family of
+variants by replacing the sigmoid gate with alternative activation functions. Among
+these, SwiGLU has become the standard in modern LLMs—including Qwen2.5 and Llama~3,
+as well as Mistral and Gemma—and is the variant relevant to this work:
+\begin{equation}
+    \mathrm{FFN}_{\mathrm{SwiGLU}}\!\left(\mathbf{h}_t^{(l)}\right)
+    =
+    \left(
+        \mathrm{Swish}\!\left(\mathbf{h}_t^{(l)}\mathbf{W}_1\right)
+        \odot
+        \mathbf{h}_t^{(l)}\mathbf{V}
+    \right)\mathbf{W}_2,
+    \label{eq:swiglu}
+\end{equation}
+where $\mathbf{W}_1, \mathbf{V} \in \mathbb{R}^{D \times D_{\mathrm{ff}}}$ are the
+gate and value projection matrices of the FFN (the symbol $\mathbf{V}$ here follows
+\citealt{shazeer2020glu} and refers to the FFN value projection, distinct from the
+attention value matrix in Equation~\ref{eq:qkv_projections}),
+$\mathbf{W}_2 \in \mathbb{R}^{D_{\mathrm{ff}} \times D}$ is the output projection,
+and $\mathrm{Swish}(z) = z \cdot \sigma(z)$ \citep{ramachandran2017searching}.
+Figure~\ref{fig:swiglu} details the internal computational graph.
+Because SwiGLU uses three weight matrices rather than two, $D_{\mathrm{ff}}$ is
+reduced by a factor of $2/3$ relative to the standard $4D$ setting to maintain
+comparable parameter counts \citep{shazeer2020glu}.
+
+% --- Figure 2: SwiGLU internal structure ----------------------------
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\linewidth]{figures/fig2_swiglu_structure.pdf}
+    \caption{%
+        Internal structure of the SwiGLU feed-forward sublayer
+        (Equation~\ref{eq:swiglu}). The input hidden state $\mathbf{h}_t^{(l)} \in
+        \mathbb{R}^D$ is projected along two parallel branches: a gate branch through
+        $\mathbf{W}_1 \in \mathbb{R}^{D \times D_{\mathrm{ff}}}$ followed by the Swish
+        activation $\mathrm{Swish}(z) = z \cdot \sigma(z)$, and a value branch through
+        $\mathbf{V} \in \mathbb{R}^{D \times D_{\mathrm{ff}}}$, where $D$ is the model
+        dimension and $D_{\mathrm{ff}}$ is the intermediate dimension. Their element-wise
+        product is projected back to $\mathbb{R}^D$ by $\mathbf{W}_2 \in
+        \mathbb{R}^{D_{\mathrm{ff}} \times D}$. The three-matrix parameterisation
+        distinguishes SwiGLU from the original two-matrix FFN and maps directly onto the
+        key-value memory decomposition introduced in Section~\ref{sec:ffn_memory}.%
+    }
+    \label{fig:swiglu}
+\end{figure}
+% --------------------------------------------------------------------
+
+The connection between the FFN parameterisation and associative memory retrieval is
+made precise in Section~\ref{sec:ffn_memory}, where the matrices $\mathbf{W}_1$ and
+$\mathbf{V}$ are identified with a key bank and a value bank respectively.
+
+% ----------------------------------------------------------------
+\subsection{Residual Connections and Layer Normalisation}
+\label{subsec:residual_layernorm}
+% ----------------------------------------------------------------
+
+Each Transformer block composes the MHA and FFN sublayers through two structural mechanisms: residual connections and layer normalisation. Together, these mechanisms form the \emph{residual stream}, which is the progressively refined representation of the input shown in Figure~\ref{fig:transformer_block}.
+
+\paragraph{Residual connections.}
+A residual (skip) connection adds the sublayer input directly to its output:
+\begin{equation}
+    \mathbf{y} = \mathbf{x} + f(\mathbf{x}),
+    \label{eq:residual}
+\end{equation}
+where $f(\cdot)$ is the sublayer transformation. This provides a direct gradient
+path during backpropagation, mitigating vanishing gradients, and encourages each
+sublayer to learn an incremental refinement of its input rather than a complete
+transformation from scratch.
+
+\paragraph{Pre-Layer Normalisation.}
+Modern LLMs apply normalisation \emph{before} each sublayer (Pre-LN), as shown in
+Figure~\ref{fig:transformer_block}. Using $\tilde{\mathbf{H}}^{(l)}$ to denote the
+intermediate hidden state after the attention residual, the full block update is:
+\begin{align}
+    \tilde{\mathbf{H}}^{(l)} &= \mathbf{H}^{(l-1)}
+        + \mathrm{MHA}^{(l)}\!\left(\mathrm{RMSNorm}\!\left(\mathbf{H}^{(l-1)}\right)\right),
+    \label{eq:residual_attn} \\
+    \mathbf{H}^{(l)} &= \tilde{\mathbf{H}}^{(l)}
+        + \mathrm{FFN}^{(l)}\!\left(\mathrm{RMSNorm}\!\left(\tilde{\mathbf{H}}^{(l)}\right)\right).
+    \label{eq:residual_ffn}
+\end{align}
+The token-level hidden state $\mathbf{h}_t^{(l)} =
+\mathrm{RMSNorm}\!\left(\tilde{\mathbf{h}}_t^{(l)}\right)$ entering the FFN is the primary signal used in the detection framework of this work. This representation corresponds to the \emph{probe point} shown in Figure~\ref{fig:transformer_block}.
+
+\paragraph{RMSNorm.}
+Both Qwen2.5 and Llama~3 employ Root Mean Square Normalisation (RMSNorm), a
+simplified variant that omits the mean-centring step of standard layer normalisation:
+\begin{equation}
+    \mathrm{RMSNorm}\!\left(\mathbf{h}_t^{(l)}\right)
+    =
+    \frac{\mathbf{h}_t^{(l)}}
+         {\sqrt{\frac{1}{D}\sum_{d=1}^{D}\!\left(h_{t,d}^{(l)}\right)^2 + \epsilon}}
+    \odot \boldsymbol{\gamma},
+    \label{eq:rmsnorm}
+\end{equation}
+where $\epsilon > 0$ ensures numerical stability and $\boldsymbol{\gamma} \in
+\mathbb{R}^D$ is a learned scale vector. Removing mean-centring reduces
+computational overhead while retaining the stabilising effect on activation
+magnitudes.
+
+% ----------------------------------------------------------------
+\subsection{Taxonomy of Transformer Architectures}
+\label{subsec:transformer_taxonomy}
+% ----------------------------------------------------------------
+
+Transformer-based models are commonly grouped into three families according to their
+attention pattern \citep{tunstall2022natural}. \emph{Encoder-only} models process
+the full input sequence bidirectionally and are primarily used for classification
+and language understanding tasks. \emph{Encoder-decoder} models learn a
+sequence-to-sequence mapping through a cross-attention bridge between a bidirectional
+encoder and a causal decoder, suited to tasks such as machine translation. The
+present work is concerned exclusively with \emph{decoder-only} models, which employ
+causal masked self-attention to autoregressively generate one token at a time. This family includes Qwen2.5, Llama 3, Mistral, and Gemma, which are the architectures examined in the experiments of Chapter~\ref{chap:experiments}. Their autoregressive structure
+produces a sequence of per-token hidden states $\mathbf{h}_t^{(l)}$ at each layer
+$l$ and position $t$, which constitute the representational signal that the
+detection mechanism analyses.
+% =============================================================
+% =============================================================
+% ================================================================
+\section{Internal Representations of LLMs}
+\label{sec:internal_representations}
+% ================================================================
+
+The previous section established how a decoder-only Transformer builds token
+representations layer by layer through self-attention and feed-forward sublayers
+connected by residual additions. Using the notation established there,
+$\mathbf{h}_t^{(l)} \in \mathbb{R}^D$ denotes the hidden state of token $t$ after
+layer $l$, and $\mathbf{H}^{(l)} \in \mathbb{R}^{T \times D}$ the corresponding
+matrix across all positions. Across layers and positions, these vectors define the
+internal representational trajectory of the model during generation.
+
+Not all of these states play the same role in this work. The objective here is not
+to treat hidden representations as generic features, but to study them as queries
+over parametric memory. This requires identifying the sub-computation in which a
+token representation is matched against stored parameters and transformed according
+to that match. In decoder-only Transformers, that role is played by the feed-forward
+sublayer.
+
+% ----------------------------------------------------------------
+\subsection{Feed-Forward Layers as Parametric Memory}
+\label{sec:ffn_memory}
+% ----------------------------------------------------------------
+
+Each feed-forward sublayer processes token representations independently, applying
+the same learned transformation to every position. This position-wise independence
+means that the hidden state $\mathbf{h}_t^{(l)}$ acts on the sublayer's parameters
+without interacting with any other token, making it a natural unit for studying
+how individual representations interact with learned knowledge.
+
+\citet{geva2021transformer} formalised this observation by showing that the
+feed-forward sublayer can be written as an unnormalised key-value memory lookup.
+Letting $\mathbf{r} \in \mathbb{R}^D$ denote the token representation entering the
+sublayer (corresponding to $\mathbf{h}_t^{(l)}$ in the notation of
+Equation~\ref{eq:residual_ffn}), the computation takes the form:
+\begin{equation}
+    \mathrm{FFN}^{(l)}(\mathbf{r})
+    =
+    g\!\left(\mathbf{r}\,{\mathbf{K}^{(l)}}^{\!\top}\right)\mathbf{V}^{(l)},
+    \label{eq:ffn_kv_view}
+\end{equation}
+where $\mathbf{K}^{(l)} \in \mathbb{R}^{K_l \times D}$ is the first weight matrix,
+whose $K_l$ rows act as key vectors, $\mathbf{V}^{(l)} \in \mathbb{R}^{K_l \times D}$
+is the second weight matrix, whose rows act as value vectors, and $g(\cdot)$ is an
+element-wise nonlinearity such as ReLU. The inner products $\mathbf{r}{\mathbf{K}^{(l)}}^{\!\top}$
+measure the alignment between the input and each key, the nonlinearity $g$ produces
+a coefficient for each memory slot, and $\mathbf{V}^{(l)}$ assembles the output as
+a weighted combination of value vectors. The distinction from a normalised memory is
+that the canonical Transformer does not apply softmax to these coefficients, making
+the retrieval unnormalised \citep{geva2021transformer}.
+
+This framing has a concrete empirical basis. \citet{geva2021transformer} showed that
+individual key vectors correlate with human-interpretable input patterns: lower
+layers tend to capture shallow surface patterns such as recurring n-grams, while
+upper layers encode more semantic content. The corresponding value vectors promote
+output distributions concentrated on tokens that plausibly follow those patterns.
+The feed-forward sublayer thus acts as a distributed, layer-specific pattern library,
+and the input representation selectively activates entries in that library through
+its inner products with the stored keys.
+
+% ----------------------------------------------------------------
+\subsection{Gated Feed-Forward Layers and the Memory Bank}
+\label{subsec:gated_ffn_memory}
+% ----------------------------------------------------------------
+
+The models examined in this work — Qwen2.5 and Llama~3 — use the SwiGLU variant
+described in Section~\ref{subsec:ffn} rather than the ReLU-based FFN of
+Equation~\ref{eq:ffn_kv_view}. In generic form, a gated feed-forward layer is:
+\begin{equation}
+    \mathrm{FFN}^{(l)}(\mathbf{r})
+    =
+    \Bigl(
+        \phi\!\left(\mathbf{r}\,{\mathbf{A}^{(l)}}^{\!\top}\right)
+        \odot
+        \mathbf{r}\,{\mathbf{B}^{(l)}}^{\!\top}
+    \Bigr)\mathbf{C}^{(l)},
+    \label{eq:gated_ffn_generic}
+\end{equation}
+where $\mathbf{A}^{(l)}, \mathbf{B}^{(l)} \in \mathbb{R}^{K_l \times D}$,
+$\mathbf{C}^{(l)} \in \mathbb{R}^{K_l \times D}$, $\phi(\cdot)$ is a smooth
+activation, and $\odot$ denotes element-wise multiplication. In the SwiGLU
+parameterisation of Equation~\ref{eq:swiglu}, $\mathbf{A}^{(l)} = \mathbf{W}_1$,
+$\mathbf{B}^{(l)} = \mathbf{V}$, and $\mathbf{C}^{(l)} = \mathbf{W}_2$ (see
+Figure~\ref{fig:swiglu}).
+
+The gating structure means that the effective retrieval score of each intermediate
+unit depends on two projections of the input simultaneously, rather than on a single
+inner product with a stored key. Any identification of a fixed memory bank with a
+specific weight matrix is therefore a modelling choice rather than a structural
+theorem. This is an important distinction: the key-value view of
+\citet{geva2021transformer} applies directly to the ReLU case, and requires a
+deliberate extension when applied to gated architectures.
+
+In this thesis, the memory bank of layer $l$ is defined as the collection of row
+vectors of $\mathbf{A}^{(l)}$:
+\begin{equation}
+    \mathbf{M}^{(l)} \coloneqq \mathbf{A}^{(l)}
+    =
+    \begin{bmatrix}
+        {\mathbf{m}_1^{(l)}}^{\!\top} \\
+        \vdots \\
+        {\mathbf{m}_{K_l}^{(l)}}^{\!\top}
+    \end{bmatrix}
+    \in \mathbb{R}^{K_l \times D}.
+    \label{eq:memory_bank_definition}
+\end{equation}
+This choice is motivated by the role of $\mathbf{A}^{(l)}$ in the gating
+computation: the term $\phi(\mathbf{r}{\mathbf{A}^{(l)}}^{\!\top})$ determines
+which intermediate units are selectively activated, making $\mathbf{A}^{(l)}$ the
+matrix whose rows most directly function as pattern detectors in the sense of
+\citet{geva2021transformer}. The matrices $\mathbf{B}^{(l)}$ and $\mathbf{C}^{(l)}$
+remain essential to the full computation, but do not serve the same pattern-matching
+role.
+
+With this definition, the hidden state $\mathbf{r} = \mathbf{h}_t^{(l)}$ entering
+the feed-forward sublayer is treated as a query over the memory bank
+$\mathbf{M}^{(l)}$: the inner products $\mathbf{h}_t^{(l)}{\mathbf{M}^{(l)}}^{\!\top}$
+measure the alignment of the token's representation with each stored pattern.
+Section~\ref{sec:hopfield} formalises this retrieval operation within a Modern
+Hopfield Network framework, which provides an energy function and a closed-form
+retrieval distribution over the memory bank.
+% =============================================================
+% ================================================================
+\section{Modern Hopfield Networks}
+\label{sec:hopfield}
+% ================================================================
+
+Hopfield networks provide a principled framework for associative memory retrieval:
+given a query state and a collection of stored patterns, they define an energy
+function whose minima correspond to retrieved patterns, and an update rule that
+descends that energy. Their relevance to this thesis is not historical. They supply
+the mathematical language needed to convert the alignment between a hidden state and
+a layer-specific memory bank into an energy, a retrieval distribution, and
+concentration measures that can be linked to hallucination behaviour in
+Section~\ref{sec:divergences}.
+
+% ----------------------------------------------------------------
+\subsection{From Classical to Modern Associative Retrieval}
+\label{subsec:classical_to_modern_hopfield}
+% ----------------------------------------------------------------
+
+Classical Hopfield networks \citep{hopfield2007hopfield} store binary patterns in a
+symmetric weight matrix $\mathbf{W} = \sum_{i=1}^{K} \mathbf{m}_i\mathbf{m}_i^\top
+\in \mathbb{R}^{D \times D}$ constructed via Hebbian learning, and retrieve them by
+iterating a sign update that decreases the quadratic energy:
+\begin{equation}
+    E_{\mathrm{cl}}(\mathbf{q})
+    =
+    -\tfrac{1}{2}\mathbf{q}^{\top}\mathbf{W}\mathbf{q},
+    \qquad \mathbf{q} \in \{-1,+1\}^D.
+    \label{eq:classical_hopfield_energy}
+\end{equation}
+This formulation is too restrictive for the present setting: states are binary, and
+the storage capacity grows only linearly with the dimension $D$.
+
+\citet{ramsauer2020hopfield} introduced a modern Hopfield network with continuous
+states and exponential storage capacity. Let
+\begin{equation}
+    \mathbf{M}
+    =
+    \begin{bmatrix}
+        \mathbf{m}_1^\top\\
+        \vdots\\
+        \mathbf{m}_K^\top
+    \end{bmatrix}
+    \in \mathbb{R}^{K \times D}
+    \label{eq:generic_memory_bank}
+\end{equation}
+be a memory bank whose $K$ rows are stored patterns, and let $\mathbf{q} \in
+\mathbb{R}^D$ be a continuous query state. The modern Hopfield energy is:
+\begin{equation}
+    E(\mathbf{q};\,\mathbf{M},\beta)
+    =
+    -\frac{1}{\beta}\log\sum_{i=1}^{K}
+    \exp\!\bigl(\beta\,\mathbf{m}_i^{\top}\mathbf{q}\bigr)
+    +\frac{1}{2}\|\mathbf{q}\|_2^{2}
+    + C(\mathbf{M},\beta,K),
+    \label{eq:modern_hopfield_energy}
+\end{equation}
+where $\beta > 0$ is an inverse temperature parameter and
+$C(\mathbf{M},\beta,K) = \beta^{-1}\log K + \frac{1}{2}\max_i\|\mathbf{m}_i\|_2^2$
+is an additive constant that depends only on the memory bank, not on the query. When
+computing retrieval distributions or divergences between distributions, this constant
+cancels and can be omitted.
+
+The energy is minimised by the update rule \citep{ramsauer2020hopfield}:
+\begin{equation}
+    \mathbf{q}^{+}
+    =
+    \mathbf{M}^{\top}\,\mathrm{softmax}\!\bigl(\beta\,\mathbf{M}\mathbf{q}\bigr).
+    \label{eq:modern_hopfield_update}
+\end{equation}
+The updated state is a convex combination of the stored patterns, with weights given
+by a softmax over their inner products with the current query. \citet{ramsauer2020hopfield}
+prove global convergence and identify three types of fixed points: a global fixed
+point near the arithmetic mean of all patterns (reached when no pattern strongly
+dominates, corresponding to a near-uniform softmax), metastable states averaging
+over a correlated subset of patterns, and single-pattern fixed points reached when
+the query is well-separated from all other stored patterns. This trichotomy will
+be relevant when interpreting entropy as a retrieval-concentration signal in
+Section~\ref{subsec:retrieval_distribution_llm}.
+
+\paragraph{Connection to the attention mechanism.}
+\citet{ramsauer2020hopfield} show that the update rule of
+Equation~\eqref{eq:modern_hopfield_update} is equivalent to scaled dot-product
+attention under the identification $\beta = 1/\sqrt{d_k}$, with the stored patterns
+serving simultaneously as keys and values. Concretely, if the stored patterns
+$\mathbf{m}_i$ play the role of both key and value vectors, then
+Equation~\eqref{eq:modern_hopfield_update} reduces to:
+\begin{equation}
+    \mathbf{q}^{+}
+    =
+    \mathrm{Attention}\!\left(\mathbf{q},\,\mathbf{M},\,\mathbf{M}\right)
+    =
+    \mathbf{M}^{\top}\,\mathrm{softmax}\!\!\left(
+        \frac{\mathbf{M}\mathbf{q}}{\sqrt{d_k}}
+    \right).
+    \label{eq:mhn_attention_equiv}
+\end{equation}
+This is the attention mechanism of \citet{vaswani2017attention} with $K = V =
+\mathbf{M}$. It is not the same as self-attention, where queries, keys, and values
+arise from separate learned projections of the same sequence. The connection is
+nonetheless significant: it shows that the Transformer architecture and modern
+Hopfield networks share the same core retrieval operation, which justifies using
+Hopfield machinery to analyse the internal behaviour of Transformer layers.
+
+\paragraph{Sparse extensions.}
+Later work generalised the dense softmax retrieval map to sparse alternatives such
+as sparsemax and $\alpha$-entmax, yielding sparse modern Hopfield networks with
+stronger convergence to single-pattern fixed points \citep{martins2023sparse}. This
+thesis retains the dense softmax formulation because it produces a full probability
+distribution over all stored patterns, which is precisely the object needed for the
+entropy and divergence-based analysis that follows.
+
+% ----------------------------------------------------------------
+\subsection{Retrieval Distribution Induced by an LLM Hidden State}
+\label{subsec:retrieval_distribution_llm}
+% ----------------------------------------------------------------
+
+The quantity of interest in this thesis is not the converged fixed point of the
+Hopfield dynamics. Rather, it is the retrieval distribution produced by a single
+application of the softmax map to a hidden state, capturing the alignment structure
+of that state with the memory bank at the moment of generation.
+
+Instantiating the generic framework of Section~\ref{subsec:classical_to_modern_hopfield}
+with the Transformer quantities established in Sections~\ref{sec:internal_representations}
+and \ref{subsec:gated_ffn_memory}, the query is the hidden state entering the FFN
+at layer $l$ and token position $t$:
+\begin{equation}
+    \mathbf{q} = \mathbf{h}_t^{(l)},
+    \label{eq:query_identification}
+\end{equation}
+and the memory bank is the layer-specific matrix $\mathbf{M}^{(l)}$ defined in
+Equation~\eqref{eq:memory_bank_definition}. The induced retrieval distribution is:
+\begin{equation}
+    p_i^{(l,t)}
+    =
+    \frac{
+        \exp\!\bigl(\beta\,{\mathbf{m}_i^{(l)}}^{\!\top}\mathbf{h}_t^{(l)}\bigr)
+    }{
+        \sum_{j=1}^{K_l}
+        \exp\!\bigl(\beta\,{\mathbf{m}_j^{(l)}}^{\!\top}\mathbf{h}_t^{(l)}\bigr)
+    },
+    \qquad i = 1, \ldots, K_l.
+    \label{eq:retrieval_distribution}
+\end{equation}
+This distribution converts the hidden state into a probability vector over the $K_l$
+stored patterns of layer $l$. The retrieved prototype — the pattern that the hidden
+state most nearly recovers — is the expectation under this distribution:
+\begin{equation}
+    \bar{\mathbf{m}}_t^{(l)}
+    =
+    \sum_{i=1}^{K_l} p_i^{(l,t)}\,\mathbf{m}_i^{(l)}.
+    \label{eq:retrieved_pattern}
+\end{equation}
+
+Equation~\eqref{eq:retrieval_distribution} is the central bridge between the
+Transformer and the Hopfield formalism: it turns a token-level hidden state into an
+interpretable distribution over learned memory patterns. The shape of that
+distribution carries information about how the model is using its parametric
+knowledge at a given layer and position.
+
+By the fixed-point analysis of \citet{ramsauer2020hopfield}, a near-uniform
+distribution corresponds to the global averaging regime, where no single pattern is
+strongly preferred. A distribution concentrated on a few patterns corresponds to a
+metastable state. A distribution sharply peaked on one pattern indicates that the
+query is well within the basin of attraction of that memory. A natural summary of
+this concentration is the retrieval entropy:
+\begin{equation}
+    H^{(l,t)}
+    =
+    -\sum_{i=1}^{K_l} p_i^{(l,t)} \log p_i^{(l,t)}.
+    \label{eq:retrieval_entropy}
+\end{equation}
+High entropy indicates diffuse, unstructured retrieval; low entropy indicates that
+the hidden state is sharply aligned with a small subset of stored patterns. The
+hypothesis motivating this work is that correct and hallucinated generation differ
+systematically in the entropy and divergence structure of the distributions
+$\bigl\{p_i^{(l,t)}\bigr\}$ across layers. Section~\ref{sec:divergences}
+introduces the information-theoretic tools used to quantify that divergence.
+
+% =============================================================
+% ================================================================
+\section{Information-Theoretic Divergences}
+\label{sec:divergences}
+% ================================================================
+
+The retrieval distribution $\{p_i^{(l,t)}\}$ of Equation~\eqref{eq:retrieval_distribution}
+and the entropy $H^{(l,t)}$ of Equation~\eqref{eq:retrieval_entropy} characterise
+the alignment structure of a single hidden state with the memory bank at one layer
+and one position. The hallucination detection hypothesis of this work requires
+comparing two such distributions: one induced during the question prefill phase and
+one induced during answer generation. This section introduces the four
+information-theoretic quantities used to quantify that dissimilarity. Throughout,
+$P = (p_1, \ldots, p_K)$ and $Q = (q_1, \ldots, q_K)$ denote two probability
+distributions over $K$ outcomes; these are distribution labels and are distinct from
+the query and key matrices of Section~\ref{subsec:self_attention}.
+
+% ----------------------------------------------------------------
+\subsection{Shannon Entropy}
+\label{subsec:shannon_entropy}
+% ----------------------------------------------------------------
+
+The Shannon entropy of a discrete distribution $P$ \citep{shannon1948mathematical}
+measures the average uncertainty of drawing from it:
+\begin{equation}
+    H(P) = -\sum_{i=1}^{K} p_i \log p_i,
+    \label{eq:shannon_entropy}
+\end{equation}
+It attains its maximum $\log K$ at the uniform
+distribution and its minimum $0$ at a point mass. In the present context,
+$H^{(l,t)}$ in Equation~\eqref{eq:retrieval_entropy} is the instance of
+Equation~\eqref{eq:shannon_entropy} with $P = \{p_i^{(l,t)}\}_{i=1}^{K_l}$,
+measuring how spread the retrieval is across the $K_l$ patterns of layer $l$.
+
+Because $K_l$ varies across architectures and configurations, the analysis uses the
+\emph{normalised entropy}:
+\begin{equation}
+    \bar{H}(P) = \frac{H(P)}{\log K},
+    \label{eq:normalised_entropy}
+\end{equation}
+which maps the range of $H$ to $[0,1]$ and makes per-layer and cross-model
+comparisons dimensionless. A value of $\bar{H} \approx 1$ indicates near-uniform
+retrieval; $\bar{H} \approx 0$ indicates near-deterministic retrieval concentrated
+on a single pattern.
+
+% ----------------------------------------------------------------
+\subsection{Kullback-Leibler Divergence}
+\label{subsec:kl_divergence}
+% ----------------------------------------------------------------
+
+The Kullback-Leibler (KL) divergence from $Q$ to $P$
+\citep{kullback1951information} measures the expected log-likelihood ratio of $P$
+over $Q$ under $P$:
+\begin{equation}
+    D_{\mathrm{KL}}(P \| Q) = \sum_{i=1}^{K} p_i \log \frac{p_i}{q_i}.
+    \label{eq:kl_divergence}
+\end{equation}
+By Gibbs' inequality, $D_{\mathrm{KL}}(P \| Q) \geq 0$, with equality if and only
+if $P = Q$ almost everywhere. The KL divergence is asymmetric: $D_{\mathrm{KL}}(P
+\| Q) \neq D_{\mathrm{KL}}(Q \| P)$ in general. In the application of this work,
+both distributions are softmax outputs over the full memory bank, ensuring strictly
+positive entries and a well-defined KL divergence. The asymmetric form is retained
+here as the building block for the symmetric measures introduced below; the
+direction of the asymmetry carries meaning when one distribution serves as a fixed
+reference and the other as a test.
+
+% ----------------------------------------------------------------
+\subsection{Jensen-Shannon Divergence}
+\label{subsec:js_divergence}
+% ----------------------------------------------------------------
+
+The Jensen-Shannon divergence (JSD) \citep{lin1991divergence} symmetrises the KL
+divergence via the mixture $M = \tfrac{1}{2}(P + Q)$:
+\begin{equation}
+    D_{\mathrm{JS}}(P \| Q)
+    =
+    \frac{1}{2}\,D_{\mathrm{KL}}(P \| M)
+    +
+    \frac{1}{2}\,D_{\mathrm{KL}}(Q \| M).
+    \label{eq:js_divergence}
+\end{equation}
+An equivalent expression in terms of entropies makes the connection to
+Equation~\eqref{eq:shannon_entropy} explicit:
+\begin{equation}
+    D_{\mathrm{JS}}(P \| Q)
+    =
+    H(M) - \frac{1}{2}H(P) - \frac{1}{2}H(Q).
+    \label{eq:js_entropy_form}
+\end{equation}
+The JSD is symmetric, always finite, and bounded: $0 \leq D_{\mathrm{JS}}(P \| Q)
+\leq \log 2$ with natural logarithms. These properties make it the primary
+divergence used in this work for comparing retrieval distributions across the
+prefill and generation phases.
+
+% ----------------------------------------------------------------
+\subsection{Hellinger Distance}
+\label{subsec:hellinger}
+% ----------------------------------------------------------------
+
+The Hellinger distance provides a geometric complement to
+the entropy-based JSD. It is defined as:
+\begin{equation}
+    H^2(P, Q)
+    =
+    \frac{1}{2}\sum_{i=1}^{K}
+    \!\left(\sqrt{p_i} - \sqrt{q_i}\right)^{\!2},
+    \label{eq:hellinger_squared}
+\end{equation}
+where $H^2(P, Q)$ is the squared Hellinger distance, also called the Hellinger
+divergence. It satisfies $0 \leq H^2(P, Q) \leq 1$, with $H^2 = 0$ iff $P = Q$
+and $H^2 = 1$ iff $P$ and $Q$ have disjoint support. The Hellinger distance is
+symmetric, bounded regardless of whether $P$ and $Q$ share support, and can be
+computed stably by operating on square-root probabilities rather than log-ratios,
+avoiding the numerical instabilities that arise near zero-probability events.
+
+The relationship between the Hellinger distance and the Bhattacharyya coefficient
+$\mathrm{BC}(P, Q) = \sum_{i=1}^{K} \sqrt{p_i q_i}$ is direct:
+\begin{equation}
+    H^2(P, Q) = 1 - \mathrm{BC}(P, Q),
+    \label{eq:hellinger_bhattacharyya}
+\end{equation}
+which shows that the Hellinger distance measures how far the two distributions are
+from having identical square-root profiles. Used alongside JSD, it provides a
+second, geometrically distinct measure of the shift between retrieval distributions
+across generation phases, with complementary sensitivity to the tails of the
+distribution.
+
+In this work, both $D_{\mathrm{JS}}$ and $H^2$ are computed per generated token per
+layer between the generation-phase retrieval distribution and the prefill reference
+distribution. The specific definition of the prefill reference and the aggregation
+of these per-token, per-layer scalars into sample-level features is formalised in
+Chapter~\ref{chap:methods}.% =============================================================
+% =============================================================
+%  END OF CHAPTER
+% =============================================================

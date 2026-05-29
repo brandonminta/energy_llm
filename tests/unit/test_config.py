@@ -12,8 +12,8 @@ from hopfield_llm.pipeline.config import (
 
 
 def test_load_default_config():
-    cfg = load_experiment_config("configs/experiments/exp01_truthfulqa_baseline.yaml")
-    assert cfg.name == "exp01_truthfulqa_baseline"
+    cfg = load_experiment_config("configs/experiments/final_qwen_truthfulqa.yaml")
+    assert cfg.name == "final_qwen_truthfulqa"
     assert cfg.model_alias == "qwen25_3b"
     assert cfg.dataset_name == "truthfulqa"
     assert cfg.beta == 15.0

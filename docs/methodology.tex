@@ -1,0 +1,1207 @@
+% =============================================================
+%  CHAPTER: Methodology
+%  Thesis: Hallucination Detection in Large Language Models
+%          via Modern Hopfield Retrieval over SwiGLU Memory Banks
+%  Status: Working draft — final pipeline specification
+% =============================================================
+
+\chapter{Methodology}
+\label{chap:methods}
+
+This chapter specifies the methodology of the thesis. It translates the
+theoretical framework of Chapter~\ref{chap:theory} into a concrete software
+artifact, an operational pipeline, an evaluation protocol, and a final
+experimental configuration that will be executed to test the central
+hypothesis. The chapter is organised as a complete problem-solving cycle:
+problem description, problem analysis, solution design, implementation,
+testing, the proposed detection model, the statistical analysis method, and
+the experimental setup of the final pipeline.
+
+The presentation is intentionally constructive. Each phase introduces the
+choices that shape the next phase, and the final section consolidates all of
+those choices into a single executable plan. Earlier exploratory runs used
+during the development of the framework are not discussed here — they served
+only to dimension the problem; the configuration described below is the
+definitive one and is the one that will produce the results reported in
+Chapter~\ref{chap:experiments}.
+
+% =============================================================
+\section{Methodological Overview}
+\label{sec:method_overview}
+% =============================================================
+
+The methodology follows the engineering cycle commonly used in
+research-software projects: \emph{problem definition} $\rightarrow$
+\emph{analysis} $\rightarrow$ \emph{design} $\rightarrow$
+\emph{implementation} $\rightarrow$ \emph{testing} $\rightarrow$
+\emph{evaluation}. Each step is reified as a section in this chapter and as
+a concrete deliverable in the accompanying repository.
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Problem description}
+        (Section~\ref{sec:problem_description}).
+        Statement of the detection task, the binary target, the operating
+        constraints, and the scope.
+    \item \textbf{Problem analysis}
+        (Section~\ref{sec:problem_analysis}).
+        Decomposition of the task into measurable sub-problems: query
+        identification, memory definition, retrieval scoring, divergence
+        quantification, and label acquisition.
+    \item \textbf{Solution design}
+        (Section~\ref{sec:solution_design}).
+        Formal definition of the proposed probe: the gated SwiGLU memory
+        bank, the Modern Hopfield retrieval energy, the per-token
+        information-theoretic divergences, and the inverse-temperature
+        calibration.
+    \item \textbf{Implementation}
+        (Section~\ref{sec:implementation}).
+        Description of the six-stage artefact-based pipeline and of the
+        package modules that realise it.
+    \item \textbf{Testing}
+        (Section~\ref{sec:testing}).
+        Unit, integration, and pipeline smoke tests; numerical
+        regression tests on small fixed inputs.
+    \item \textbf{Proposed model}
+        (Section~\ref{sec:proposed_model}).
+        The per-layer feature vector, the logistic-regression probe, and
+        the held-out evaluation procedure.
+    \item \textbf{Analysis method}
+        (Section~\ref{sec:analysis_method}).
+        Statistical procedures used to claim signal: nested
+        cross-validation, bootstrap confidence intervals, permutation and
+        within-category null distributions, scan correction across layers,
+        paired-bootstrap nested-model tests, and effect-size reporting.
+    \item \textbf{Experimental configuration}
+        (Section~\ref{sec:experimental_config}).
+        Datasets, models, splits, hyperparameters, baselines, and the
+        ordered execution plan of the final pipeline.
+\end{enumerate}
+
+The pipeline is artefact-based: every stage writes a typed file to disk and
+every downstream stage reads from that file. This makes the methodology
+auditable, re-runnable in pieces, and resistant to silent regressions, as
+the same artefacts are consumed by tests and by analysis notebooks.
+
+% =============================================================
+\section{Problem Description}
+\label{sec:problem_description}
+% =============================================================
+
+% ----------------------------------------------------------------
+\subsection{Detection task}
+\label{subsec:task}
+% ----------------------------------------------------------------
+
+Let $f_\theta$ be a frozen, instruction-tuned, decoder-only language model
+with $L$ layers and SwiGLU feed-forward sublayers
+(Section~\ref{subsec:ffn}). Given a textual question $q$ and a set of gold
+short-form answers $\mathcal{A}_q = \{a_1, \ldots, a_m\}$ produced by a
+factoid question-answering dataset, $f_\theta$ generates an answer
+$\hat{y} = f_\theta(q)$ by greedy autoregressive decoding under a fixed
+chat-template wrapper.
+
+A \emph{hallucination} is operationalised as a binary indicator $z_q \in
+\{0, 1\}$ such that $z_q = 1$ when the generated answer $\hat{y}$ is not
+factually supported by $\mathcal{A}_q$, and $z_q = 0$ otherwise. The label
+$z_q$ is obtained by an external judging procedure described in
+Section~\ref{subsec:labels}, not by the model itself.
+
+The detection task is to construct a scoring function
+\begin{equation}
+    s : (q,\,\hat{y},\,\mathcal{I}(f_\theta, q, \hat{y})) \,\longmapsto\, \mathbb{R},
+    \label{eq:detection_function}
+\end{equation}
+where $\mathcal{I}(\cdot)$ denotes a fixed family of internal observables
+collected from the forward passes of $f_\theta$ on $q$ and during the
+generation of $\hat{y}$. Higher values of $s$ indicate higher predicted
+likelihood of $z_q = 1$. Quality is measured by the area under the receiver
+operating characteristic curve (AUROC) of $s$ against $z_q$.
+
+% ----------------------------------------------------------------
+\subsection{Operating constraints}
+\label{subsec:constraints}
+% ----------------------------------------------------------------
+
+The methodology adopts six constraints that scope what is allowed:
+
+\begin{enumerate}[leftmargin=*]
+    \item \emph{White-box access.} The model weights and activations are
+          accessible. No fine-tuning of $f_\theta$ is permitted.
+    \item \emph{Single forward pass for the main probe.} The Hopfield
+          features are computed from one prefill plus one greedy
+          generation; sampling-based baselines may use more.
+    \item \emph{Frozen architecture.} The detection mechanism may not alter
+          the decoding distribution. Decoded text under detection and
+          under no detection must be identical.
+    \item \emph{Mechanistic interpretability.} Each feature must admit a
+          per-layer interpretation and must be traceable to a specific
+          weight matrix or hidden state.
+    \item \emph{Reproducibility.} The pipeline must be deterministic for
+          fixed random seeds, fixed model checkpoints, and fixed
+          chat-template configurations.
+    \item \emph{Modest hardware envelope.} Stages requiring GPUs must be
+          runnable on a single A100 40\,GB or, with 4-bit quantisation, on
+          a consumer RTX-class card.
+\end{enumerate}
+
+These constraints align the methodology with the constraints of practical
+deployment scenarios (local inference, no retraining, audit-friendly
+features) and bound the engineering scope of the pipeline.
+
+% ----------------------------------------------------------------
+\subsection{Scope}
+\label{subsec:scope}
+% ----------------------------------------------------------------
+
+The scope of this thesis is limited to (i) factoid question answering with
+short gold answers, (ii) decoder-only models with SwiGLU MLP sublayers,
+(iii) English-language datasets, and (iv) hallucinations that manifest in
+the generated answer rather than in upstream chain-of-thought tokens. These
+restrictions define the regime in which the proposed signal is claimed to
+apply; cross-task generalisation is treated as out-of-scope.
+
+% =============================================================
+\section{Problem Analysis}
+\label{sec:problem_analysis}
+% =============================================================
+
+The detection task decomposes into five well-defined sub-problems, each of
+which corresponds to a specific module in the implementation.
+
+% ----------------------------------------------------------------
+\subsection{Query identification}
+\label{subsec:query_id}
+% ----------------------------------------------------------------
+
+The methodology operates on the hidden state $\mathbf{h}_t^{(l)} \in
+\mathbb{R}^D$ entering the SwiGLU feed-forward sublayer of layer $l$ at
+position $t$ (the \emph{probe point} of
+Figure~\ref{fig:transformer_block}). The first sub-problem is to specify
+which token positions contribute the query during prefill and during
+generation, and how to reduce a sequence of $T$ such states into the
+quantities used downstream.
+
+Two distinct positions matter:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Prefill reference.} The query is taken as the hidden
+          state of the \emph{last prompt token} after the chat template has
+          been applied. This is the state from which the model commits to
+          producing $\hat{y}$, and it is a single token's representation
+          rather than a mixture; this single-token choice is what makes
+          the prefill reference comparable to the per-token generation
+          states and avoids the mixture artefacts of mean-pooling across
+          the prompt.
+    \item \textbf{Generation queries.} During generation, the query at
+          position $t$ is the hidden state $\mathbf{h}_t^{(l)}$ at the
+          $t$-th newly generated token, captured once per token by a
+          forward hook on the MLP module.
+\end{itemize}
+
+Both passes apply the same chat template, so the prefill last-token state
+and the generation states share the same prompt prefix in their respective
+attention contexts. This invariance is enforced in the implementation
+(Section~\ref{sec:implementation}) and is verified by a smoke test.
+
+% ----------------------------------------------------------------
+\subsection{Memory definition}
+\label{subsec:memory_def}
+% ----------------------------------------------------------------
+
+The second sub-problem is to specify the per-layer memory bank
+$\mathbf{M}^{(l)} \in \mathbb{R}^{K_l \times D}$
+(Equation~\ref{eq:memory_bank_definition}). The bank is a derived,
+non-trainable function of the model parameters.
+
+In SwiGLU, the activation coefficient of the $i$-th intermediate unit is
+\begin{equation}
+    a_i^{(l)}(\mathbf{h})
+    =
+    \mathrm{Swish}\!\bigl(\mathbf{h}\,{\mathbf{W}_1^{(l)}}^{\!\top}[i]\bigr)
+    \,\cdot\,
+    \bigl(\mathbf{h}\,{\mathbf{V}^{(l)}}^{\!\top}[i]\bigr).
+    \label{eq:swiglu_unit_activation}
+\end{equation}
+Identifying the memory with either $\mathbf{W}_1^{(l)}$ or $\mathbf{V}^{(l)}$ alone
+captures only half of the gating computation. The methodology therefore
+defines the \emph{gated key bank}
+\begin{equation}
+    \mathbf{M}^{(l)} = \mathbf{W}_1^{(l)} \odot \mathbf{V}^{(l)}
+    \in \mathbb{R}^{K_l \times D},
+    \label{eq:gated_key_bank}
+\end{equation}
+where $\odot$ is the element-wise product. The $i$-th row
+$\mathbf{m}_i^{(l)} = \mathbf{W}_1^{(l)}[i] \odot \mathbf{V}^{(l)}[i]$ is the
+\emph{linearised gated key} of intermediate unit $i$, in the sense that
+$\mathbf{m}_i^{(l)} \cdot \mathbf{h}$ approximates the gated activation
+$a_i^{(l)}(\mathbf{h})$ around a small neighbourhood of the operating
+point.\footnote{The exact $a_i^{(l)}(\mathbf{h})$ involves a non-linearity on
+the gate branch and is therefore not a single inner product. The linearised
+form is used as the retrieval score because the downstream Hopfield
+machinery operates on dot products, and because the element-wise product
+of the two projections is the unique parameter-derived quantity that mixes
+both branches of the gate without changing the dimensionality.}
+
+This bank is the principled key for SwiGLU. The implementation also
+supports the un-gated bank
+$\mathbf{M}^{(l)}_{\mathrm{up}} = \mathbf{V}^{(l)}$ as an ablation, and a
+value-space bank
+$\mathbf{M}^{(l)}_{\mathrm{val}} = (\mathbf{W}_2^{(l)})^{\!\top}$ for a
+secondary probe at the FFN output.
+
+Rows of the bank are L2-normalised after construction so that the
+maximum row norm $M_l = \max_i \|\mathbf{m}_i^{(l)}\|_2$ equals $1$ for
+every layer and the cross-layer constant $\tfrac{1}{2}M_l^2$ of
+Equation~\eqref{eq:modern_hopfield_energy} is identically $\tfrac{1}{2}$.
+This normalisation removes a layer-dependent additive offset from the
+energy without affecting the relative ordering of layers within a sample,
+and it makes the per-layer energies cross-layer comparable.
+
+% ----------------------------------------------------------------
+\subsection{Retrieval scoring}
+\label{subsec:retrieval_scoring}
+% ----------------------------------------------------------------
+
+The third sub-problem is to compute the Modern Hopfield retrieval energy
+$E(\mathbf{h}_t^{(l)};\,\mathbf{M}^{(l)},\,\beta)$ and the induced
+retrieval distribution $\{p_i^{(l,t)}\}$
+(Equations~\ref{eq:modern_hopfield_energy} and
+\ref{eq:retrieval_distribution}). Two design points are fixed:
+
+\begin{itemize}[leftmargin=*]
+    \item \emph{Numerical stability.} The log-sum-exp term is computed by
+          \texttt{torch.logsumexp}, not by naive exponentiation, so that
+          the score range $[\beta \min_i s_i,\,\beta \max_i s_i]$ does not
+          overflow at the operating $\beta$.
+    \item \emph{Query mode.} The energy is computed in \texttt{dot} mode
+          on the raw hidden state, with \texttt{normalize\_query=False}.
+          This keeps the quadratic term $\tfrac{1}{2}\|\mathbf{h}_t^{(l)}\|^2$
+          empirically varying and therefore makes the energy decomposition
+          falsifiable; under unit-norm queries the quadratic term collapses
+          to a constant and the empirical content of the LSE-vs-norm
+          decomposition is lost.
+\end{itemize}
+
+The retrieval distribution is reported alongside the energy as the
+softmax over the unbounded scores
+$\beta\,\mathbf{m}_i^{(l)\!\top}\mathbf{h}_t^{(l)}$ and is the object on
+which the divergences of Section~\ref{sec:divergences} act.
+
+% ----------------------------------------------------------------
+\subsection{Divergence quantification}
+\label{subsec:divergence_quant}
+% ----------------------------------------------------------------
+
+The fourth sub-problem is to quantify how the per-layer retrieval
+distribution shifts from the prefill reference to each generation token.
+For every layer $l$ and every generation position $t$, the methodology
+records the Jensen–Shannon divergence and the squared Hellinger distance
+between the generation distribution $\{p_i^{(l,t)}\}$ and the prefill
+reference distribution $\{p_i^{(l,\mathrm{ref})}\}$
+(Equations~\ref{eq:js_divergence} and \ref{eq:hellinger_squared}). These
+two divergences are symmetric, bounded, and have complementary
+sensitivities: JS captures entropy-style mass redistribution and Hellinger
+captures geometric distance between square-root profiles.
+
+The Kullback–Leibler divergence is computed as the building block of JS
+and reported as a diagnostic in the asymmetric form
+$D_{\mathrm{KL}}(p^{(l,t)} \,\|\, p^{(l,\mathrm{ref})})$, but it is not used
+as a feature.
+
+% ----------------------------------------------------------------
+\subsection{Label acquisition}
+\label{subsec:labels}
+% ----------------------------------------------------------------
+
+The fifth sub-problem is to obtain reliable binary labels $z_q$ at scale.
+Two complementary labelling procedures are used:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Token-F1 heuristic.} The generated answer $\hat{y}$ and
+          every gold answer $a_j$ are tokenised by the same tokenizer
+          used by $f_\theta$. The maximum SQuAD-style token-F1 score
+          over $\mathcal{A}_q$ is compared to a fixed threshold
+          ($\tau_{\mathrm{F1}} = 0.3$). The heuristic provides an
+          inexpensive, deterministic, but semantically blunt label.
+    \item \textbf{LLM judge.} A separate language model is asked, via a
+          locked prompt template, whether $\hat{y}$ is factually supported
+          by $\mathcal{A}_q$. The judge's verbatim output is recorded
+          alongside a parsed binary label and the SHA-1 of the prompt
+          template.
+\end{enumerate}
+
+The two labels are reconciled by reporting Cohen's $\kappa$ as a
+calibration statistic. The judge label is taken as the primary supervision
+signal; the heuristic label is retained as a transparent cross-check and
+as the supervision used in low-API-budget ablations. Both labels are
+written as separate JSON artefacts and never overwrite each other, so the
+choice of supervision can be changed without re-running the labelling
+stage.
+
+% =============================================================
+\section{Solution Design}
+\label{sec:solution_design}
+% =============================================================
+
+This section consolidates the sub-problems of Section~\ref{sec:problem_analysis}
+into the formal definition of the proposed probe and into the algorithms
+that produce its features.
+
+% ----------------------------------------------------------------
+\subsection{Per-layer feature design}
+\label{subsec:feature_design}
+% ----------------------------------------------------------------
+
+For each layer $l \in \{0, \ldots, L-1\}$ the methodology defines a
+small, fixed set of per-sample features. Let $\mathbf{h}^{(l,\mathrm{ref})}$
+denote the prefill last-token hidden state, and let
+$\{\mathbf{h}_t^{(l)}\}_{t=1}^{T_g}$ denote the generation-token hidden
+states over the $T_g$ tokens produced for question $q$. Let
+$E^{(l,t)}$, $H^{(l,t)}$, and $\bar{H}^{(l,t)}$ denote the energy, entropy,
+and normalised entropy at $(l,t)$, and let
+$\mathrm{JS}^{(l,t)}$ and $H^2_{\mathrm{Hel}}{}^{(l,t)}$ denote the JS and
+squared-Hellinger divergences between $\{p_i^{(l,t)}\}$ and
+$\{p_i^{(l,\mathrm{ref})}\}$.
+
+For every layer $l$ the following scalars are computed:
+\begin{align}
+    \Delta E^{(l)}
+        &= \tfrac{1}{T_g^\star} \!\sum_{t \in \mathcal{T}_q^\star}\! E^{(l,t)} - E^{(l,\mathrm{ref})}, \\
+    \Delta H^{(l)}
+        &= \tfrac{1}{T_g^\star} \!\sum_{t \in \mathcal{T}_q^\star}\! H^{(l,t)} - H^{(l,\mathrm{ref})}, \\
+    \Delta \bar{H}^{(l)}
+        &= \tfrac{1}{T_g^\star} \!\sum_{t \in \mathcal{T}_q^\star}\! \bar{H}^{(l,t)} - \bar{H}^{(l,\mathrm{ref})}, \\
+    \overline{\mathrm{JS}}^{(l)}
+        &= \tfrac{1}{T_g^\star} \!\sum_{t \in \mathcal{T}_q^\star}\! \mathrm{JS}^{(l,t)}, \\
+    \overline{H^2_{\mathrm{Hel}}}{}^{(l)}
+        &= \tfrac{1}{T_g^\star} \!\sum_{t \in \mathcal{T}_q^\star}\! H^2_{\mathrm{Hel}}{}^{(l,t)}.
+    \label{eq:per_layer_features}
+\end{align}
+Here $\mathcal{T}_q^\star \subseteq \{1, \ldots, T_g\}$ is the
+\emph{answer-span} subset of generated positions and $T_g^\star =
+|\mathcal{T}_q^\star|$. The span is obtained by aligning $\hat{y}$ against
+the gold answers $\mathcal{A}_q$ at the tokenizer level; when no
+alignment is found, the span defaults to all content tokens (those that
+remain after a deterministic punctuation/whitespace filter). This pooling
+restriction is motivated by the observation that the detection signal of
+interest is the model's commitment to factual claims, which lives in the
+answer-bearing tokens rather than in connectors or punctuation.
+
+The per-layer vector for sample $q$ is the concatenation
+\begin{equation}
+    \boldsymbol{\phi}_q
+    =
+    \bigl[
+        \Delta E^{(0)}, \ldots, \Delta E^{(L-1)},\;
+        \Delta \bar{H}^{(0)}, \ldots, \Delta \bar{H}^{(L-1)},\;
+        \overline{\mathrm{JS}}^{(0)}, \ldots, \overline{\mathrm{JS}}^{(L-1)},\;
+        \overline{H^2_{\mathrm{Hel}}}{}^{(0)}, \ldots, \overline{H^2_{\mathrm{Hel}}}{}^{(L-1)}
+    \bigr]
+    \in \mathbb{R}^{4L}.
+    \label{eq:feature_vector}
+\end{equation}
+The ablation features $\Delta H^{(l)}$ (un-normalised entropy) are stored
+as alternates and used only when an explicit ablation is reported.
+
+% ----------------------------------------------------------------
+\subsection{Inverse-temperature calibration}
+\label{subsec:beta_calibration}
+% ----------------------------------------------------------------
+
+The retrieval sharpness $\beta$ controls whether the softmax over
+$\mathbf{M}^{(l)}$ is near-uniform (no signal), maximally informative, or
+collapsed onto a single row (no signal). Both extremes produce noisy
+divergences. The methodology calibrates $\beta$ once per model–bank pair
+by the following procedure:
+
+\begin{enumerate}[leftmargin=*]
+    \item Draw a fixed warm-up subset of $N_c = 30$ questions from the
+          training split.
+    \item Run prefill on each warm-up question and capture the raw
+          scores $\mathbf{M}^{(l)}\mathbf{h}^{(l,\mathrm{ref})}$ at every
+          layer.
+    \item For each candidate $\beta \in \{1, 2, 5, 10, 15, 20, 30, 50,
+          100\}$, evaluate the mean normalised entropy of
+          $\mathrm{softmax}(\beta \cdot \mathrm{scores})$ across all
+          captured layers and warm-up samples.
+    \item Choose $\beta^\star$ as the value at which the mean normalised
+          entropy crosses the operating target
+          $\bar{H}^\star = 0.55$. Linear interpolation in
+          $\log \beta$ is used between the two bracketing candidates.
+\end{enumerate}
+
+The choice $\bar{H}^\star = 0.55$ sits inside the \emph{detection band}:
+above $\bar{H} \approx 0.7$ the softmax is nearly uniform and the
+divergences vanish; below $\bar{H} \approx 0.3$ the softmax is collapsed
+and the divergences saturate. This calibration is computed only on the
+training split so that no test-set information leaks into $\beta^\star$.
+
+% ----------------------------------------------------------------
+\subsection{Algorithmic summary}
+\label{subsec:algorithms}
+% ----------------------------------------------------------------
+
+The complete per-sample procedure is summarised in
+Algorithm~\ref{alg:per_sample}. The procedure is purely functional in the
+sense that it takes the model, the bank, and the question as inputs and
+returns the feature vector $\boldsymbol{\phi}_q$ together with the
+generated text $\hat{y}$; no in-place modifications of the model are
+performed.
+
+\begin{algorithm}[H]
+\caption{Per-sample feature extraction}
+\label{alg:per_sample}
+\begin{algorithmic}[1]
+\Require frozen model $f_\theta$, banks $\{\mathbf{M}^{(l)}\}_{l=0}^{L-1}$,
+         inverse temperature $\beta^\star$, question $q$, gold answers $\mathcal{A}_q$
+\State $p \gets \texttt{apply\_chat\_template}(q)$
+\State Run prefill forward pass on $p$; at every layer $l$, capture the
+       hidden state $\mathbf{h}^{(l,\mathrm{ref})}$ at the last prompt token
+\State Compute $E^{(l,\mathrm{ref})}$, $H^{(l,\mathrm{ref})}$,
+       $\bar{H}^{(l,\mathrm{ref})}$ and the reference distribution
+       $\{p_i^{(l,\mathrm{ref})}\}$ for all $l$ via
+       Equations~\eqref{eq:modern_hopfield_energy}--\eqref{eq:retrieval_distribution}
+\State Greedy-decode $\hat{y}$ from $p$ with $T_g \le T_{\max}$ tokens; at
+       every generated position $t$, capture
+       $\{\mathbf{h}_t^{(l)}\}_{l=0}^{L-1}$
+\For{each $(l, t)$}
+    \State Compute $E^{(l,t)}$, $H^{(l,t)}$, $\bar{H}^{(l,t)}$,
+           $\{p_i^{(l,t)}\}$
+    \State Compute $\mathrm{JS}^{(l,t)}$ and
+           $H^2_{\mathrm{Hel}}{}^{(l,t)}$ against
+           $\{p_i^{(l,\mathrm{ref})}\}$
+\EndFor
+\State Align $\hat{y}$ to $\mathcal{A}_q$ at the tokenizer level to obtain
+       $\mathcal{T}_q^\star$
+\State Pool the per-token quantities over $\mathcal{T}_q^\star$ as in
+       Equation~\eqref{eq:per_layer_features}
+\State Assemble $\boldsymbol{\phi}_q$ as in Equation~\eqref{eq:feature_vector}
+\State \Return $(\boldsymbol{\phi}_q,\,\hat{y})$
+\end{algorithmic}
+\end{algorithm}
+
+% =============================================================
+\section{Implementation}
+\label{sec:implementation}
+% =============================================================
+
+The methodology is realised as a Python package, \texttt{hopfield\_llm},
+organised around a six-stage artefact-based pipeline. Each stage produces a
+typed artefact on disk and consumes only artefacts written by previous
+stages. Stages 1–4 form the core capture-and-aggregate flow; Stages 5–6
+are evaluation layers that may be re-run independently. The pipeline is
+shown schematically in Figure~\ref{fig:pipeline_overview}.
+
+\begin{figure}[H]
+    \centering
+    \begin{minipage}{0.92\linewidth}
+    \texttt{%
+    \begin{tabbing}
+    \=[1]\quad\=\texttt{build-banks}\quad\quad\=GPU\quad\=model \=\(\rightarrow\) banks.pt\\
+    [2]\>\texttt{run-trajectory}\>GPU\>banks + dataset\>\(\rightarrow\) \{id\}.npz, \{id\}.json\\
+    [3]\>\texttt{analyze}\>CPU\>trajectory dir\>\(\rightarrow\) analysis.json\\
+    [4]\>\texttt{visualize}\>CPU\>analysis.json\>\(\rightarrow\) plots/*.png\\
+    [5]\>\texttt{label}\>CPU\>trajectory dir\>\(\rightarrow\) \{id\}\_labeled.json, calibration.json\\
+    [6]\>\texttt{evaluate}\>CPU\>trajectory + labels\>\(\rightarrow\) report.html
+    \end{tabbing}
+    }
+    \end{minipage}
+    \caption{The six-stage pipeline. GPU-bound stages run once per
+    \emph{(model, dataset, probe)} triple; CPU-bound stages can be
+    re-executed against the same trajectories without reusing the GPU.}
+    \label{fig:pipeline_overview}
+\end{figure}
+
+% ----------------------------------------------------------------
+\subsection{Stage 1 — Bank extraction}
+\label{subsec:stage1}
+% ----------------------------------------------------------------
+
+\textbf{Module: \texttt{memory/banks.py}.} The stage walks every layer of
+the loaded model, resolves the SwiGLU sub-modules through a model-alias
+registry (\texttt{gate\_proj}/\texttt{up\_proj} for Qwen and Llama;
+\texttt{w1}/\texttt{w3} aliases for Mistral-family naming), and constructs
+the requested bank. For the gated key bank
+(Equation~\ref{eq:gated_key_bank}), the dequantised \texttt{gate\_proj} and
+\texttt{up\_proj} weights are loaded into \texttt{float32} on CPU, their
+element-wise product is computed, and the resulting matrix
+$\mathbf{W}_{\mathrm{gate}}^{(l)} \odot \mathbf{V}^{(l)}$ is L2-normalised
+row-wise. The output artefact \texttt{banks.pt} contains
+$\{l \mapsto \texttt{Tensor}[K_l, D]\}$ together with a companion
+\texttt{banks\_metadata.json} that records per-layer
+$\{K_l, D, M_l^{\mathrm{raw}}, M_l^{\mathrm{used}}, \text{source}\}$.
+
+The supported bank values are \texttt{gated\_key} (primary, principled
+SwiGLU key), \texttt{up} (un-gated key, kept for ablation), and
+\texttt{down\_values} (rows of $\mathbf{W}_2^\top$ for the value-space
+ablation). The raw \texttt{down\_proj} weight is explicitly rejected with
+a hard error, because its rows live in the output dimension and would
+silently confuse keys with values.
+
+% ----------------------------------------------------------------
+\subsection{Stage 2 — Trajectory capture}
+\label{subsec:stage2}
+% ----------------------------------------------------------------
+
+\textbf{Modules: \texttt{hooks/capture.py}, \texttt{pipeline/stages.py}.}
+For each sample, the stage runs two forward passes: a prefill pass on the
+chat-templated prompt and a greedy-generation pass capped at $T_{\max}$
+tokens. Per-layer pre-hooks registered on the \texttt{mlp} module of every
+\texttt{model.layers[l]} capture $\mathbf{h}_t^{(l)}$ at the MLP input,
+i.e.\ after the post-attention RMSNorm and before the gate/up projections
+(Figure~\ref{fig:transformer_block}).
+
+For every $(l, t)$ pair, the stage computes the seven scalars of
+\texttt{LayerEnergyResult}: full energy $E$, entropy $H$, normalised
+entropy $\bar{H}$, log-sum-exp term, quadratic term, top score, and
+active-row count (rows whose raw score exceeds a fixed threshold
+$\tau = 0.1$). It additionally computes the per-token JS and Hellinger
+divergences against the prefill last-token reference. The complete set
+of per-sample arrays is persisted to a compressed \texttt{\{id\}.npz}
+file with the layout listed in Table~\ref{tab:npz_schema}.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{lll}
+        \toprule
+        Key & Shape & Description \\
+        \midrule
+        \texttt{prefill\_energy}        & $[L]$       & Last-token reference energy per layer \\
+        \texttt{prefill\_entropy}       & $[L]$       & Last-token reference Shannon entropy per layer \\
+        \texttt{prefill\_norm\_entropy} & $[L]$       & As above, normalised by $\log K_l$ \\
+        \texttt{prefill\_lse}           & $[L]$       & LSE term of the energy decomposition \\
+        \texttt{prefill\_quadratic}     & $[L]$       & Quadratic term $\tfrac{1}{2}\|\mathbf{h}^{(l,\mathrm{ref})}\|^2$ \\
+        \texttt{prefill\_top\_act}      & $[L]$       & Max raw score over the bank rows \\
+        \texttt{gen\_energy}            & $[L, T_g]$  & Per-layer per-token generation energy \\
+        \texttt{gen\_entropy}           & $[L, T_g]$  & Per-layer per-token generation entropy \\
+        \texttt{gen\_norm\_entropy}     & $[L, T_g]$  & Normalised generation entropy \\
+        \texttt{gen\_lse}               & $[L, T_g]$  & Generation LSE term \\
+        \texttt{gen\_top\_act}          & $[L, T_g]$  & Generation max score \\
+        \texttt{gen\_js}                & $[L, T_g]$  & JS divergence vs prefill reference \\
+        \texttt{gen\_hellinger}         & $[L, T_g]$  & Squared Hellinger distance vs prefill reference \\
+        \texttt{token\_ids}             & $[T_g]$     & Generated token ids \\
+        \bottomrule
+    \end{tabular}
+    \caption{Schema of the per-sample \texttt{.npz} artefact produced by
+    Stage~2. The companion \texttt{\{id\}.json} records the question, the
+    gold answers, the generated text, the generation configuration, and
+    the model identifier.}
+    \label{tab:npz_schema}
+\end{table}
+
+Hidden states themselves are never persisted: the bank multiplication and
+the divergences are computed online inside the hook and only the
+$[L]$/$[L, T_g]$ scalars survive the forward pass. A diagnostic subset
+of $N_{\mathrm{diag}}$ samples additionally writes the raw scores
+$\mathbf{M}^{(l)}\mathbf{h}_t^{(l)}$ as a \texttt{\{id\}\_scores.npz}
+sidecar, which permits a post-hoc $\beta$ sweep without re-running the
+GPU stage.
+
+The stage exposes a sharding interface
+(\texttt{shard\_id, num\_shards}) that slices \texttt{samples[k::N]} so
+that multiple workers can populate the same trajectory directory in
+parallel without lock contention; this is used in the HPC array-job
+submission script.
+
+% ----------------------------------------------------------------
+\subsection{Stage 3 — Analysis}
+\label{subsec:stage3}
+% ----------------------------------------------------------------
+
+\textbf{Module: \texttt{pipeline/analysis.py}.} The stage is CPU-only and
+reads only the artefacts written by Stage~2. For each sample, it loads the
+\texttt{.npz} arrays and the metadata JSON, optionally restricts the
+generation arrays to the answer span $\mathcal{T}_q^\star$ (when
+\texttt{pool\_over\_answer=True}), and computes the per-layer
+$\Delta$-features of Equation~\eqref{eq:per_layer_features} together with
+two scalar summaries per sample:
+\begin{equation}
+    \mathrm{shift}^{(1)}_q
+    =
+    \tfrac{1}{L}\sum_{l=0}^{L-1}\!\!\left|\Delta E^{(l)}\right|,
+    \qquad
+    \mathrm{shift}^{(2)}_q
+    =
+    \!\sqrt{\tfrac{1}{L}\sum_{l=0}^{L-1}\!\!\left(\Delta E^{(l)}\right)^{\!2}}.
+    \label{eq:shift_scalars}
+\end{equation}
+These scalars are not used as detection features but are reported as
+interpretable per-sample summaries in the analysis JSON.
+
+The output \texttt{analysis.json} aggregates the per-layer arrays into
+$\mathrm{mean}_l$, $\mathrm{std}_l$ across samples, the score summary,
+and an optional per-category breakdown (for TruthfulQA's $38$ categories,
+which are propagated as \texttt{DataSample.category}).
+
+% ----------------------------------------------------------------
+\subsection{Stage 4 — Visualisation}
+\label{subsec:stage4}
+% ----------------------------------------------------------------
+
+\textbf{Module: \texttt{visualization/visualize\_analysis.py}.} The stage
+renders Matplotlib plots from \texttt{analysis.json}: per-layer mean
+$\Delta E^{(l)}$, $\Delta \bar{H}^{(l)}$,
+$\overline{\mathrm{JS}}^{(l)}$, $\overline{H^2_{\mathrm{Hel}}}{}^{(l)}$
+profiles with shaded standard deviations; per-category bar plots; and
+the distribution of the per-sample shift scalars. The figures are saved
+as PNGs alongside the analysis artefact.
+
+% ----------------------------------------------------------------
+\subsection{Stage 5 — Labelling}
+\label{subsec:stage5}
+% ----------------------------------------------------------------
+
+\textbf{Module: \texttt{labeling/}.} The stage walks every
+\texttt{\{id\}.json} produced by Stage~2 and computes both the F1
+heuristic label and the LLM-judge label
+(Section~\ref{subsec:labels}). The judge backend is configurable:
+when \texttt{api\_base} is set, an OpenAI-compatible REST call is made
+with the locked template; otherwise, a local HuggingFace model is loaded
+for air-gapped HPC use. The judge's verbatim output, the parsed label,
+the template hash, and the model identifier are persisted to
+\texttt{\{id\}\_labeled.json}. After all samples are labelled,
+\texttt{calibration.json} records the inter-rater agreement
+(Cohen's $\kappa$) between the heuristic and the judge.
+
+% ----------------------------------------------------------------
+\subsection{Stage 6 — Evaluation}
+\label{subsec:stage6}
+% ----------------------------------------------------------------
+
+\textbf{Module: \texttt{evaluation/}.} The stage joins the per-sample
+features written by Stage~3 with the labels written by Stage~5 and
+produces:
+\begin{enumerate}[leftmargin=*]
+    \item per-layer AUROC tables for every feature in
+          $\boldsymbol{\phi}_q$ against $z_q$;
+    \item the logistic-regression probe of
+          Section~\ref{sec:proposed_model} with nested cross-validation;
+    \item AUROC tables for the baselines of
+          Section~\ref{subsec:baselines};
+    \item the post-hoc $\beta$ sweep over the diagnostic subset, when
+          raw scores were saved;
+    \item a self-contained HTML report with embedded plots.
+\end{enumerate}
+
+% ----------------------------------------------------------------
+\subsection{Orchestration}
+\label{subsec:orchestration}
+% ----------------------------------------------------------------
+
+\textbf{CLI: \texttt{hopfield-llm}.} Each stage is exposed as a
+sub-command. The orchestrator sub-command \texttt{run-experiment} reads a
+single YAML configuration, runs Stages~1–4 with full experiment
+tracking (timestamped output directory, git commit hash, configuration
+snapshot, timing metadata, structured logs), and writes them inside
+\texttt{outputs/\{timestamp\}\_\{experiment\_name\}/}. Stages~5–6 are
+explicitly opt-in and run separately, because the labelling stage incurs
+external API cost and the evaluation stage benefits from being re-run
+multiple times against different label files. The implementation of this
+tracking layer lives in \texttt{utils/tracker.py} and is shared across
+both local and HPC submissions.
+
+% =============================================================
+\section{Testing}
+\label{sec:testing}
+% =============================================================
+
+Three test tiers protect the pipeline. They are organised as
+\texttt{pytest} suites and run by continuous integration on every change.
+
+\paragraph{Unit tests (\texttt{tests/unit/}).} These cover the pure
+mathematical primitives: the four terms of the Hopfield energy on
+hand-computed inputs; the KL/JS/Hellinger functions on known cases
+($p = q$ gives zero; disjoint support saturates Hellinger to one;
+$\mathrm{JS} \le \log 2$); the bank-extraction shape assertions for
+$\mathbf{W}_{\mathrm{gate}}^{(l)} \odot \mathbf{V}^{(l)}$; and the token-F1
+heuristic on hand-labelled toy strings.
+
+\paragraph{Integration tests (\texttt{tests/integration/}).} These run
+the four core stages end-to-end on a tiny model and a fixed five-sample
+slice of TruthfulQA, asserting that the produced \texttt{analysis.json}
+contains the expected keys, that the per-layer arrays have the expected
+shapes, and that re-running the same configuration twice produces
+bit-identical \texttt{analysis.json} (modulo timestamps).
+
+\paragraph{Pipeline smoke test.} A \texttt{scripts/local/test\_pipeline.sh}
+script runs all six stages on the five-sample slice with a public
+$\le 1.5$\,B-parameter model, verifies that every expected artefact
+exists, and confirms that the chat-template invariance
+(Section~\ref{subsec:query_id}) holds: the prefill token sequence and the
+prefix consumed by generation must be identical.
+
+The smoke test plus the integration suite are the gate for every commit
+that touches files inside \texttt{src/hopfield\_llm/}.
+
+% =============================================================
+\section{Proposed Detection Model}
+\label{sec:proposed_model}
+% =============================================================
+
+% ----------------------------------------------------------------
+\subsection{Per-layer logistic probe}
+\label{subsec:probe}
+% ----------------------------------------------------------------
+
+The proposed detection model is a regularised logistic-regression probe
+on the per-layer feature vector $\boldsymbol{\phi}_q \in \mathbb{R}^{4L}$
+of Equation~\eqref{eq:feature_vector}. Let $\sigma(\cdot)$ denote the
+logistic function. The probe estimates
+\begin{equation}
+    \hat{z}_q
+    =
+    \sigma\!\left(\boldsymbol{\phi}_q^{\!\top} \boldsymbol{w} + b\right),
+    \qquad
+    \boldsymbol{w} \in \mathbb{R}^{4L},\;
+    b \in \mathbb{R},
+    \label{eq:logistic_probe}
+\end{equation}
+fit by minimising the L2-regularised binary cross-entropy
+\begin{equation}
+    \min_{\boldsymbol{w},\,b}\; \tfrac{1}{N}\!\sum_{q=1}^N
+    \mathrm{BCE}\!\left(z_q,\,\hat{z}_q\right)
+    \;+\;
+    \tfrac{1}{2C}\,\|\boldsymbol{w}\|_2^2,
+    \label{eq:logistic_objective}
+\end{equation}
+where $C > 0$ is the inverse-regularisation strength. A standardisation
+step ($\mathrm{StandardScaler}$, fit on the training fold only) precedes
+the logistic regression. Missing values, which arise when an extraction
+warning fires for a single layer, are imputed with the per-column median
+of the training fold.
+
+The choice of a linear probe is deliberate: it commits the methodology
+to claims that are interpretable per layer (every coefficient in
+$\boldsymbol{w}$ maps to a single layer–metric pair), and it places a
+strong inductive bias against absorbing surface-feature confounds that a
+non-linear classifier could trivially memorise from $4L$ features.
+
+% ----------------------------------------------------------------
+\subsection{Held-out evaluation protocol}
+\label{subsec:eval_protocol}
+% ----------------------------------------------------------------
+
+The dataset of $N$ labelled samples is partitioned, stratified on $z_q$
+and with a fixed seed, into a \emph{train}/\emph{validation}/\emph{test}
+split of $70/15/15$. The test split is locked before the probe is
+fit and is not inspected until the very last step. The hyperparameter
+$C$ is chosen from the grid $\{0.01,\,0.1,\,1.0,\,10.0\}$ by inner
+$3$-fold cross-validation on the training fold; the outer evaluation is
+$5$-fold stratified cross-validation on \emph{train} $\cup$ \emph{val}.
+With the best $C$ selected, the probe is finally re-fit on
+\emph{train} $\cup$ \emph{val} and evaluated once on the held-out test
+split.
+
+This separation is what makes the reported AUROC a genuine generalisation
+estimate rather than a cross-validated optimistic statistic.
+
+% ----------------------------------------------------------------
+\subsection{Single-feature and per-layer reports}
+\label{subsec:single_feature_reports}
+% ----------------------------------------------------------------
+
+Alongside the multivariate probe, the methodology reports two
+complementary diagnostics. The first is the \emph{per-layer AUROC} of
+each individual feature $f \in \{\Delta E, \Delta \bar{H},
+\overline{\mathrm{JS}}, \overline{H^2_{\mathrm{Hel}}}\}$ at every layer
+$l$. The second is the \emph{single-feature unsupervised AUROC} of the
+best-layer score for each $f$, computed without any logistic-regression
+fitting. The first diagnostic localises the signal along the depth axis;
+the second isolates the unsupervised contribution of the Hopfield-derived
+features from the supervised contribution of the probe.
+
+% ----------------------------------------------------------------
+\subsection{Baselines}
+\label{subsec:baselines}
+% ----------------------------------------------------------------
+
+The detection model is compared against a fixed baseline suite that
+spans the families normally cited in the hallucination-detection
+literature.
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Token-level uncertainty.} Mean sequence log-probability,
+          mean per-token entropy, and maximum per-token entropy of
+          $\hat{y}$ under teacher forcing.
+          (Module: \texttt{evaluation/baselines.py}.)
+    \item \textbf{P(True).} A teacher-forced log-probability that the
+          model assigns to the token ``True'' after a follow-up prompt of
+          the form ``Is the following answer correct? Answer with a single
+          token: True or False.''
+          (Same module.)
+    \item \textbf{Semantic Entropy} \citep{farquhar2024detecting}.
+          $N_s = 10$ stochastic completions per prompt at temperature
+          $T_s = 0.5$ are clustered by bidirectional NLI entailment and
+          the entropy of the cluster distribution is taken as the score.
+          (Module: \texttt{evaluation/semantic\_entropy.py}.)
+    \item \textbf{HalluField} \citep{vu2025hallufield}. The logit
+          field-theoretic baseline: two teacher-forced forward passes
+          with perturbed sampling temperature are used to compute the
+          free-energy variation $\delta F_q$.
+          (Module: \texttt{evaluation/hallufield.py}.)
+    \item \textbf{INTRA} \citep{vazhentsev2026leveraging}. A lightweight
+          classifier on layer-pooled residual hidden states. The hidden
+          states are read from the same forward pass as the Hopfield
+          features, so the cost is fully amortised.
+          (Module: \texttt{evaluation/intra.py}.)
+\end{itemize}
+
+All baselines are scored under the identical train/val/test split as the
+probe. The aim is not to beat each baseline outright; it is to test
+whether the Hopfield-derived features add information \emph{on top of}
+the token-level uncertainty baselines, which is the contribution that
+the central hypothesis claims.
+
+% =============================================================
+\section{Analysis Method}
+\label{sec:analysis_method}
+% =============================================================
+
+This section specifies the statistical procedures used to support every
+claim made in Chapter~\ref{chap:experiments}. All procedures are
+implemented in \texttt{evaluation/} and run by Stage~6.
+
+% ----------------------------------------------------------------
+\subsection{Primary endpoint}
+\label{subsec:primary_endpoint}
+% ----------------------------------------------------------------
+
+The primary endpoint is the held-out AUROC of the probe of
+Equation~\eqref{eq:logistic_probe} on the locked test split, computed
+once, with a non-parametric bootstrap $95\%$ confidence interval
+estimated from $B = 10\,000$ resamples of the test predictions.
+
+% ----------------------------------------------------------------
+\subsection{Per-layer null distribution with scan correction}
+\label{subsec:scan_correction}
+% ----------------------------------------------------------------
+
+Per-layer AUROC plots are scan statistics: reporting only the maximum
+AUROC across $L$ layers inflates the type-I error. The methodology uses
+a permutation null in which the label vector is shuffled and the maximum
+per-layer AUROC is recomputed; this is repeated $B_{\mathrm{perm}} =
+1000$ times to form a null distribution of the scan maximum. A claim of
+``layer $l^\star$ shows AUROC above chance'' is supported only if the
+observed maximum exceeds the $95$th percentile of this null.
+
+% ----------------------------------------------------------------
+\subsection{Within-category permutation null}
+\label{subsec:within_category_null}
+% ----------------------------------------------------------------
+
+Datasets with categorical structure (TruthfulQA) admit a base-rate
+exploit: a detector that simply scores ``Misconceptions'' high will beat
+chance if hallucination rates differ across categories. To control for
+this, the methodology computes a within-category permutation null in
+which labels are permuted only within each category, and reports the
+$\Delta\mathrm{AUROC}$ of the probe over this stratified null in
+addition to the unconditional one.
+
+% ----------------------------------------------------------------
+\subsection{Effect size}
+\label{subsec:effect_size}
+% ----------------------------------------------------------------
+
+Beyond AUROC, the methodology reports Cliff's $\delta$ between the
+predicted-probability distributions of the two classes, with a
+bootstrap $95\%$ confidence interval. AUROC measures ranking quality;
+$\delta$ measures the standardised separation of the two distributions
+and is the effect-size metric appropriate for non-parametric two-sample
+comparisons.
+
+% ----------------------------------------------------------------
+\subsection{Paired-bootstrap nested-model test}
+\label{subsec:paired_bootstrap}
+% ----------------------------------------------------------------
+
+The central claim that the Hopfield features add information over a
+baseline is tested by the paired-bootstrap nested-model procedure of
+\citet{efron1994introduction}. Let $\hat{s}^{\mathrm{full}}_q$ and
+$\hat{s}^{\mathrm{base}}_q$ denote the probe scores produced by the
+full feature set $\boldsymbol{\phi}_q$ and by the baseline-only feature
+subset. For each of $B = 10\,000$ paired bootstrap resamples of the
+test set, $\Delta\mathrm{AUROC} = \mathrm{AUROC}^{\mathrm{full}} -
+\mathrm{AUROC}^{\mathrm{base}}$ is recomputed; the $95\%$ confidence
+interval of this $\Delta$ is reported. A positive lower bound is the
+formal condition under which the Hopfield contribution is claimed to be
+significant.
+
+% ----------------------------------------------------------------
+\subsection{Multiple-comparison correction}
+\label{subsec:multiple_comparison}
+% ----------------------------------------------------------------
+
+Secondary hypotheses are tested with Bonferroni correction at family
+$\alpha = 0.05$. Per-layer AUROC plots are exploratory and are not
+subject to Bonferroni; they are protected only by the scan-corrected
+null of Section~\ref{subsec:scan_correction}.
+
+% ----------------------------------------------------------------
+\subsection{Pre-registration}
+\label{subsec:preregistration}
+% ----------------------------------------------------------------
+
+Before the final pipeline is executed, the analysis plan — the primary
+endpoint, the success threshold, the layer-band of interest predicted
+from the theoretical framework (mid-to-late MLP layers, roughly the
+$50$–$85\%$ depth band), the baseline suite, and the multiple-comparison
+strategy — is committed to the repository as
+\texttt{docs/preregistration.md} and tagged with a git release. The
+intent of pre-registration is to make every later claim falsifiable: any
+deviation from the plan must be documented as a deviation rather than
+silently absorbed into the analysis.
+
+% =============================================================
+\section{Experimental Configuration}
+\label{sec:experimental_config}
+% =============================================================
+
+This section specifies the configuration that the final pipeline will be
+executed under. The configuration is consistent with the design of
+Sections~\ref{sec:solution_design}–\ref{sec:proposed_model}; nothing in
+this section overrides earlier design decisions, and no new pipeline
+stages are introduced.
+
+% ----------------------------------------------------------------
+\subsection{Models}
+\label{subsec:models}
+% ----------------------------------------------------------------
+
+Two instruction-tuned decoder-only models are evaluated:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Qwen2.5-3B-Instruct} \citep{qwen2025qwen25}. $L = 36$
+          layers, $D = 2048$, $D_{\mathrm{ff}} = 11008$.
+          Primary model for hyperparameter selection and the headline
+          result.
+    \item \textbf{Llama-3.2-3B-Instruct} \citep{grattafiori2024llama3}.
+          $L = 28$ layers, $D = 3072$, $D_{\mathrm{ff}} = 8192$.
+          Replication model for cross-architecture transfer.
+\end{itemize}
+
+Both models are loaded with $4$-bit NF4 quantisation
+(\texttt{bitsandbytes}) on local GPUs and in BF16 on the HPC A100. The
+quantisation only affects the forward pass; bank extraction always
+dequantises the relevant weight matrices to \texttt{float32} on CPU
+before the element-wise product of
+Equation~\eqref{eq:gated_key_bank}.
+
+% ----------------------------------------------------------------
+\subsection{Datasets}
+\label{subsec:datasets}
+% ----------------------------------------------------------------
+
+Three short-form factoid QA datasets are used:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{TruthfulQA} \citep{lin2022truthfulqa}. $817$ adversarial
+          questions across $38$ categories. Used as the primary dataset
+          because (i) it carries a curated set of correct and incorrect
+          reference answers, (ii) it is the de facto benchmark for
+          hallucination detection on factoid QA, and (iii) its
+          category metadata permits the within-category null of
+          Section~\ref{subsec:within_category_null}.
+    \item \textbf{TriviaQA} (\texttt{rc.nocontext} split,
+          \citealt{joshi2017triviaqa}). Natural-distribution factoid
+          questions, used as the cross-dataset transfer evaluation.
+          $500$ samples drawn at fixed seed.
+    \item \textbf{Natural Questions} (short-answer subset,
+          \citealt{kwiatkowski2019natural}). Held in reserve as an
+          additional out-of-distribution check if budget allows; not part
+          of the primary analysis.
+\end{itemize}
+
+For every dataset, sample identifiers are deterministic functions of the
+upstream identifier so that artefacts can be traced back to the source
+record.
+
+% ----------------------------------------------------------------
+\subsection{Bank, probe, and generation hyperparameters}
+\label{subsec:hyperparameters}
+% ----------------------------------------------------------------
+
+Table~\ref{tab:hyperparameters} lists every hyperparameter of the
+final pipeline. These values are fixed before execution and are not
+varied across the runs that produce the headline result.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{p{0.36\linewidth} p{0.28\linewidth} p{0.28\linewidth}}
+        \toprule
+        Parameter & Value & Provenance \\
+        \midrule
+        \multicolumn{3}{l}{\emph{Memory bank}} \\
+        \hspace{1em}\texttt{bank}                & \texttt{gated\_key}        & Eq.~\eqref{eq:gated_key_bank} \\
+        \hspace{1em}\texttt{normalize}           & \texttt{True} (row L2)     & §\ref{subsec:memory_def} \\
+        \hspace{1em}\texttt{hook\_target}        & \texttt{mlp\_input}        & §\ref{subsec:query_id} \\
+        \multicolumn{3}{l}{\emph{Energy and divergences}} \\
+        \hspace{1em}\texttt{energy\_mode}        & \texttt{dot}               & §\ref{subsec:retrieval_scoring} \\
+        \hspace{1em}\texttt{normalize\_query}    & \texttt{False}             & §\ref{subsec:retrieval_scoring} \\
+        \hspace{1em}\texttt{threshold} (active-row count) & $0.1$              & — \\
+        \hspace{1em}\texttt{beta} ($\beta^\star$)& calibrated, target $\bar{H}^\star = 0.55$ & §\ref{subsec:beta_calibration} \\
+        \hspace{1em}\texttt{calibration\_samples}& $30$                       & §\ref{subsec:beta_calibration} \\
+        \multicolumn{3}{l}{\emph{Generation}} \\
+        \hspace{1em}Decoding                     & greedy                     & §\ref{subsec:constraints} \\
+        \hspace{1em}\texttt{max\_new\_tokens}    & $50$                       & — \\
+        \hspace{1em}Chat template                & model default              & §\ref{subsec:query_id} \\
+        \multicolumn{3}{l}{\emph{Analysis pooling}} \\
+        \hspace{1em}\texttt{pool\_over\_answer}  & \texttt{True}              & §\ref{subsec:feature_design} \\
+        \multicolumn{3}{l}{\emph{Probe}} \\
+        \hspace{1em}Regulariser                  & L2                          & Eq.~\eqref{eq:logistic_objective} \\
+        \hspace{1em}$C$ grid                     & $\{0.01, 0.1, 1, 10\}$     & §\ref{subsec:probe} \\
+        \hspace{1em}Inner CV                     & $3$-fold stratified         & §\ref{subsec:eval_protocol} \\
+        \hspace{1em}Outer CV                     & $5$-fold stratified         & §\ref{subsec:eval_protocol} \\
+        \hspace{1em}Split                        & $70/15/15$ (train/val/test) & §\ref{subsec:eval_protocol} \\
+        \multicolumn{3}{l}{\emph{Statistics}} \\
+        \hspace{1em}Bootstrap resamples          & $10\,000$                   & §\ref{subsec:primary_endpoint} \\
+        \hspace{1em}Permutation resamples        & $1000$                      & §\ref{subsec:scan_correction} \\
+        \hspace{1em}Multiple-comparison family   & Bonferroni, $\alpha=0.05$  & §\ref{subsec:multiple_comparison} \\
+        \multicolumn{3}{l}{\emph{Labelling}} \\
+        \hspace{1em}F1 threshold $\tau_{\mathrm{F1}}$ & $0.3$                  & §\ref{subsec:labels} \\
+        \hspace{1em}Judge model                  & \texttt{gpt-4o-mini}        & §\ref{subsec:labels} \\
+        \hspace{1em}Prompt template              & \texttt{convcoa\_v1.txt}    & §\ref{subsec:labels} \\
+        \multicolumn{3}{l}{\emph{Determinism}} \\
+        \hspace{1em}Random seed                  & $42$                       & — \\
+        \hspace{1em}Generation                   & deterministic (greedy)      & §\ref{subsec:constraints} \\
+        \hspace{1em}Bank normalisation seed      & not applicable             & — \\
+        \bottomrule
+    \end{tabular}
+    \caption{Final pipeline hyperparameters. The provenance column points
+    at the section in which each choice is justified.}
+    \label{tab:hyperparameters}
+\end{table}
+
+% ----------------------------------------------------------------
+\subsection{Storage budget}
+\label{subsec:storage}
+% ----------------------------------------------------------------
+
+For Qwen2.5-3B on $500$ TruthfulQA samples ($L=36$, $K=11008$,
+$T_g \le 50$), each \texttt{\{id\}.npz} occupies $30$–$60$\,KB after
+compression, the optional \texttt{\{id\}\_scores.npz} sidecar weighs
+$\approx 38$\,MB per sample when full scores are kept, and the
+\texttt{banks.pt} artefact is $\approx 3$\,GB. The default
+configuration writes full scores only for the first $50$ samples
+(\texttt{scores\_subset\_size = 50}), bounding the total trajectory
+directory to $\approx 2$\,GB. Hidden states are never persisted; they
+live only in GPU memory during the forward pass.
+
+% ----------------------------------------------------------------
+\subsection{Final execution plan}
+\label{subsec:execution_plan}
+% ----------------------------------------------------------------
+
+The final pipeline is executed as a single, ordered sequence. Each step
+maps directly to a CLI invocation that consumes the artefacts of the
+previous step. The sequence is reproducible: given the same model
+checkpoint, the same dataset split, and the same seed, it produces
+bit-identical artefacts up to floating-point noise from the BF16/4-bit
+quantisation paths.
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Build the gated-key bank for Qwen2.5-3B.}
+        \texttt{hopfield-llm build-banks --model qwen25\_3b --bank
+        gated\_key --output outputs/qwen25\_3b/banks.pt}. Produces
+        \texttt{banks.pt} and \texttt{banks\_metadata.json}.
+    \item \textbf{Calibrate $\beta^\star$ on a 30-question warm-up.}
+        Performed inline by Stage~2 when
+        \texttt{calibrate\_beta=true}; writes
+        \texttt{calibration\_beta.json} into the run directory.
+    \item \textbf{Capture trajectories on TruthfulQA.}
+        \texttt{hopfield-llm run-trajectory --model qwen25\_3b --dataset
+        truthfulqa --banks outputs/qwen25\_3b/banks.pt --output
+        outputs/qwen25\_3b/truthfulqa/trajectories}. Writes one
+        \texttt{.npz}/\texttt{.json} pair per sample.
+    \item \textbf{Analyse trajectories with answer-span pooling.}
+        \texttt{hopfield-llm analyze --trajectories \dots
+        --pool-over-answer --output analysis.json}.
+    \item \textbf{Render the Stage~4 plots.}
+        \texttt{hopfield-llm visualize --analysis analysis.json
+        --output plots/}.
+    \item \textbf{Label with the F1 heuristic and the LLM judge.}
+        \texttt{hopfield-llm label --trajectories \dots --output
+        labels/ --judge-model gpt-4o-mini}. Writes per-sample labels
+        and \texttt{calibration.json}.
+    \item \textbf{Run the baselines.}
+        \texttt{python -m hopfield\_llm.evaluation.baselines}
+        (token-uncertainty + P(True)) on the same trajectories;
+        \texttt{python -m hopfield\_llm.evaluation.semantic\_entropy}
+        for the sampling baseline; \texttt{python -m
+        hopfield\_llm.evaluation.hallufield} for HalluField;
+        \texttt{python -m hopfield\_llm.evaluation.intra} for INTRA.
+        All four write per-sample sidecars into the trajectory
+        directory.
+    \item \textbf{Evaluate.}
+        \texttt{hopfield-llm evaluate --trajectories \dots --labels
+        labels/ --output report.html}. Performs the
+        train/validation/test split, fits the probe with nested CV,
+        computes per-layer AUROCs, paired-bootstrap nested-model tests,
+        bootstrap CIs, permutation nulls, and writes the HTML report.
+    \item \textbf{Replicate on Llama-3.2-3B.} Steps 1–8 are repeated
+        with \texttt{--model llama32\_3b}. The fitted probe from the
+        Qwen run is additionally applied zero-shot to the Llama
+        features as the cross-model transfer check.
+    \item \textbf{Cross-dataset transfer.} Steps 3–8 are repeated for
+        each model with \texttt{--dataset triviaqa}. The Qwen probe
+        fitted on the TruthfulQA train+val split is evaluated on the
+        TriviaQA test split without retraining.
+\end{enumerate}
+
+The ordering of the steps reflects the dependency graph among the
+artefacts: bank $\rightarrow$ trajectories $\rightarrow$ analysis,
+trajectories $\rightarrow$ labels, and \{analysis, labels, baselines\}
+$\rightarrow$ evaluation. Re-running an earlier step does not require
+re-running upstream steps; re-running a later step does not invalidate
+earlier artefacts.
+
+% ----------------------------------------------------------------
+\subsection{Reproducibility artefacts}
+\label{subsec:reproducibility}
+% ----------------------------------------------------------------
+
+Each run directory contains:
+
+\begin{itemize}[leftmargin=*]
+    \item the resolved YAML configuration, snapshotted at execution time;
+    \item the git commit hash and a flag indicating whether the working
+          tree was clean;
+    \item the environment fingerprint (Python version, \texttt{torch}
+          version, \texttt{transformers} version, \texttt{bitsandbytes}
+          version, CUDA version);
+    \item the per-stage wall-clock timing recorded by
+          \texttt{ExperimentTracker};
+    \item the chat-template string verbatim, including any model-specific
+          control tokens;
+    \item the random seed and the deterministic ordering of the dataset
+          slice consumed.
+\end{itemize}
+
+These artefacts are sufficient to re-execute the methodology on a
+different host and to verify the numerical reproducibility claim.
+
+% =============================================================
+\section{Summary}
+\label{sec:method_summary}
+% =============================================================
+
+The methodology turns the theoretical framework of
+Chapter~\ref{chap:theory} into a concrete, auditable pipeline. The probe
+treats the hidden state entering each SwiGLU sublayer as a query against
+a layer-specific bank whose rows are the element-wise product
+$\mathbf{W}_{\mathrm{gate}}^{(l)} \odot \mathbf{V}^{(l)}$ of the gate and
+value projections, computes the Modern Hopfield retrieval energy and
+divergences against the prefill last-token reference, pools the resulting
+per-token quantities over the answer span, and feeds the per-layer
+$\Delta$-features into an L2-regularised logistic regression evaluated on
+a locked $15\%$ test split. The pipeline writes typed artefacts at every
+stage, is sharded for HPC use, and is supported by unit, integration, and
+end-to-end smoke tests. The final configuration of
+Section~\ref{sec:experimental_config} is the one that
+Chapter~\ref{chap:experiments} will execute and report against
+pre-registered baselines and pre-registered statistical procedures.
+
+% =============================================================
+% END OF CHAPTER
+% =============================================================

@@ -162,6 +162,19 @@ def load_sample_features(
         else {}
     )
 
+    # ── Sampling / field baselines (scalar sidecars, NaN when absent) ───────
+    def _sidecar_scalar(suffix: str, key: str) -> float:
+        p = artifact_dir / f"{sample_id}_{suffix}.json"
+        if not p.exists():
+            return _NAN
+        try:
+            return float(json.loads(p.read_text(encoding="utf-8")).get(key, _NAN))
+        except (ValueError, json.JSONDecodeError):
+            return _NAN
+
+    semantic_entropy = _sidecar_scalar("semmentropy", "semantic_entropy")
+    hallufield_score = _sidecar_scalar("hallufield", "hallufield_score")
+
     # ── Raw scores for beta sweep (optional) ──────────────────────────────
     scores_path = artifact_dir / f"{sample_id}_scores.npz"
     gen_scores: Optional[np.ndarray] = None
@@ -189,6 +202,8 @@ def load_sample_features(
         "token_entropy_mean": float(bl.get("token_entropy_mean", _NAN)),
         "token_entropy_max":  float(bl.get("token_entropy_max",  _NAN)),
         "p_true":             bl.get("p_true"),  # float | None
+        "semantic_entropy":   semantic_entropy,
+        "hallufield_score":   hallufield_score,
         # Text
         "generated_text": generated_text,
         "gold_answers":   gold_answers,
@@ -218,7 +233,9 @@ def load_all_features(
     sample_ids = sorted(
         jf.stem
         for jf in artifact_dir.glob("*.json")
-        if not jf.stem.endswith(("_label", "_baselines", "_hpre"))
+        if not jf.stem.endswith(
+            ("_label", "_baselines", "_hpre", "_semmentropy", "_hallufield", "_intra")
+        )
         and (artifact_dir / f"{jf.stem}.npz").exists()
     )
     samples: list[dict] = []

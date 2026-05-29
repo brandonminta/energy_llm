@@ -8,6 +8,12 @@ KEY-SPACE PROBE (default, bank="up"):
   Bank   = rows of W_up   [d_m, d]
   Scores = W_up @ x       [d_m]
 
+GATED KEY-SPACE PROBE (bank="gated_key"):
+  For SwiGLU MLPs: a_i = Swish(W_gate·x)_i × (W_up·x)_i
+  Bank   = rows of (W_gate ⊙ W_up)  [d_m, d]   element-wise product
+  Scores ≈ (W_gate[k] ⊙ W_up[k]) · x  — linearised gated retrieval score
+  This is the principled key-space probe for SwiGLU architectures.
+
 VALUE-SPACE PROBE (bank="down_values"):
   Query  = FFN output y^l          [d]
   Bank   = rows of W_down.T        [d_m, d]   (columns of W_down)
@@ -85,6 +91,11 @@ def _resolve_proj(mlp: Any, bank: str) -> tuple[str, Any]:
         return _first_existing_attr(mlp, ("up_proj", "w3", "fc1"), role="up")
     if bank == "down_values":
         return _first_existing_attr(mlp, ("down_proj", "w2", "fc2"), role="down")
+    if bank == "gated_key":
+        raise ValueError(
+            "bank='gated_key' requires two projections — use _extract_gated_key(), "
+            "not _resolve_proj()."
+        )
     explicit = {"gate_proj", "up_proj", "fc1", "w1", "w3"}
     if bank in explicit:
         return _first_existing_attr(mlp, (bank,), role=bank)
@@ -103,8 +114,51 @@ _SINGLE_BANKS = {
     "fc1", "w1", "w3",
 }
 
+# Dual-projection banks that require special extraction.
+_DUAL_BANKS = {"gated_key"}
+
 _KEY_SPACE   = {"gate", "up", "gate_proj", "up_proj", "fc1", "w1", "w3"}
 _VALUE_TRANS = {"down_values"}
+
+
+def _extract_gated_key(
+    mlp: Any,
+    config_hidden: int | None,
+    config_intermediate: int | None,
+    layer_idx: int,
+) -> tuple[torch.Tensor, str]:
+    """Extract the element-wise product of W_gate ⊙ W_up rows.
+
+    For SwiGLU architectures, the k-th hidden activation is:
+        a_k = Swish(W_gate[k] · x) × (W_up[k] · x)
+
+    The linearised retrieval key is ξ_k^gated = W_gate[k] ⊙ W_up[k], giving
+    the approximation  a_k ≈ ξ_k^gated · x.  This is the principled
+    key-space bank for SwiGLU (Falencia T7 in the pipeline review).
+
+    Returns:
+        (w, source_name)  where w has shape [K, d] in float32 on CPU.
+    """
+    _, gate_mod = _first_existing_attr(mlp, ("gate_proj", "w1", "fc1"), role="gate")
+    _, up_mod   = _first_existing_attr(mlp, ("up_proj",   "w3", "fc1"), role="up")
+
+    w_gate = _get_weight_float32(gate_mod)  # [K, d]
+    w_up   = _get_weight_float32(up_mod)    # [K, d]
+
+    if w_gate.shape != w_up.shape:
+        raise ValueError(
+            f"Layer {layer_idx}: gate and up projections have different shapes "
+            f"{tuple(w_gate.shape)} vs {tuple(w_up.shape)}"
+        )
+
+    if config_intermediate is not None and w_gate.shape[0] != config_intermediate:
+        raise ValueError(
+            f"Layer {layer_idx}: gate out_features={w_gate.shape[0]} != "
+            f"intermediate_size={config_intermediate}"
+        )
+
+    w = w_gate * w_up  # [K, d] — element-wise product
+    return w, "gate_proj⊙up_proj"
 
 
 def extract_banks(
@@ -142,9 +196,9 @@ def extract_banks(
             "for the value-space probe, or bank='up' for the key-space probe."
         )
 
-    if bank not in _SINGLE_BANKS:
+    if bank not in _SINGLE_BANKS and bank not in _DUAL_BANKS:
         raise ValueError(
-            f"Unknown bank='{bank}'. Supported: {sorted(_SINGLE_BANKS)}"
+            f"Unknown bank='{bank}'. Supported: {sorted(_SINGLE_BANKS | _DUAL_BANKS)}"
         )
 
     banks: dict[int, torch.Tensor] = {}
@@ -159,8 +213,13 @@ def extract_banks(
                 raise AttributeError(f"Layer {i} has no 'mlp' attribute")
             mlp = layer.mlp
 
-            source_name, module = _resolve_proj(mlp, bank)
-            w_raw = _get_weight_float32(module)  # [out_features, in_features]
+            if bank == "gated_key":
+                w_raw, source_name = _extract_gated_key(
+                    mlp, config_hidden, config_intermediate, i
+                )
+            else:
+                source_name, module = _resolve_proj(mlp, bank)
+                w_raw = _get_weight_float32(module)  # [out_features, in_features]
 
             if w_raw.ndim != 2:
                 raise ValueError(f"Layer {i}: expected 2D weight, got shape={tuple(w_raw.shape)}")
@@ -168,8 +227,8 @@ def extract_banks(
             out_f, in_f = w_raw.shape
 
             # Shape validation per bank family
-            if bank in _KEY_SPACE:
-                # W_up: maps hidden → intermediate; weight [d_m, d]
+            if bank in _KEY_SPACE or bank == "gated_key":
+                # [K, d] — rows are key (or gated-key) vectors
                 if config_hidden is not None and in_f != config_hidden:
                     raise ValueError(
                         f"Layer {i}: in_features={in_f} != hidden_size={config_hidden} "
@@ -180,7 +239,7 @@ def extract_banks(
                         f"Layer {i}: out_features={out_f} != intermediate_size={config_intermediate} "
                         f"for key-space bank='{bank}'"
                     )
-                w = w_raw  # [d_m, d] — rows are key vectors
+                w = w_raw  # [K, d]
 
             elif bank in _VALUE_TRANS:
                 # down_values: W_down.T; original weight [d, d_m], transposed → [d_m, d]

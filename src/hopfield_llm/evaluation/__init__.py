@@ -9,6 +9,19 @@ Usage
     )
     from hopfield_llm.evaluation.probe import fit_logreg_probe
     from hopfield_llm.evaluation.report import build_eval_report
+
+    # C3 — Semantic Entropy (Farquhar 2024)
+    from hopfield_llm.evaluation.semantic_entropy import (
+        SemanticEntropyScorer, run_semantic_entropy_batch,
+    )
+
+    # C4 — HalluField (temperature perturbation)
+    from hopfield_llm.evaluation.hallufield import (
+        compute_hallufield_score, run_hallufield_batch,
+    )
+
+    # C5 — INTRA (Vazhentsev 2026)
+    from hopfield_llm.evaluation.intra import run_intra_batch
 """
 
 from hopfield_llm.evaluation.features import (

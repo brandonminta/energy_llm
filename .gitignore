@@ -82,6 +82,8 @@ mlruns/
 
 # Generated binary documents (e.g. README.pdf exported from README.md)
 *.pdf
+# ...but keep the thesis figures shipped with the docs
+!docs/*.pdf
 
 # Project-specific AI guidance (not for public consumption)
 CLAUDE.md

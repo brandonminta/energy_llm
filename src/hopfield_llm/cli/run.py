@@ -22,11 +22,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model",   required=True, help="Model alias or HuggingFace model ID")
     p.add_argument("--output",  required=True, help="Output path for banks .pt file")
     p.add_argument("--bank",    default="up",
-                   choices=["gate", "up", "down_values",
+                   choices=["gate", "up", "down_values", "gated_key",
                             "gate_proj", "up_proj", "fc1", "w1", "w3"],
                    help="MLP projection to use as the memory bank")
     p.add_argument("--device",  default=None)
     p.add_argument("--no-4bit", action="store_true", help="Disable 4-bit quantization")
+    p.add_argument("--normalize", action="store_true",
+                   help="L2-normalize bank rows (M=1 per layer; required by the "
+                        "final methodology config). Default off preserves legacy behaviour.")
 
     # ── Stage 2 — trajectory collection ──────────────────────────────────────
     p = subparsers.add_parser(
@@ -40,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta",     type=float, default=15.0)
     p.add_argument("--threshold", type=float, default=0.1)
     p.add_argument("--energy-mode", default="dot", choices=["dot", "cosine"], dest="energy_mode")
+    p.add_argument("--normalize-query", action=argparse.BooleanOptionalAction, default=True,
+                   dest="normalize_query",
+                   help="L2-normalize the query hidden state before the energy. "
+                        "Use --no-normalize-query for the final methodology config "
+                        "(keeps the quadratic term empirically varying).")
+    p.add_argument("--hook-target", default="mlp_input", choices=["mlp_input", "mlp_output"],
+                   dest="hook_target", help="Where to capture the query hidden state.")
     p.add_argument("--max-samples", type=int, default=None, dest="max_samples")
     p.add_argument("--seed",     type=int, default=42)
     p.add_argument("--max-new-tokens", type=int, default=50, dest="max_new_tokens")
@@ -163,14 +173,22 @@ def _run_experiment(args: argparse.Namespace) -> int:
     analysis_path = run_dir / "analysis.json"
     plots_dir     = run_dir / "plots"
 
+    # In probe mode build_banks writes banks_{label}.pt, not banks.pt.
+    _probe_bank_paths = [run_dir / f"banks_{cfg.primary_probe.label}.pt"]
+    if cfg.secondary_probe is not None:
+        _probe_bank_paths.append(run_dir / f"banks_{cfg.secondary_probe.label}.pt")
+    _banks_exist = banks_path.exists() or all(p.exists() for p in _probe_bank_paths)
+
     try:
-        if args.skip_banks and banks_path.exists():
+        if args.skip_banks and _banks_exist:
             from hopfield_llm.utils.logging import get_logger
             get_logger("cli").info("Skipping bank extraction (--skip-banks)")
         else:
             build_banks(
                 model=cfg.model_alias, output=str(banks_path),
                 bank=cfg.bank, device=device, load_in_4bit=cfg.load_in_4bit,
+                primary_probe=cfg.primary_probe,
+                secondary_probe=cfg.secondary_probe,
             )
             tracker.log_metric("stage1_complete", 1.0)
 
@@ -190,6 +208,8 @@ def _run_experiment(args: argparse.Namespace) -> int:
             calibrate_beta=cfg.calibrate_beta,
             calibration_samples=cfg.calibration_samples,
             beta_target=cfg.beta_target,
+            primary_probe=cfg.primary_probe,
+            secondary_probe=cfg.secondary_probe,
         )
         if calibrated_beta is not None:
             tracker.patch_config({"trajectory": {"beta": calibrated_beta}})
@@ -201,6 +221,8 @@ def _run_experiment(args: argparse.Namespace) -> int:
                 traj_dir=str(traj_dir), output=str(analysis_path),
                 score_metric=cfg.score_metric, score_aggregation=cfg.score_aggregation,
                 signal_zone=cfg.signal_zone,
+                pool_over_answer=cfg.pool_over_answer,
+                tokenizer_id=cfg.tokenizer_id or cfg.model_alias,
             )
             tracker.log_metric("stage3_complete", 1.0)
 
@@ -228,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         build_banks(
             model=args.model, output=args.output,
             bank=args.bank, device=args.device, load_in_4bit=not args.no_4bit,
+            normalize=args.normalize,
         )
     elif args.command == "run-trajectory":
         run_trajectory(
@@ -238,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             diagnostic_subset=args.diagnostic_subset,
             shard_id=args.shard_id, num_shards=args.num_shards,
             device=args.device, load_in_4bit=not args.no_4bit,
+            normalize_query=args.normalize_query, hook_target=args.hook_target,
             calibrate_beta=args.calibrate_beta,
             calibration_samples=args.calibration_samples,
             beta_target=args.beta_target,

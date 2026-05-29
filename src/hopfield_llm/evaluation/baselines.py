@@ -143,3 +143,127 @@ def save_baselines(
     path = Path(artifact_dir) / f"{sample_id}_baselines.json"
     path.write_text(json.dumps(baselines, indent=2), encoding="utf-8")
     return path
+
+
+# ------------------------------------------------------------------
+# Batch runner + CLI entrypoint
+# ------------------------------------------------------------------
+
+_SIDECAR_TAGS = (
+    "calibration", "_label", "_baselines", "_scores", "_hpre",
+    "_hallufield", "_intra", "_semmentropy", "_lam",
+)
+
+
+def run_baselines_batch(
+    llm,
+    traj_dir: Path,
+    output_dir: Optional[Path] = None,
+    with_p_true: bool = True,
+    max_samples: Optional[int] = None,
+) -> int:
+    """Compute token-uncertainty + P(True) baselines for every trajectory sample.
+
+    Writes ``{sample_id}_baselines.json`` next to each trajectory file with keys
+    ``seq_logprob_mean``, ``token_entropy_mean``, ``token_entropy_max`` and
+    (when ``with_p_true``) ``p_true``.  Resume-safe: existing files are skipped.
+
+    Returns:
+        Number of samples newly processed.
+    """
+    traj_dir = Path(traj_dir)
+    out_dir  = Path(output_dir) if output_dir else traj_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_files = sorted(
+        f for f in traj_dir.glob("*.json")
+        if not any(t in f.name for t in _SIDECAR_TAGS)
+    )
+    if max_samples:
+        sample_files = sample_files[:max_samples]
+
+    total = len(sample_files)
+    done = skipped = failed = 0
+    log.info("run_baselines_batch: %d samples (p_true=%s)", total, with_p_true)
+
+    for i, jf in enumerate(sample_files, 1):
+        try:
+            meta = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Skipping %s: %s", jf.name, exc)
+            failed += 1
+            continue
+
+        sample_id = meta.get("id", jf.stem)
+        out_path  = out_dir / f"{sample_id}_baselines.json"
+        if out_path.exists():
+            skipped += 1
+            continue
+
+        sample = DataSample(
+            id=sample_id,
+            source=meta.get("source", ""),
+            question=meta.get("question", ""),
+            gold_answers=meta.get("gold_answers", []),
+            generated_text=meta.get("generated_text", ""),
+        )
+        try:
+            bl = compute_logit_baselines(llm, sample)
+            if with_p_true:
+                bl["p_true"] = compute_p_true(llm, sample)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%d/%d] FAILED %s: %s", i, total, sample_id, exc)
+            failed += 1
+            continue
+
+        bl["id"] = sample_id
+        save_baselines(bl, out_dir, sample_id)
+        done += 1
+        if i % 50 == 0:
+            log.info("[%d/%d] done=%d skipped=%d failed=%d", i, total, done, skipped, failed)
+
+    log.info("run_baselines_batch: done=%d skipped=%d failed=%d total=%d",
+             done, skipped, failed, total)
+    return done
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: ``python -m hopfield_llm.evaluation.baselines --trajectories DIR``."""
+    import argparse
+
+    from hopfield_llm.models.loader import HFLLM
+    from hopfield_llm.utils.logging import setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="Token-uncertainty + P(True) baselines over a trajectory directory",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--trajectories", required=True, help="Trajectory directory")
+    parser.add_argument("--model", default=None,
+                        help="Model alias; defaults to the model in the first trajectory JSON")
+    parser.add_argument("--no-4bit", action="store_true", help="Disable 4-bit quantization")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--no-p-true", action="store_true", help="Skip the P(True) baseline")
+    parser.add_argument("--max-samples", type=int, default=None)
+    args = parser.parse_args(argv)
+
+    setup_logging()
+    traj_dir = Path(args.trajectories)
+    model_alias = args.model
+    if model_alias is None:
+        first = next(iter(sorted(traj_dir.glob("*.json"))), None)
+        if first is None:
+            parser.error(f"No trajectory JSON files in {traj_dir}")
+        model_alias = json.loads(first.read_text(encoding="utf-8")).get("model", "qwen25_3b")
+        log.info("Resolved model alias from trajectory metadata: %s", model_alias)
+
+    llm = HFLLM(model_id=model_alias, device=args.device, load_in_4bit=not args.no_4bit)
+    llm.model.eval()
+    run_baselines_batch(
+        llm, traj_dir, with_p_true=not args.no_p_true, max_samples=args.max_samples,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

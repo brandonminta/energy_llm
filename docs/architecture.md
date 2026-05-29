@@ -2,46 +2,43 @@
 
 ## Overview
 
-`hopfield_llm` is a 6-stage artifact-based pipeline for energy-based hallucination detection in LLMs.
+`hopfield_llm` is an artifact-based pipeline for energy-based hallucination detection in LLMs. The first four stages form the core capture-and-aggregate flow; stages 5–6 are optional analytical layers run after the GPU stages complete.
 
 ```
 Dataset + Model
       │
       ▼
- [Stage 1] build_banks
-      │   Extract per-layer memory banks (MLP weight matrices)
-      │   Options: W_gate, W_up, W_down, W_fc1, W_fc2, W_w1, W_w2, W_w3, ...
+ [Stage 1] build-banks            (GPU)
+      │   Extract per-layer memory banks from MLP projections
+      │   Banks: gate / up / down_values / gate_proj / up_proj / down_proj / fc1 / fc2 / w1 / w2 / w3
       │   Output: banks.pt {layer_idx → Tensor[K, D]}
       │
       ▼
- [Stage 2] run_trajectory
-      │   Hook into model; run prefill + autoregressive generation
-      │   Capture h_pre per layer per token; compute energy/entropy
-      │   Output: {sample_id}.npz (energy [L] and [L,T]) + {sample_id}.json (metadata)
+ [Stage 2] run-trajectory         (GPU)
+      │   Hook into model.layers[*].mlp; run prefill + autoregressive generation
+      │   Both passes observe the chat-templated prompt → comparable per-layer states
+      │   Output: {id}.npz (energy/entropy [L] and [L,T]) + {id}.json (metadata)
       │
       ▼
- [Stage 3] label_sample
-      │   Label each sample: is_hallucination (boolean)
-      │   Options: heuristic (F1-based) or llm_judge (external LLM)
-      │   Output: {sample_id}_label.json
+ [Stage 3] analyze                (CPU)
+      │   Aggregate trajectory artifacts; compute per-sample divergences and scores
+      │   Output: analysis.json (score_summary, score_by_category, layer_metrics)
       │
       ▼
- [Stage 4] evaluate_features
-      │   Load trajectory artifacts + labels; bridge M2/M3 boundary
-      │   Extract baseline metrics (log-probability, entropy)
-      │   Output: feature dicts [{sample_id, is_hallucination, per_layer_features[L], ...}]
+ [Stage 4] visualize              (CPU)
+      │   Render plots from analysis.json
+      │   Output: plots/*.png
       │
       ▼
- [Stage 5] evaluate_probes
-      │   Compute per-layer AUROC table (best feature per layer)
-      │   Fit logistic regression probe with stratified nested CV
-      │   Perform beta sweep over cached score tensors
-      │   Output: metrics dict with AUROC, probe results, beta sweep curves
+ [Stage 5] label                  (CPU, optional)
+      │   F1 heuristic + LLM judge; Cohen's κ calibration between them
+      │   Output: {id}_labeled.json + calibration.json
       │
       ▼
- [Stage 6] report
-          Build self-contained HTML report with plots and metrics
-          Output: report.html (AUROC table, probe AUROC, beta curves, baselines)
+ [Stage 6] evaluate               (CPU, optional)
+          Per-layer AUROC + logistic-regression probe + token-logprob/entropy baselines
+          Post-hoc β-sweep over cached score tensors when available
+          Output: report.html
 ```
 
 Each stage writes artifacts to disk and can be run independently, making it
@@ -118,14 +115,14 @@ The pipeline supports **post-hoc modification without recomputation**:
 
 ## Current scientific hypothesis
 
-> The memory bank is the W_down matrix of the SwiGLU MLP.
-> The query is h_pre = SiLU(gate) ⊙ up at the last question token.
-> Energy = Modern Hopfield retrieval energy of this query against W_down.
+> The memory bank is a per-layer matrix derived from the SwiGLU MLP weights.
+> The query is the FFN input (key-space probe) or output (value-space probe) at the last question token of the chat-templated prompt.
+> Energy = Modern Hopfield retrieval energy of this query against the bank.
 
 **This hypothesis is not hardcoded.** To test alternatives:
-- Change the bank: pass `bank="gate"` or `bank="gate_plus_up"` to `build_banks`
-- Change the query: pass a different `query_fn` to `capture_prefill`
-- Change energy formula: replace `compute_energy` in `metrics/energy.py`
+- Change the bank: pass `bank="gate"` or `bank="down_values"` to `build_banks`
+- Change the query position: edit the `last_token`/`mean_tokens` extractor in `queries/extractors.py`
+- Change the energy formula: replace `compute_energy` in `metrics/energy.py`
 
 ---
 

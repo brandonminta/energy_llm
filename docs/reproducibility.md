@@ -11,7 +11,7 @@ for every completed experiment.  Required for Scopus submission (open-science an
 |-------|-------|
 | **Commit** | `db99c582d473ed9b2b09d636388b70b357f938d2` |
 | **Branch** | `main` |
-| **Config** | `configs/experiments/exp04_qwen_chat_template_fix.yaml` (snapshot in `exp04_results/config.yaml`) |
+| **Config** | `configs/experiments/exp04_qwen_chat_template_fix.yaml` (snapshot in `outputs/exp04_qwen_truthfulqa/config.yaml`) |
 | **Model** | `Qwen/Qwen2.5-3B-Instruct` (4-bit NF4 via bitsandbytes) |
 | **Dataset** | TruthfulQA MC (HuggingFace `truthful_qa`, `multiple_choice` config), `max_samples=500`, `seed=42` |
 | **β** | auto-calibrated from 30 calibration samples, converged at **β★ ≈ 68.16** |
@@ -19,7 +19,7 @@ for every completed experiment.  Required for Scopus submission (open-science an
 | **Hook target** | `mlp_input` |
 | **normalize_query** | `True` (‼ see preregistration.md §caveats — E_quad ≡ 0 under unit-norm) |
 | **Labels** | GPT-4o-mini judge (`gpt-4o-mini-2024-07-18`), heuristic F1 fallback |
-| **Label script commit** | same — `scripts/local/label_with_gpt.py` |
+| **Labeling** | same commit — `hopfield-llm label` (stage 5) |
 | **Hallucination rate** | ≈ 33 % (gpt-4o-mini) |
 
 ### Software environment
@@ -46,10 +46,10 @@ for every completed experiment.  Required for Scopus submission (open-science an
 
 | Artifact | Location |
 |----------|----------|
-| Trajectory `.npz` + `.json` | `exp04_results/trajectories/` (500 files) |
-| Labels | `exp04_results/labels/` (500 `_label.json` files) |
-| Analysis | `exp04_results/analysis.json` |
-| Config snapshot | `exp04_results/config.yaml` |
+| Trajectory `.npz` + `.json` | `outputs/exp04_qwen_truthfulqa/trajectories/` (500 files) |
+| Labels | `outputs/exp04_qwen_truthfulqa/labels/` (500 `_label.json` files) |
+| Analysis | `outputs/exp04_qwen_truthfulqa/analysis.json` |
+| Config snapshot | `outputs/exp04_qwen_truthfulqa/config.yaml` |
 
 ---
 

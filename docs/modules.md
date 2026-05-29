@@ -183,7 +183,7 @@ for sample in dataset:
 from hopfield_llm.pipeline.config import load_experiment_config
 from hopfield_llm.pipeline.stages import build_banks, run_trajectory
 
-cfg = load_experiment_config("configs/experiments/exp01.yaml")
+cfg = load_experiment_config("configs/experiments/final_qwen_truthfulqa.yaml")
 build_banks(cfg.model.alias, cfg.trajectory.bank, "banks.pt", cfg.model.load_in_4bit)
 ```
 
@@ -223,7 +223,7 @@ build_banks(cfg.model.alias, cfg.trajectory.bank, "banks.pt", cfg.model.load_in_
 ```python
 from hopfield_llm.visualization.plots import visualize_analysis
 
-visualize_analysis("outputs/exp01/analysis.json", "plots/")
+visualize_analysis("outputs/final_qwen_truthfulqa/analysis.json", "plots/")
 ```
 
 ---
@@ -415,9 +415,9 @@ print(auroc_by_beta)  # {beta: auroc}
 from hopfield_llm.evaluation.report import build_eval_report
 
 build_eval_report(
-    artifact_dir="outputs/exp01/trajectories",
-    labels_dir="outputs/exp01/trajectories",
-    output_path="outputs/exp01/report.html",
+    artifact_dir="outputs/final_qwen_truthfulqa/trajectories",
+    labels_dir="outputs/final_qwen_truthfulqa/trajectories",
+    output_path="outputs/final_qwen_truthfulqa/report.html",
 )
 ```
 
@@ -441,8 +441,8 @@ build_eval_report(
 ```python
 from hopfield_llm.utils.tracking import ExperimentTracker
 
-tracker = ExperimentTracker("exp01_tqa_baseline")
-print(tracker.run_dir)  # outputs/exp01_tqa_baseline/2024-04-23_1345_qwen25_3b_truthfulqa_down_15_0a1b2c3d/
+tracker = ExperimentTracker("final_qwen_truthfulqa")
+print(tracker.run_dir)  # outputs/final_qwen_truthfulqa/20260101_1345_qwen25_3b_truthfulqa_gated_key_b15.0_0a1b2c3d/
 
 with tracker.stage_timing("build-banks"):
     # run stage
@@ -470,7 +470,7 @@ with tracker.stage_timing("build-banks"):
 **Example**:
 ```bash
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01.yaml \
+    --config configs/experiments/final_qwen_truthfulqa.yaml \
     --override beta=20.0 \
     --skip-banks
 ```

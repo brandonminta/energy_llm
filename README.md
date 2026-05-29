@@ -19,17 +19,26 @@ export OPENAI_API_KEY=sk-...
 hopfield-llm label    --trajectories traj/ --output labels/
 hopfield-llm evaluate --trajectories traj/ --labels labels/ --output report.html
 
-# Or run stages 1-4 from a config
-hopfield-llm run-experiment --config configs/experiments/exp01_truthfulqa_baseline.yaml
+# Or run stages 1-4 from a config (the definitive headline run)
+hopfield-llm run-experiment --config configs/experiments/final_qwen_truthfulqa.yaml
+
+# Baselines for the evaluate report (token uncertainty, P(True), semantic
+# entropy, HalluField, INTRA) — each also runnable via `python -m`:
+python scripts/local/run_baselines.py --trajectories traj/ --model qwen25_3b
 ```
+
+See `configs/experiments/README.md` for the full config matrix and
+`RUNBOOK.md` for the ordered execution plan.
 
 ## Quick Start (HPC)
 
 ```bash
-bash setup_hpc.sh
-./jobs/submit_pipeline.sh                              # defaults
-MODEL=qwen25_7b DATASET=nq NUM_SHARDS=16 \
-  ./jobs/submit_pipeline.sh                            # larger run
+bash scripts/hpc/setup_hpc.sh
+# Single GPU job per config (auto-resumes; add --skip-banks on resubmit):
+sbatch --job-name=final_qwen_tqa \
+  scripts/hpc/jobs/run_experiment.sh configs/experiments/final_qwen_truthfulqa.yaml
+# Or sharded array submission for large sweeps:
+MODEL=qwen25_7b DATASET=nq NUM_SHARDS=16 scripts/hpc/submit_pipeline.sh
 ```
 
 ## Pipeline Stages
@@ -71,7 +80,7 @@ Experiment parameters are defined in YAML configs (`configs/experiments/`):
 
 ```yaml
 experiment:
-  name: exp01_truthfulqa_baseline
+  name: final_qwen_truthfulqa
 model:
   alias: qwen25_3b
   load_in_4bit: true
@@ -80,14 +89,21 @@ dataset:
   max_samples: null
   seed: 42
 trajectory:
-  bank: up            # gate | up | down_values | gate_proj | up_proj | down_proj | fc1 | fc2 | w1 | w2 | w3
-  beta: 15.0
+  bank: up            # legacy field; primary_probe.bank wins below
+  beta: 15.0          # starting point; overridden when calibrate_beta=true
+  calibrate_beta: true
+  beta_target: 0.55
   energy_mode: dot    # dot | cosine
+primary_probe:
+  bank: gated_key     # gated_key | up | down_values | gate | gate_proj | up_proj | ...
+  normalize: true     # L2-normalise bank rows (M=1)
+  normalize_query: false
+  hook_target: mlp_input
+  label: gated_key
 analysis:
-  # Distribution-based metrics (kl/js/hellinger) require save_distributions=True
-  # during trajectory capture. Default to delta_energy, which is always available.
   score_metric: delta_energy
   score_aggregation: mean
+  pool_over_answer: true   # pool generation metrics over the gold-answer span
 output:
   base_dir: outputs
 ```
@@ -98,31 +114,39 @@ Environment configs (`configs/environments/`) auto-detect local vs HPC via `HOPF
 
 ```
 src/hopfield_llm/          Python package
-  cli/                      CLI entry point (5 subcommands)
+  cli/                      CLI entry point (run.py — 7 subcommands)
   models/                   HFLLM loader + architecture resolution + model profiles
   hooks/                    Forward-hook activation capture (prefill + generation)
   memory/                   Memory bank construction from MLP weights
-  queries/                  Query extraction strategies (swappable)
-  metrics/                  Energy computation, divergences, hallucination scoring
+  queries/                  Query reduction strategies (last/mean/positional)
+  metrics/                  Energy, divergences, scoring, β-calibration, logit-lens, null-control
+  analysis/                 Answer-span alignment + chat-prompt construction
   datasets/                 BaseDataset + TruthfulQA, TriviaQA, NQ adapters
+  evaluation/               Features, per-layer AUROC, probe, baselines, report
+  labeling/                 F1 heuristic + LLM judge
   pipeline/                 Stage functions, analysis, ExperimentConfig
   storage/                  Artifact save/load (torch + JSON)
   utils/                    Logging, environment config, experiment tracking
-  visualization/            Matplotlib plots from analysis JSON
+  visualization/            Matplotlib plots from analysis JSON (plots.py)
 configs/
   environments/             local.yaml (RTX 2050) + hpc.yaml (A100)
-  experiments/              Experiment YAML configs
-jobs/                       SLURM templates + submission script
-scripts/                    Local convenience scripts + result inspection
-outputs/                    Experiment outputs (tracked run directories, gitignored)
+  experiments/              Experiment YAML configs + README (config matrix)
+  labeling/                 Judge + heuristic defaults
+scripts/
+  hpc/                      setup, submit_pipeline (sharded array), jobs/run_experiment.sh, templates/
+  local/                    test_pipeline.sh (smoke), run_baselines.py, chat_model.py
+outputs/                    Experiment outputs (run directories, gitignored)
 tests/
   unit/                     Pure function tests
   integration/              Pipeline integration tests
-docs/                       Architecture, setup, and usage documentation
+docs/                       Theory (.tex), architecture, usage, findings, pre-registration
+notebooks/                  Analysis notebooks (01–06)
 ```
 
 ## Documentation
 
 - [Architecture](docs/architecture.md) — Module responsibilities, data flow, design decisions
+- [Usage](docs/usage.md) / [Quick reference](docs/quickref.md) — CLI + Python API
 - [Setup](docs/setup.md) — Installation for local and HPC environments
-- [Usage](docs/usage.md) — CLI, Python API, adding datasets, query extractors
+- [Findings](docs/findings.md) — Exp-04 empirical results and design rationale
+- [Config matrix](configs/experiments/README.md) — every experiment config and its role

@@ -107,9 +107,10 @@ def _load_m_per_layer(meta_path: Path) -> dict[int, float]:
 def build_banks(
     model: str,
     output: str | Path,
-    bank: str = "down",
+    bank: str = "up",
     device: str | None = None,
     load_in_4bit: bool = True,
+    normalize: bool = False,
     primary_probe: ProbeConfig | None = None,
     secondary_probe: ProbeConfig | None = None,
 ) -> Path:
@@ -148,7 +149,7 @@ def build_banks(
     if primary_probe is None and secondary_probe is None:
         # ── Legacy path ─────────────────────────────────────────────
         banks_data, metadata = extract_banks(
-            llm, bank=bank, normalize=False, strict=True, return_metadata=True
+            llm, bank=bank, normalize=normalize, strict=True, return_metadata=True
         )
         artifact = {
             "artifact_type": "banks",
@@ -216,6 +217,8 @@ def run_trajectory(
     num_shards: int = 1,
     device: str | None = None,
     load_in_4bit: bool = True,
+    normalize_query: bool = True,
+    hook_target: str = "mlp_input",
     primary_probe: ProbeConfig | None = None,
     secondary_probe: ProbeConfig | None = None,
     scores_subset_size: int = 50,
@@ -345,8 +348,8 @@ def run_trajectory(
         prim_hook_target = primary_probe.hook_target
         prim_nrm_query = primary_probe.normalize_query
     else:
-        prim_hook_target = "mlp_input"
-        prim_nrm_query = True
+        prim_hook_target = hook_target
+        prim_nrm_query = normalize_query
 
     llm = HFLLM(
         model_id=model, device=device,

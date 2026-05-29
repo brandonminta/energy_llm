@@ -80,20 +80,20 @@ hopfield-llm visualize \
 
 ```bash
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01_truthfulqa_baseline.yaml
+    --config configs/experiments/final_qwen_truthfulqa.yaml
 ```
 
 **With overrides**:
 ```bash
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01_truthfulqa_baseline.yaml \
+    --config configs/experiments/final_qwen_truthfulqa.yaml \
     --override beta=20.0 dataset_name=triviaqa max_samples=100
 ```
 
 **Skip bank recomputation**:
 ```bash
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01_truthfulqa_baseline.yaml \
+    --config configs/experiments/final_qwen_truthfulqa.yaml \
     --skip-banks
 ```
 
@@ -145,7 +145,7 @@ from hopfield_llm.evaluation.probe import fit_logreg_probe
 from hopfield_llm.evaluation.report import build_eval_report
 
 # Load features
-samples = load_all_features("outputs/exp01/trajectories")
+samples = load_all_features("outputs/final_qwen_truthfulqa/trajectories")
 
 # Per-layer AUROC
 auroc_df = per_layer_auroc_table(samples, ["delta_energy", "delta_entropy"])
@@ -156,7 +156,7 @@ probe = fit_logreg_probe(samples, ["delta_energy", "delta_entropy"], n_splits=5)
 print(f"AUROC: {probe['mean_auroc']:.3f} ± {probe['std_auroc']:.3f}")
 
 # HTML Report
-build_eval_report("outputs/exp01/trajectories", "outputs/exp01/trajectories", "report.html")
+build_eval_report("outputs/final_qwen_truthfulqa/trajectories", "outputs/final_qwen_truthfulqa/trajectories", "report.html")
 ```
 
 ---
@@ -167,7 +167,7 @@ build_eval_report("outputs/exp01/trajectories", "outputs/exp01/trajectories", "r
 
 ```bash
 hopfield-llm run-experiment \
-    --config configs/experiments/exp01_truthfulqa_baseline.yaml \
+    --config configs/experiments/final_qwen_truthfulqa.yaml \
     --override model.alias=qwen25_1_5b dataset.max_samples=50
 ```
 

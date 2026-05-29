@@ -345,3 +345,52 @@ def run_semantic_entropy_batch(
         done, skipped, total,
     )
     return summaries
+
+
+def _resolve_alias(traj_dir: Path, model: Optional[str]) -> str:
+    if model:
+        return model
+    first = next(iter(sorted(traj_dir.glob("*.json"))), None)
+    if first is None:
+        raise SystemExit(f"No trajectory JSON files in {traj_dir}")
+    return json.loads(first.read_text(encoding="utf-8")).get("model", "qwen25_3b")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: ``python -m hopfield_llm.evaluation.semantic_entropy --trajectories DIR``."""
+    import argparse
+
+    from hopfield_llm.models.loader import HFLLM
+    from hopfield_llm.utils.logging import setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="Semantic Entropy baseline (Farquhar et al., 2024) over a trajectory dir",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--trajectories", required=True, help="Trajectory directory")
+    parser.add_argument("--model", default=None, help="Generator model alias")
+    parser.add_argument("--nli-model", default=_DEFAULT_NLI_MODEL, dest="nli_model")
+    parser.add_argument("--n", type=int, default=10, help="Completions sampled per prompt")
+    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--max-new-tokens", type=int, default=50, dest="max_new_tokens")
+    parser.add_argument("--no-4bit", action="store_true")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--nli-device", default="cpu", dest="nli_device")
+    parser.add_argument("--max-samples", type=int, default=None, dest="max_samples")
+    args = parser.parse_args(argv)
+
+    setup_logging()
+    traj_dir = Path(args.trajectories)
+    alias = _resolve_alias(traj_dir, args.model)
+    llm = HFLLM(model_id=alias, device=args.device, load_in_4bit=not args.no_4bit)
+    llm.model.eval()
+    scorer = SemanticEntropyScorer(nli_model_id=args.nli_model, device=args.nli_device)
+    run_semantic_entropy_batch(
+        llm, scorer, traj_dir, n=args.n, temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens, max_samples=args.max_samples,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

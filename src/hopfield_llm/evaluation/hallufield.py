@@ -187,3 +187,44 @@ def run_hallufield_batch(
 
     log.info("run_hallufield_batch: done=%d", len(results))
     return results
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: ``python -m hopfield_llm.evaluation.hallufield --trajectories DIR``."""
+    import argparse
+
+    from hopfield_llm.models.loader import HFLLM
+    from hopfield_llm.utils.logging import setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="HalluField free-energy baseline (Vu et al., 2025) over a trajectory dir",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--trajectories", required=True, help="Trajectory directory")
+    parser.add_argument("--model", default=None, help="Model alias")
+    parser.add_argument("--t1", type=float, default=_T1_DEFAULT)
+    parser.add_argument("--eps", type=float, default=_EPS_DEFAULT)
+    parser.add_argument("--no-4bit", action="store_true")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--max-samples", type=int, default=None, dest="max_samples")
+    args = parser.parse_args(argv)
+
+    setup_logging()
+    traj_dir = Path(args.trajectories)
+    alias = args.model
+    if alias is None:
+        first = next(iter(sorted(traj_dir.glob("*.json"))), None)
+        if first is None:
+            parser.error(f"No trajectory JSON files in {traj_dir}")
+        alias = json.loads(first.read_text(encoding="utf-8")).get("model", "qwen25_3b")
+
+    llm = HFLLM(model_id=alias, device=args.device, load_in_4bit=not args.no_4bit)
+    llm.model.eval()
+    run_hallufield_batch(
+        llm, traj_dir, t1=args.t1, eps=args.eps, max_samples=args.max_samples,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

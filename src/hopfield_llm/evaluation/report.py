@@ -24,7 +24,12 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from hopfield_llm.evaluation.beta_sweep import beta_sweep_auroc
 from hopfield_llm.evaluation.features import load_all_features
 from hopfield_llm.evaluation.per_layer_auroc import best_single_feature, per_layer_auroc_table
-from hopfield_llm.evaluation.probe import fit_logreg_probe, _MIN_SAMPLES
+from hopfield_llm.evaluation.probe import (
+    _MIN_SAMPLES,
+    fit_logreg_probe,
+    oof_probe_predictions,
+    paired_bootstrap_delta_auroc,
+)
 from hopfield_llm.utils.logging import get_logger
 
 log = get_logger("evaluation.report")
@@ -35,10 +40,16 @@ _PER_LAYER_KEYS = [
     "delta_energy",
 ]
 
+# Scalar baselines surfaced in the AUROC table. p_true / semantic_entropy /
+# hallufield_score are NaN unless their sidecars were computed
+# (python -m hopfield_llm.evaluation.{baselines,semantic_entropy,hallufield}).
 _SCALAR_BASELINE_KEYS = [
     "seq_logprob_mean",
     "token_entropy_mean",
     "token_entropy_max",
+    "p_true",
+    "semantic_entropy",
+    "hallufield_score",
 ]
 
 _DEFAULT_BETA_SWEEP = [1.0, 5.0, 10.0, 15.0, 25.0, 50.0]
@@ -271,6 +282,46 @@ def build_eval_report(
         auroc, prauc = _scalar_auroc(samples, key)
         baseline_rows.append({"method": key, "auroc": auroc, "prauc": prauc})
     sections.append(_html_table(baseline_rows, "Scalar baseline AUROCs"))
+
+    # ── Nested-model test: do Hopfield features add over baselines? ─────────
+    # Compares an out-of-fold probe on [Hopfield + baselines] against one on
+    # [baselines only] via a paired bootstrap of ΔAUROC (methodology §analysis).
+    sections.append("<h2>Nested-model test (Hopfield features vs baselines-only)</h2>")
+    hop_keys = [k for k in auroc_keys if k in samples[0]]
+    avail_baselines = [
+        k for k in _SCALAR_BASELINE_KEYS
+        if not all(
+            (s.get(k) is None) or (isinstance(s.get(k), float) and math.isnan(s[k]))
+            for s in samples
+        )
+    ]
+    if n >= _MIN_SAMPLES and hop_keys and avail_baselines:
+        try:
+            labels_b, base_oof = oof_probe_predictions(samples, avail_baselines)
+            _, full_oof = oof_probe_predictions(samples, avail_baselines + hop_keys)
+            nm = paired_bootstrap_delta_auroc(labels_b, full_oof, base_oof, n_boot=2000)
+            sig = "yes" if (not math.isnan(nm["ci_low"]) and nm["ci_low"] > 0) else "no"
+            sections.append(_html_table([{
+                "auroc_baselines_only": nm["auroc_base"],
+                "auroc_full":           nm["auroc_full"],
+                "delta_auroc":          nm["delta"],
+                "ci95_low":             nm["ci_low"],
+                "ci95_high":            nm["ci_high"],
+                "hopfield_adds_signal": sig,
+            }], "Paired-bootstrap ΔAUROC (full − baselines-only)"))
+            sections.append(
+                f"<p><em>Baseline features: {', '.join(avail_baselines)} | "
+                f"Hopfield features: {', '.join(hop_keys)} | "
+                f"bootstrap resamples: 2000</em></p>"
+            )
+        except ValueError as exc:
+            sections.append(f"<p><em>Nested-model test skipped: {exc}</em></p>")
+    else:
+        sections.append(
+            "<p><em>Nested-model test skipped: needs ≥"
+            f"{_MIN_SAMPLES} samples and ≥1 computed baseline sidecar "
+            "(run python -m hopfield_llm.evaluation.baselines first).</em></p>"
+        )
 
     # ── Method comparison table ────────────────────────────────────────────
     sections.append("<h2>Summary: method vs AUROC</h2>")

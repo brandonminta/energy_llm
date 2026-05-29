@@ -99,11 +99,11 @@ def test_fill_result_arrays_m_changes_energy():
     M_val = 2.0
     m_per_layer = {i: M_val for i in range(n_layers)}
 
-    (energy_with_m, *_), _, _ = _fill_result_arrays(
+    (energy_with_m, *_), _, _, _ = _fill_result_arrays(
         x_buf, banks, n_layers, beta=15.0, threshold=0.1, mode="dot",
         m_per_layer=m_per_layer,
     )
-    (energy_no_m, *_), _, _ = _fill_result_arrays(
+    (energy_no_m, *_), _, _, _ = _fill_result_arrays(
         x_buf, banks, n_layers, beta=15.0, threshold=0.1, mode="dot",
         m_per_layer={},
     )
@@ -127,7 +127,7 @@ def test_fill_result_arrays_no_m_zero_term():
     banks = _fake_banks(n_layers, K, d)
     x_buf = {i: torch.randn(T, d) for i in range(n_layers)}
 
-    (energy, _, _, lse, quadratic, *_), _, _ = _fill_result_arrays(
+    (energy, _, _, lse, quadratic, *_), _, _, _ = _fill_result_arrays(
         x_buf, banks, n_layers, beta=10.0, threshold=0.1, mode="dot",
         m_per_layer={},
     )
@@ -157,11 +157,11 @@ def test_fill_result_arrays_partial_m():
     M_val = 3.0
     m_partial = {0: M_val, 2: M_val}   # layers 1 and 3 have no M
 
-    (energy_with, *_), _, _ = _fill_result_arrays(
+    (energy_with, *_), _, _, _ = _fill_result_arrays(
         x_buf, banks, n_layers, beta=15.0, threshold=0.1, mode="dot",
         m_per_layer=m_partial,
     )
-    (energy_base, *_), _, _ = _fill_result_arrays(
+    (energy_base, *_), _, _, _ = _fill_result_arrays(
         x_buf, banks, n_layers, beta=15.0, threshold=0.1, mode="dot",
         m_per_layer={},
     )

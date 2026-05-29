@@ -4,6 +4,11 @@
 **Autor:** Brandon — Yachay Tech University  
 **Versión:** 1.0 · Mayo 2026
 
+> **Nota:** este documento es la síntesis temprana en español de la literatura.
+> El marco teórico **autoritativo y final** es el capítulo de tesis
+> `docs/fundamentals.tex` (y la metodología, `docs/methodology.tex`). Se conserva
+> aquí como ayuda de lectura.
+
 ---
 
 ## 1. Introducción y Motivación

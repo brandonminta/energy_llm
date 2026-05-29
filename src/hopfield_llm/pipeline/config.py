@@ -53,8 +53,9 @@ class ExperimentConfig:
     max_new_tokens:     int   = 50
     diagnostic_subset:  int   = 20
 
-    # Memory bank (legacy single-probe field)
-    bank: str = "down"
+    # Memory bank (legacy single-probe field; primary_probe.bank takes
+    # precedence in probe mode and is the canonical field).
+    bank: str = "up"
 
     # Analysis parameters
     divergence_metrics: list[str] = field(
@@ -63,6 +64,10 @@ class ExperimentConfig:
     score_metric:       str               = "delta_energy"
     score_aggregation:  str               = "mean"
     signal_zone:        tuple[int, int] | None = None
+    # Pool generation metrics only over the gold-answer span (falls back to
+    # content tokens).  The final methodology configs set this True.
+    pool_over_answer:   bool              = False
+    tokenizer_id:       str | None        = None
 
     # Sharding (HPC)
     num_shards: int = 1
@@ -135,6 +140,8 @@ class ExperimentConfig:
                 "score_metric": self.score_metric,
                 "score_aggregation": self.score_aggregation,
                 "signal_zone": list(self.signal_zone) if self.signal_zone else None,
+                "pool_over_answer": self.pool_over_answer,
+                "tokenizer_id": self.tokenizer_id,
             },
             "sharding": {"num_shards": self.num_shards},
             "labeling": {
@@ -226,6 +233,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         score_metric=analysis.get("score_metric", "delta_energy"),
         score_aggregation=analysis.get("score_aggregation", "mean"),
         signal_zone=signal_zone,
+        pool_over_answer=bool(analysis.get("pool_over_answer", False)),
+        tokenizer_id=analysis.get("tokenizer_id"),
         num_shards=int(sharding.get("num_shards", 1)),
         scores_subset_size=int(traj.get("scores_subset_size", 50)),
         score_capture=str(traj.get("score_capture", "full")),

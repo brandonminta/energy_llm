@@ -144,7 +144,7 @@ rather than hallucination.
 | Hook target | `mlp_input` | Captures query into the MLP before W_up projection |
 | Scores subset | 50 (`save_distributions=True`) | Stores `[L, T, K]` softmax scores for post-hoc β sweep |
 | Labels | GPT-5.4-mini binary judge + F1 heuristic | Cohen's κ ≈ moderate agreement (see `calibration_beta.json` for the β curve, not κ) |
-| Output | `exp04_results/` (analysis, plots, labels, trajectories) | Self-contained run dir |
+| Output | `outputs/exp04_qwen_truthfulqa/` (analysis, plots, labels, trajectories) | Self-contained run dir |
 
 ### 4.2 What is computed, compared, and why
 
@@ -170,7 +170,7 @@ For each of the 500 samples:
    fed to a logistic-regression probe (StandardScaler + L2 with `C=0.1`,
    5-fold stratified CV).
 
-### 4.3 What's in `exp04_results/`
+### 4.3 What's in `outputs/exp04_qwen_truthfulqa/`
 
 ```
 config.yaml             ← snapshot of the run config
@@ -804,7 +804,7 @@ cost):
 ## Appendix B — File map for Exp-04
 
 ```
-exp04_results/
+outputs/exp04_qwen_truthfulqa/
 ├── config.yaml                          ← run config snapshot
 ├── git_info.json                        ← commit db99c58
 ├── banks_metadata.json                  ← {layer: K, D, M, M_raw} × 36

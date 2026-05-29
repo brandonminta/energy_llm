@@ -211,3 +211,44 @@ def run_intra_batch(
 
     log.info("run_intra_batch: done=%d skipped=%d total=%d", done, skipped, total)
     return done
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: ``python -m hopfield_llm.evaluation.intra --trajectories DIR``."""
+    import argparse
+
+    from hopfield_llm.models.loader import HFLLM
+    from hopfield_llm.utils.logging import setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="INTRA layer-pooled hidden-state features (Vazhentsev et al., 2026)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--trajectories", required=True, help="Trajectory directory")
+    parser.add_argument("--model", default=None, help="Model alias")
+    parser.add_argument("--no-4bit", action="store_true")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--no-chat-template", action="store_true", dest="no_chat_template")
+    parser.add_argument("--max-samples", type=int, default=None, dest="max_samples")
+    args = parser.parse_args(argv)
+
+    setup_logging()
+    traj_dir = Path(args.trajectories)
+    alias = args.model
+    if alias is None:
+        first = next(iter(sorted(traj_dir.glob("*.json"))), None)
+        if first is None:
+            parser.error(f"No trajectory JSON files in {traj_dir}")
+        alias = json.loads(first.read_text(encoding="utf-8")).get("model", "qwen25_3b")
+
+    llm = HFLLM(model_id=alias, device=args.device, load_in_4bit=not args.no_4bit)
+    llm.model.eval()
+    run_intra_batch(
+        llm, traj_dir, apply_chat_template=not args.no_chat_template,
+        max_samples=args.max_samples,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

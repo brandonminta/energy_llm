@@ -1,0 +1,53 @@
+# E3 (secondary, contingent): Qwen2.5-3B-Instruct on TriviaQA rc.nocontext,
+# 500 samples drawn at seed 42 (subsec:experiments). Exploratory
+# cross-dataset evidence; executed only if E1 completes within budget.
+# beta* is calibrated ONCE PER MODEL (subsec:beta_calibration): E3 inherits
+# the E1 value. After E1 calibration, set calibration.beta_star below to the
+# value in results/e1/config_snapshot.yaml — do NOT recalibrate on TriviaQA.
+name: e3_qwen_triviaqa
+seed: 42
+output_dir: results/e3
+
+model:
+  alias: qwen25_3b
+  dtype: bfloat16
+  load_in_4bit: false
+
+dataset:
+  name: triviaqa              # rc.nocontext validation split
+  num_samples: 500            # drawn at seed 42
+
+bank:
+  bank_id: gate
+  path: results/e1/banks.pt   # same model as E1 — reuse the banks artifact
+
+calibration:
+  num_samples: 30
+  beta_grid: [1, 2, 5, 10, 15, 20, 30, 50, 100]
+  target_norm_entropy: 0.55
+  beta_star: null             # set from E1 (same model); see comment above
+
+generation:
+  max_new_tokens: 50
+
+trajectory:
+  cache_score_tensors: false
+  score_dtype: float32
+  log_memory_every: 10
+
+labeling:
+  judge_model: gpt-4o-mini
+  api_base: null
+  max_retries: 6
+  human_subset_size: 60
+
+probe:
+  c_grid: [0.01, 0.1, 1.0, 10.0]
+  split: [0.70, 0.15, 0.15]
+  inner_cv_folds: 3
+  outer_cv_folds: 5
+
+stats:
+  n_bootstrap: 10000
+  n_permutation: 1000
+  alpha: 0.05

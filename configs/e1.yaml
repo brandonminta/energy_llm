@@ -1,0 +1,52 @@
+# E1 (primary): Qwen2.5-3B-Instruct on TruthfulQA (subsec:experiments).
+# Supports both confirmatory hypotheses, the depth-axis profile, the
+# per-category breakdown, and the beta sensitivity curve. Score tensors are
+# cached for this run only (the sensitivity analysis recomputes from them
+# with no forward passes).
+name: e1_qwen_truthfulqa
+seed: 42
+output_dir: results/e1
+
+model:
+  alias: qwen25_3b            # Qwen/Qwen2.5-3B-Instruct (L=36, D=2048, Dff=11008)
+  dtype: bfloat16             # reported runs: BF16 on a single A100
+  load_in_4bit: false         # 4-bit NF4 = local dev only, never reported
+
+dataset:
+  name: truthfulqa            # generation split, all 817 questions
+  num_samples: null
+
+bank:
+  bank_id: gate               # M = A = W1^T (eq:memory_bank_definition); only evaluated bank
+  path: ""                    # default: <output_dir>/banks.pt
+
+calibration:
+  num_samples: 30             # N_c
+  beta_grid: [1, 2, 5, 10, 15, 20, 30, 50, 100]
+  target_norm_entropy: 0.55   # H_bar*
+  beta_star: null             # written by scripts/calibrate_beta.py into the snapshot
+
+generation:
+  max_new_tokens: 50          # T_max, greedy decoding
+
+trajectory:
+  cache_score_tensors: true   # E1 only: ~40 MB/sample, ~33 GB total (see README)
+  score_dtype: float32        # bank matmul precision; bfloat16 on 10GB MIG slices
+  log_memory_every: 10
+
+labeling:
+  judge_model: gpt-4o-mini
+  api_base: null
+  max_retries: 6
+  human_subset_size: 60
+
+probe:
+  c_grid: [0.01, 0.1, 1.0, 10.0]
+  split: [0.70, 0.15, 0.15]
+  inner_cv_folds: 3
+  outer_cv_folds: 5
+
+stats:
+  n_bootstrap: 10000
+  n_permutation: 1000
+  alpha: 0.05

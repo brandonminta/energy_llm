@@ -1,0 +1,1155 @@
+% =============================================================
+%  CHAPTER: Methodology
+%  Thesis: Hallucination Detection in Large Language Models
+%          via Modern Hopfield Retrieval over SwiGLU Memory Banks
+%  Status: Revised. Primary bank is the gate matrix A^{(l)} = W_1^{(l)T}
+%          (consistent with fundamentals.tex, Eq. memory_bank_definition);
+%          retrieval scores are a fixed per-row rescaling of the gate
+%          pre-activations (derived view, s != g).
+% =============================================================
+
+\label{chap:methods}
+
+This chapter operationalises the retrieval framework of
+Chapter~\ref{chap:theory}: it specifies how the energy, entropy, and
+divergence quantities defined there are extracted from a frozen model and
+assembled into a hallucination score.
+
+The method is developed within four bounding conditions: factoid question
+answering with short gold answers; decoder-only models whose feed-forward
+sublayers use the SwiGLU parameterisation (Section~\ref{subsec:ffn}); English
+datasets; and hallucinations that appear in the generated answer rather than
+in upstream chain-of-thought tokens. These conditions define the regime in
+which the proposed signal is claimed to apply. Generalisation to other tasks
+is out of scope.
+
+Six further constraints govern the design itself. First, the weights and
+activations of the model under study are fully accessible. Second, no
+fine-tuning of the model is permitted. Third, the Hopfield features are
+computed from a single prefill pass followed by a single greedy decoding
+pass, although sampling-based baselines may use multiple forward passes.
+Fourth, the detection mechanism is a read-only observer: the decoding
+distribution must be identical with and without detection, so no
+intervention on generation is allowed. Fifth, each feature must admit a
+per-layer interpretation traceable to a specific weight matrix or hidden
+state, in keeping with the mechanistic interpretability objective. Sixth,
+the pipeline must be deterministic for fixed random seeds, model
+checkpoints, and chat-template configurations, within a fixed precision and
+software stack on fixed hardware.
+
+% =============================================================
+\section{Problem Description}
+\label{sec:problem_description}
+% =============================================================
+
+Let $f_\theta$ be a frozen, instruction-tuned, decoder-only language model
+with $L$ layers and SwiGLU feed-forward sublayers
+(Section~\ref{subsec:ffn}). Given a question $q$ and a set of gold
+short-form answers $\mathcal{A}_q = \{a_1, \ldots, a_m\}$ from a factoid
+question-answering dataset, the model produces an answer
+$\hat{y} = f_\theta(q)$ by greedy autoregressive decoding, selecting the
+highest-probability token at each step. The question is wrapped in a fixed
+chat template, a structured prompt format that prepends role markers and a
+system turn so that $q$ reaches $f_\theta$ in the same conversational form
+used during instruction tuning.
+
+A \emph{hallucination} is a binary indicator $z_q \in \{0, 1\}$, with
+$z_q = 1$ when $\hat{y}$ is not factually supported by $\mathcal{A}_q$ and
+$z_q = 0$ otherwise. These labels are needed to evaluate the scoring
+function defined below, and obtaining them at scale by hand is the main
+bottleneck for any large evaluation corpus. The label is therefore assigned
+by a separate language model acting as an external judge, queried through a
+locked prompt template that asks whether $\hat{y}$ is supported by
+$\mathcal{A}_q$. The model under study is never asked to evaluate its own output.
+
+Because the judge is queried through an external service whose outputs are
+not deterministic, the labelling step is reproducible only given the
+archived label set rather than bit-for-bit on re-execution. Label quality
+is guarded by validating judge agreement against a human-labelled subset,
+reported as Cohen's $\kappa$ in Chapter~\ref{chap:results} together
+with the subset size.
+
+The detection task is to construct a scoring function
+\begin{equation}
+    s : (q,\,\hat{y},\,\mathcal{I}(f_\theta, q, \hat{y}))
+    \,\longmapsto\, \mathbb{R},
+    \label{eq:detection_function}
+\end{equation}
+where $\mathcal{I}(\cdot)$ is a fixed family of internal observables
+collected from the forward passes of $f_\theta$ on $q$ and during the
+generation of $\hat{y}$. Higher values of $s$ indicate a higher predicted
+probability that $z_q = 1$, and the quality of $s$ is measured by the area
+under the receiver operating characteristic curve (AUROC) against the
+labels $z_q$.
+
+% =============================================================
+% =============================================================
+% =============================================================
+% =============================================================
+\section{Problem Analysis}
+\label{sec:problem_analysis}
+% =============================================================
+
+The detection function of Equation~\eqref{eq:detection_function} is
+underdetermined as stated: it does not specify which internal observables
+enter $\mathcal{I}$, how they are compared across the two phases of
+inference, or how the comparison is reduced to a scalar score. The task
+decomposes into five sub-problems, and their dependencies run in sequence.
+The choice of probe positions determines what is extracted; the memory-bank
+definition determines what those extractions are compared against; the
+retrieval scoring converts both into energies and probability distributions;
+the divergence quantification compares those distributions across the
+prefill and generation phases; and the aggregation and probing step
+assembles the per-layer quantities into the scoring function $s$. This
+section analyses each sub-problem in turn, identifying what makes it
+nontrivial and what requirements any resolution must satisfy. The decisions
+that satisfy these requirements are stated in
+Section~\ref{sec:solution_design}, and their computational realisation is
+deferred to Section~\ref{sec:implementation}. Following the convention of
+Section~\ref{sec:hopfield}, single hidden states are treated as column
+vectors in this chapter, so retrieval scores appear as
+$\mathbf{M}^{(l)}\mathbf{r}_t^{(l)}$; entrywise these are the same inner
+products as the row-form expression
+$\mathbf{r}_t^{(l)}{\mathbf{M}^{(l)}}^{\!\top}$ of
+Chapter~\ref{chap:theory}.
+
+% ----------------------------------------------------------------
+\subsection{Choice of Probe Positions}
+\label{subsec:pa_probe_positions}
+% ----------------------------------------------------------------
+
+The retrieval framework of Chapter~\ref{chap:theory} assigns a query to
+every layer and every token position, but the detection hypothesis is
+comparative: it concerns the relationship between the retrieval structure
+established while the model processes the grounded question and the
+structure induced while it produces the answer. Autoregressive inference
+supplies this contrast naturally. During prefill, the forward pass over the
+prompt, the input tokens are externally given and grounded by construction;
+during generation, each forward pass conditions on tokens the model itself
+has emitted, so the input becomes progressively self-referential. Any
+operationalisation of the hypothesis must therefore designate, per layer, a
+reference object drawn from the prefill and a trajectory of objects drawn
+from the generation steps.
+
+The generation side admits little freedom: the quantities of interest exist
+once per newly produced token, and discarding positions would discard
+signal. The prefill side is genuinely underdetermined. The prompt contains
+many token positions, each inducing its own retrieval distribution, while
+the comparison requires a single per-layer reference. A pooled reference
+over the question span would average distributions induced by tokens of
+heterogeneous grammatical and informational roles, producing a mixture that
+no single forward-pass state ever realises, and the comparison against
+per-token generation states would then be one between objects of different
+kinds. A single-position reference avoids this mismatch, and among the
+prompt positions only the final one conditions on the complete question; it
+is also the state from which the first answer token is decoded, so it
+represents the retrieval configuration at the moment the model commits to
+its answer. The requirement is thus a single-token, last-position prefill
+reference, with the further condition that prefill and generation states be
+extracted under an identical prompt format, since any discrepancy in the
+conditioning context would contaminate the phase comparison with a prompt
+artefact.
+
+% ----------------------------------------------------------------
+\subsection{Identifying the Memory Bank}
+\label{subsec:pa_memory_bank}
+% ----------------------------------------------------------------
+
+The second sub-problem is inherited directly from
+Section~\ref{subsec:gated_ffn_memory}. In the ReLU architecture analysed by
+\citet{geva2021transformer}, the first weight matrix is the unique
+structural candidate for the stored keys, because each intermediate
+coefficient is a function of a single inner product with one of its rows. In
+the gated architecture of Equation~\eqref{eq:gated_ffn_generic}, each
+coefficient depends on two projections of the input simultaneously, so no
+weight matrix occupies that position by necessity and the bank must be fixed
+by argument. The analysis of Chapter~\ref{chap:theory} establishes the
+grounds: the gate branch alone passes through the nonlinearity and performs
+the selective activation that defines a key, while the value branch
+modulates magnitude and the down projection writes content to the residual
+stream. Whatever bank is adopted must respect this division of roles, must
+be a fixed, non-trainable function of the frozen weights so that the
+read-only constraint of this chapter is preserved, and must yield one stored
+pattern per intermediate unit so that the retrieval distribution has a
+per-unit interpretation.
+
+This sub-problem also fixes the scope of what the detector can claim to
+observe. A bank built from the recognition step measures which stored
+patterns a token engages, not what the layer subsequently writes back to the
+residual stream; the latter is a separate quantity, and any conclusion drawn
+from the method must be phrased at the level of pattern engagement. The
+hypothesis under test is correspondingly delimited: grounded and
+hallucinated generation are conjectured to differ in this pattern of
+engagement, measurable as a shift in the retrieval distribution between the
+prefill reference and the generated tokens.
+
+% ----------------------------------------------------------------
+\subsection{Scale Confounds in Retrieval Scoring}
+\label{subsec:pa_scale_confounds}
+% ----------------------------------------------------------------
+
+Converting queries and bank into energies and distributions exposes the
+method to two scale confounds, and each imposes a requirement on the scoring
+construction.
+
+The first concerns the query. The Modern Hopfield energy of
+Equation~\eqref{eq:modern_hopfield_energy} contains the quadratic term
+$\tfrac{1}{2}\|\mathbf{q}\|_2^2$, so any systematic difference in
+hidden-state norm between the phases would shift the energy even if the
+alignment structure were unchanged. A detector built on raw energies could
+then succeed merely as a norm-change detector, a degenerate explanation that
+the analysis must be able to exclude. Two requirements follow. The query
+must be taken at a point where its scale is controlled; the probe point
+$\mathbf{r}_t^{(l)}$ of Equation~\eqref{eq:probe_point} satisfies this,
+since RMSNorm fixes the root-mean-square scale up to the learned vector
+$\boldsymbol{\gamma}$ and makes queries comparable across tokens and phases.
+And the energy must remain attributable to its components, so the scoring
+construction has to keep the log-sum-exp term and the norm term separable
+rather than reporting only their sum. At the same time, the query norm is
+not pure nuisance: the energy depends on it explicitly, and a change in
+representation magnitude between phases is itself a candidate signal.
+Whether the query should be normalised is therefore a genuine design
+decision, trading the removal of a confound against the loss of an
+informative degree of freedom, and it must be resolved explicitly rather
+than inherited from convention.
+
+The second concerns the stored patterns. Bank rows are learned weight
+vectors with heterogeneous norms, so a raw inner product confounds the
+direction of a pattern with its magnitude, and large-norm rows dominate the
+softmax of Equation~\eqref{eq:retrieval_distribution} regardless of
+directional match. Comparability across memory slots requires placing the
+rows on a common scale. Doing so has a consequence that must be stated
+wherever faithfulness to the model is claimed: once the rows are rescaled,
+the resulting scores are no longer identical to the pre-activations the
+model itself computes, but a per-slot rescaling of them. The construction
+remains a deterministic function of the model's native quantities, yet it is
+a derived view rather than a raw activation, and the formal statements of
+the method must keep this distinction explicit.
+
+A related decision point is where along the gate branch the score should be
+read. The nonlinearity transforms the inner products before they enter the
+remainder of the layer, but the Hopfield energy and update of
+Section~\ref{sec:hopfield} are defined on the inner products themselves;
+reading the score after the nonlinearity would substitute a transformed
+quantity into a formalism built for the linear one and would sever the
+correspondence on which the energy interpretation rests. The requirement is
+that the scoring preserve the dot-product form assumed by the framework.
+
+% ----------------------------------------------------------------
+\subsection{Comparing Distributions Across Phases}
+\label{subsec:pa_distribution_comparison}
+% ----------------------------------------------------------------
+
+The fourth sub-problem is the choice of comparison quantities, and the
+constraints of the setting narrow it considerably. The comparison should not
+depend on which phase is designated as reference, which rules out asymmetric
+measures as primary features; the Kullback--Leibler divergence of
+Section~\ref{subsec:kl_divergence} is accordingly suited as a building block
+rather than a feature. Features feeding a downstream classifier should be
+bounded, so that a handful of extreme values cannot dominate the fit, and
+they should remain numerically stable where probabilities are small, since
+softmax outputs over banks with $K_l$ in the tens of thousands place most
+mass on few entries. No single divergence captures every aspect of
+distributional change, and a probe trained on one measure inherits its blind
+spots, so the feature set should combine measures with complementary
+sensitivity; the properties established in Section~\ref{sec:divergences}
+identify the Jensen--Shannon divergence and the squared Hellinger distance
+as a pair satisfying these conditions. Finally, single-distribution
+summaries face a comparability problem of their own: the bank size $K_l$
+varies across layers and architectures, so raw entropies live on different
+scales, and only the normalised entropy of
+Equation~\eqref{eq:normalised_entropy} supports per-layer and cross-model
+comparison.
+
+% ----------------------------------------------------------------
+\subsection{From Layerwise Quantities to a Score}
+\label{subsec:pa_aggregation}
+% ----------------------------------------------------------------
+
+The final sub-problem is the reduction of per-token, per-layer quantities to
+the scalar score $s$, and its central analytical point is that the direction
+of the effect cannot be assumed. It is tempting to posit that hallucination
+corresponds to degraded retrieval, that is, to higher energy and more
+diffuse distributions during generation. The fixed-point structure of
+Section~\ref{subsec:classical_to_modern_hopfield} does not support this as
+an assumption: a hallucinated answer may equally correspond to a low-energy,
+sharply concentrated retrieval in which the query has settled into the basin
+of a well-formed but factually wrong association, so that the failure is one
+of content rather than of retrieval stability. Furthermore, there is no a
+priori reason for the sign or strength of the effect to be uniform across
+layers, given the depth-dependent specialisation of feed-forward keys
+reported by \citet{geva2021transformer}. The mapping from features to score
+must therefore be learned from labelled data, free to assign either
+direction to each layer, while remaining simple enough that any
+discrimination it achieves is attributable to the features themselves rather
+than to representational capacity in the classifier; this preserves the
+per-layer interpretability constraint stated at the opening of this chapter.
+Aggregation over the generated tokens must additionally not conflate answer
+length with signal strength, which requires a length-invariant reduction of
+the per-token quantities, and features of heterogeneous scales must be
+placed on a common scale before fitting, since the residual query-norm
+dependence identified in Section~\ref{subsec:pa_scale_confounds} leaves
+energies on layer-dependent scales.
+
+Each requirement assembled in this section has a one-to-one resolution in
+the design that follows: a last-token prefill reference compared against
+per-token generation states under an identical prompt format; a fixed,
+recognition-side memory bank derived from the frozen weights; a scoring
+construction that preserves the dot-product form, controls pattern scale,
+makes the derived-view caveat explicit, and keeps the energy decomposition
+separable; bounded, symmetric divergence pairs with normalised entropy; and
+a learned, direction-agnostic linear probe on standardised, length-invariant
+features. Section~\ref{sec:solution_design} states these decisions formally.
+% =============================================================
+% =============================================================
+\section{Solution Design}
+\label{sec:solution_design}
+% =============================================================
+
+The five sub-problems of Section~\ref{sec:problem_analysis} now combine into
+a concrete detector. This section defines the retrieval scoring
+construction, the per-layer feature set, the calibration of the inverse
+temperature, the detection probe with its evaluation protocol, and the full
+algorithmic pipeline.
+% ----------------------------------------------------------------
+\subsection{Retrieval Scoring Construction}
+\label{subsec:retrieval_scoring}
+% ----------------------------------------------------------------
+
+The scoring construction resolves the requirements identified in
+Section~\ref{subsec:pa_scale_confounds}: it must preserve the dot-product
+form assumed by the Hopfield framework, control the scale of the stored
+patterns, resolve the query-normalisation decision explicitly, and make
+explicit that the resulting scores are a derived view of the model's native
+activations rather than those activations themselves.
+
+The model computes, at every layer $l$ and every token position $t$, the
+raw gate pre-activations
+\begin{equation}
+    \mathbf{g}_t^{(l)}
+    \;=\;
+    {\mathbf{W}_1^{(l)}}^{\!\top}\mathbf{r}_t^{(l)}
+    \;=\;
+    \mathbf{A}^{(l)}\mathbf{r}_t^{(l)}
+    \;\in\; \mathbb{R}^{K_l},
+    \label{eq:gate_preactivations}
+\end{equation}
+where $\mathbf{r}_t^{(l)}$ is the probe point of
+Equation~\eqref{eq:probe_point} and $K_l$ is the intermediate dimension of
+layer $l$. These are the inner products the forward pass passes to the Swish
+nonlinearity; reading them before that transformation preserves the
+dot-product form on which the Hopfield energy and update rule are defined.
+
+The retrieval scores against the memory bank $\mathbf{M}^{(l)}$ of
+Equation~\eqref{eq:memory_bank_definition} are obtained by rescaling each entry of
+$\mathbf{g}_t^{(l)}$ by the fixed L2 norm of the corresponding bank row,
+\begin{equation}
+    s_{t,i}^{(l)}
+    \;=\;
+    \frac{g_{t,i}^{(l)}}{\|\mathbf{m}_i^{(l)}\|_2}
+    \;=\;
+    {\hat{\mathbf{m}}_i^{(l)}}{}^{\!\top}\mathbf{r}_t^{(l)},
+    \qquad
+    \hat{\mathbf{m}}_i^{(l)} \coloneqq
+    \frac{\mathbf{m}_i^{(l)}}{\|\mathbf{m}_i^{(l)}\|_2},
+    \qquad i = 1, \ldots, K_l,
+    \label{eq:retrieval_scores}
+\end{equation}
+so that $s_{t,i}^{(l)} = \|\mathbf{r}_t^{(l)}\|_2\cos\theta_i$, where
+$\theta_i$ is the angle between $\mathbf{r}_t^{(l)}$ and the $i$-th gate
+row. The vector $\mathbf{s}_t^{(l)} = (s_{t,1}^{(l)}, \ldots,
+s_{t,K_l}^{(l)})^\top \in \mathbb{R}^{K_l}$ collects all scores at
+position $(l,t)$. The rescaling is query-independent and fixed at bank
+construction; the forward pass is never modified. The query itself is not
+normalised: the factor $\|\mathbf{r}_t^{(l)}\|_2$ is retained as an
+informative component of the score, resolving the design decision posed in
+Section~\ref{subsec:pa_scale_confounds}, while the separable energy
+decomposition keeps its contribution attributable.
+
+Two consequences of this construction must be stated explicitly. First, the
+scores $\mathbf{s}_t^{(l)}$ are not identical to the gate pre-activations
+$\mathbf{g}_t^{(l)}$ the model computes: they are a per-slot rescaling of
+them by norms that are fixed but not generally equal to one. The
+construction is a deterministic function of the model's native quantities
+and preserves the read-only constraint, yet it is a derived view rather than
+a raw activation. Any claim of faithfulness to the model must be qualified
+accordingly. Second, the Hopfield energy and retrieval distribution of
+Equations~\eqref{eq:modern_hopfield_energy}--\eqref{eq:retrieval_distribution}
+are evaluated by the detector at the pair
+$(\mathbf{M}^{(l)},\,\mathbf{r}_t^{(l)})$ using $\mathbf{s}_t^{(l)}$ as
+the score vector; no update iteration is performed, and no claim is made
+that the model itself executes Hopfield retrieval dynamics.
+% ----------------------------------------------------------------
+% ----------------------------------------------------------------
+\subsection{Per-Layer Feature Design}
+\label{subsec:feature_design}
+% ----------------------------------------------------------------
+
+For each layer $l \in \{0, \ldots, L-1\}$ and each sample $q$, let
+$\mathbf{r}^{(l,\mathrm{ref})}$ be the prefill last-token hidden state and
+let $\{\mathbf{r}_t^{(l)}\}_{t=1}^{T_g}$ be the hidden states over the
+$T_g$ generated tokens, with $T_g \le T_{\max}$ a fixed cap on the number
+of tokens the model may produce.  Let $E^{(l,t)}$, $H^{(l,t)}$, and
+$\bar{H}^{(l,t)}$ be the Hopfield energy
+(Equation~\eqref{eq:modern_hopfield_energy}), retrieval entropy
+(Equation~\eqref{eq:retrieval_entropy}), and normalised entropy
+(Equation~\eqref{eq:normalised_entropy}) at position $(l,t)$, computed from
+the retrieval scores of Equation~\eqref{eq:retrieval_scores}, and let
+$\mathrm{JS}^{(l,t)}$ and $H^2_{\mathrm{Hel}}{}^{(l,t)}$ be the
+Jensen--Shannon divergence and squared Hellinger distance between
+$\{p_i^{(l,t)}\}$ and the reference distribution
+$\{p_i^{(l,\mathrm{ref})}\}$.
+
+All quantities are pooled over the full set of generated positions
+$\{1, \ldots, T_g\}$. This choice is deliberate. The pooling rule consults
+nothing beyond the generated sequence itself, so every feature is
+computable at inference time without gold answers or labels.
+
+For every layer $l$ the following five per-sample scalars are computed:
+\begin{align}
+    \Delta E^{(l)}
+        &= \frac{1}{T_g} \sum_{t=1}^{T_g} E^{(l,t)}
+           - E^{(l,\mathrm{ref})},
+    \label{eq:delta_energy} \\[4pt]
+    \Delta H^{(l)}
+        &= \frac{1}{T_g} \sum_{t=1}^{T_g} H^{(l,t)}
+           - H^{(l,\mathrm{ref})},
+    \label{eq:delta_entropy} \\[4pt]
+    \Delta \bar{H}^{(l)}
+        &= \frac{1}{T_g} \sum_{t=1}^{T_g} \bar{H}^{(l,t)}
+           - \bar{H}^{(l,\mathrm{ref})},
+    \label{eq:delta_norm_entropy} \\[4pt]
+    \overline{\mathrm{JS}}^{(l)}
+        &= \frac{1}{T_g} \sum_{t=1}^{T_g} \mathrm{JS}^{(l,t)},
+    \label{eq:mean_js} \\[4pt]
+    \overline{H^2_{\mathrm{Hel}}}{}^{(l)}
+        &= \frac{1}{T_g} \sum_{t=1}^{T_g} H^2_{\mathrm{Hel}}{}^{(l,t)}.
+    \label{eq:mean_hellinger}
+\end{align}
+The mean over generated positions is the length-invariant reduction
+required by Section~\ref{subsec:pa_aggregation}: it measures the typical
+per-token shift and is insensitive to the number of generated tokens, so
+the features cannot discriminate by answer length alone.
+
+Each scalar measures a different aspect of how recognition-side retrieval
+shifts between the question prefix and the answer generation.
+$\Delta E^{(l)}$ captures the change in retrieval energy, mixing alignment
+and query-norm components as analysed in
+Section~\ref{subsec:pa_scale_confounds}; $\Delta \bar{H}^{(l)}$ captures the
+change in retrieval concentration; and $\overline{\mathrm{JS}}^{(l)}$
+together with $\overline{H^2_{\mathrm{Hel}}}{}^{(l)}$ measure the symmetric
+distributional shift between the two phases from two geometrically distinct
+angles.
+
+Four of the five scalars enter the feature vector. Defining the per-group
+layer vectors
+\begin{equation}
+    \mathbf{e}_q = \bigl[\Delta E^{(0)},\,\ldots,\,\Delta E^{(L-1)}\bigr]
+                   \in \mathbb{R}^{L},
+    \quad
+    \mathbf{h}_q = \bigl[\Delta\bar{H}^{(0)},\,\ldots,\,
+                   \Delta\bar{H}^{(L-1)}\bigr] \in \mathbb{R}^{L},
+    \label{eq:group_vectors_1}
+\end{equation}
+\begin{equation}
+    \mathbf{j}_q = \bigl[\overline{\mathrm{JS}}^{(0)},\,\ldots,\,
+                   \overline{\mathrm{JS}}^{(L-1)}\bigr] \in \mathbb{R}^{L},
+    \quad
+    \mathbf{d}_q = \bigl[\overline{H^2_{\mathrm{Hel}}}{}^{(0)},\,\ldots,\,
+                   \overline{H^2_{\mathrm{Hel}}}{}^{(L-1)}\bigr]
+                   \in \mathbb{R}^{L},
+    \label{eq:group_vectors_2}
+\end{equation}
+the feature vector is their concatenation:
+\begin{equation}
+    \boldsymbol{\phi}_q
+    =
+    \bigl[\,\mathbf{e}_q \;\|\; \mathbf{h}_q \;\|\; \mathbf{j}_q \;\|\;
+    \mathbf{d}_q\,\bigr]
+    \in \mathbb{R}^{4L}.
+    \label{eq:feature_vector}
+\end{equation}
+The un-normalised entropy shift $\Delta H^{(l)}$ is the fifth scalar; it
+is retained in the stored outputs but excluded from $\boldsymbol{\phi}_q$,
+since $\Delta \bar{H}^{(l)}$ carries the same concentration signal in a
+cross-layer-comparable form, as required by
+Section~\ref{subsec:pa_distribution_comparison}. The absolute
+generation-phase quantities $\overline{E}^{(l)}_{\mathrm{gen}}$ and
+$\overline{\bar{H}}^{(l)}_{\mathrm{gen}}$, pooled without subtracting the
+prefill reference, are likewise stored as diagnostics but excluded from the
+feature vector. All $L$ layers enter $\boldsymbol{\phi}_q$, including early
+layers whose scores may be dominated by representation magnitude rather
+than discriminative structure; the per-feature standardisation of
+Section~\ref{subsec:probe} places all features on a common scale, and the
+L2 regularisation of the probe shrinks the coefficients of uninformative
+ones.
+% ----------------------------------------------------------------
+\subsection{Inverse-Temperature Calibration}
+\label{subsec:beta_calibration}
+% ----------------------------------------------------------------
+
+The inverse temperature $\beta$ controls the sharpness of the softmax over
+the bank $\mathbf{M}^{(l)}$. When $\beta$ is too small the softmax is
+near-uniform and the divergences vanish; when it is too large the softmax
+collapses onto one row and the divergences saturate. Both extremes destroy
+the discriminative signal, so $\beta$ is calibrated once per model against
+a fixed target for the mean normalised entropy.
+
+Calibration draws a warm-up subset of $N_c$ questions from the training
+split and captures the retrieval scores of
+Equation~\eqref{eq:retrieval_scores} at the prefill reference position of
+every layer. For each candidate $\beta$ in a fixed, approximately
+logarithmic grid, the
+mean normalised entropy of the induced softmax is evaluated across all
+captured layers and warm-up samples; this mean decreases monotonically in
+$\beta$. The selected value $\beta^\star$ is the point at which the curve
+crosses the operating target $\bar{H}^\star$, found by linear interpolation
+in $\log \beta$ between the two bracketing grid points. If the curve does
+not cross the target within the grid, $\beta^\star$ is clamped to the grid
+endpoint whose mean normalised entropy is closest to $\bar{H}^\star$, and
+the clamping is logged.
+
+The target places the operating point inside the range of $\bar{H}$ over
+which the divergences remain informative, away from both the uniform and
+the collapsed extremes. The target and the surrounding band are operational
+settings motivated by this saturation behaviour, not estimated quantities;
+their concrete values, together with $N_c$ and the grid, are fixed in
+Section~\ref{sec:experimental_config}, and the sensitivity of the results
+to $\beta^\star$ is examined in Chapter~\ref{chap:results}. Restricting
+calibration to the training split keeps test-set information out of
+$\beta^\star$.
+
+% ----------------------------------------------------------------
+\subsection{Detection Probe and Evaluation Protocol}
+\label{subsec:probe}
+% ----------------------------------------------------------------
+
+The detection model is the L2-regularised logistic-regression probe
+motivated in Section~\ref{subsec:pa_aggregation}. With $\sigma(\cdot)$ the
+logistic function, the probe estimates
+\begin{equation}
+    \hat{z}_q
+    =
+    \sigma\!\left(\boldsymbol{\phi}_q^{\!\top}\boldsymbol{w} + b\right),
+    \qquad
+    \boldsymbol{w} \in \mathbb{R}^{4L},\quad b \in \mathbb{R},
+    \label{eq:logistic_probe}
+\end{equation}
+and is fit by minimising the regularised binary cross-entropy
+\begin{equation}
+    \min_{\boldsymbol{w},\,b}\;
+    \frac{1}{N}\sum_{q=1}^{N}
+    \mathrm{BCE}\!\left(z_q,\,\hat{z}_q\right)
+    +
+    \frac{1}{2C N}\,\|\boldsymbol{w}\|_2^2,
+    \label{eq:logistic_objective}
+\end{equation}
+where $C > 0$ is the inverse-regularisation strength; this parameterisation
+matches the numerical solver used in
+Section~\ref{sec:implementation}. A standardisation step (zero mean, unit
+variance, fit on the training fold only) precedes the logistic regression,
+satisfying the common-scale requirement of
+Section~\ref{subsec:pa_aggregation}, and per-column median imputation
+handles the missing values that arise when activation extraction fails at a
+single layer. Each coefficient in $\boldsymbol{w}$ maps to one layer-metric
+pair, so every claim about where the signal lives is interpretable per
+layer.
+
+The $N$ labelled samples are partitioned, stratified on $z_q$ with a fixed
+seed, into train, validation, and test splits. The test split is locked
+before any probe is fit and is not inspected until the final step. The
+hyperparameter $C$ is selected by stratified cross-validation within the
+training split; the validation split takes no part in this selection and
+enters only the final refit, a deliberately conservative use that keeps
+model selection confined to the training data. An outer stratified
+cross-validation over train~$\cup$~validation is used solely to report the
+stability of the AUROC across folds, with the selected $C$ held fixed; it
+plays no role in model selection and the resulting estimate is descriptive.
+With the selected $C$ fixed, the probe is re-fit on
+train~$\cup$~validation and evaluated once on the held-out test split, and
+that single evaluation is the reported generalisation estimate. Split
+ratios, fold counts, and the grid for $C$ are fixed in
+Section~\ref{sec:experimental_config}.
+
+Two diagnostics accompany the probe. The \emph{per-layer AUROC} of each
+individual feature
+$f \in \{\Delta E, \Delta\bar{H}, \overline{\mathrm{JS}},
+\overline{H^2_{\mathrm{Hel}}}\}$ at every layer $l$ localises the signal
+along the depth axis and feeds the exploratory depth-axis analysis of
+Section~\ref{subsec:an_localisation}. The
+\emph{single-feature unsupervised AUROC} of the best-layer score for each
+$f$, computed without any logistic fitting, separates the unsupervised
+contribution of the Hopfield features from the supervised contribution of
+the probe.
+
+% ----------------------------------------------------------------
+\subsection{Algorithmic Summary}
+\label{subsec:algorithms}
+% ----------------------------------------------------------------
+
+The banks are constructed once per model before any sample is processed:
+for every layer, the gate matrix is extracted from the frozen weights as in
+Equation~\eqref{eq:memory_bank_definition}, its rows are L2-normalised
+(Equation~\eqref{eq:retrieval_scores}), and the per-row norms are stored so that
+retrieval scores can be recovered from the captured gate pre-activations by
+the fixed rescaling of Equation~\eqref{eq:retrieval_scores}.
+Algorithm~\ref{alg:per_sample} then summarises the per-sample procedure. It
+is purely functional: it takes the frozen model, the pre-built banks, the
+calibrated $\beta^\star$, and the question, and returns the feature vector
+$\boldsymbol{\phi}_q$ together with the generated text $\hat{y}$. No
+in-place modification of the model occurs at any stage.
+
+\begin{algorithm}[H]
+\caption{Per-sample feature extraction}
+\label{alg:per_sample}
+\begin{algorithmic}[1]
+\Require frozen model $f_\theta$, banks
+         $\{\mathbf{M}^{(l)}\}_{l=0}^{L-1}$ with unit-normalised rows
+         $\hat{\mathbf{m}}_i^{(l)}$ and stored row norms,
+         inverse temperature $\beta^\star$, question $q$
+\State $p \gets$ the question $q$ wrapped in the fixed chat template
+\State Run the prefill forward pass on $p$; at every layer $l$, capture the
+       hidden state $\mathbf{r}^{(l,\mathrm{ref})}$ at the last prompt token
+\State Compute the retrieval scores of Equation~\eqref{eq:retrieval_scores},
+       then $E^{(l,\mathrm{ref})}$, $H^{(l,\mathrm{ref})}$,
+       $\bar{H}^{(l,\mathrm{ref})}$, and the reference distribution
+       $\{p_i^{(l,\mathrm{ref})}\}$ for all $l$ via
+       Equations~\eqref{eq:modern_hopfield_energy},
+       \eqref{eq:retrieval_entropy}, \eqref{eq:normalised_entropy}, and
+       \eqref{eq:retrieval_distribution}
+\State Greedy-decode $\hat{y}$ from $p$ with $T_g \le T_{\max}$ tokens; at
+       every generated position $t$, capture
+       $\{\mathbf{r}_t^{(l)}\}_{l=0}^{L-1}$
+\For{each $(l, t)$}
+    \State Compute the retrieval scores, then $E^{(l,t)}$, $H^{(l,t)}$,
+           $\bar{H}^{(l,t)}$, and $\{p_i^{(l,t)}\}$
+    \State Compute $\mathrm{JS}^{(l,t)}$ and
+           $H^2_{\mathrm{Hel}}{}^{(l,t)}$ against
+           $\{p_i^{(l,\mathrm{ref})}\}$
+\EndFor
+\State Pool the per-token quantities over $t = 1, \ldots, T_g$ as in
+       Equations~\eqref{eq:delta_energy}--\eqref{eq:mean_hellinger}
+\State Assemble $\boldsymbol{\phi}_q$ as in
+       Equations~\eqref{eq:group_vectors_1}--\eqref{eq:feature_vector}
+\State \Return $(\boldsymbol{\phi}_q,\,\hat{y})$
+\end{algorithmic}
+\end{algorithm}
+% =============================================================
+% =============================================================
+\section{Implementation}
+\label{sec:implementation}
+% =============================================================
+
+The method is implemented as a Python package, \texttt{energy\_llm}, built
+around an artefact pipeline. Each stage writes typed artefacts to disk and
+reads only the artefacts produced by earlier stages, so every stage is
+independently re-runnable and the expensive GPU stages are never repeated
+when a downstream decision changes. The package is built on PyTorch
+\citep{paszke2019pytorch} for tensor computation and activation capture,
+the HuggingFace \texttt{transformers} library \citep{wolf2020transformers}
+for model loading and tokenisation, NumPy and SciPy for the
+information-theoretic primitives, and scikit-learn
+\citep{pedregosa2011scikit} for the probe and evaluation protocol. Each
+stage carries unit tests on its artefact contracts, and an end-to-end
+integration test exercises the full pipeline on a miniature model with
+\texttt{pytest}. The
+specific classes and functions drawn from each library, and the reasons for
+those choices, are stated where they are used.
+
+% ----------------------------------------------------------------
+\subsection{Stage 1: Bank Extraction}
+\label{subsec:stage1}
+% ----------------------------------------------------------------
+
+Models are loaded through
+\texttt{transformers.AutoModelForCausalLM.from\_pretrained}, which resolves
+the architecture from the checkpoint configuration and reproduces the exact
+parameterisation of the released weights; this matters because the bank is
+defined as a function of those frozen weights and any re-implementation of
+the architecture would break the identification of
+Equation~\eqref{eq:memory_bank_definition}. The stage walks every decoder
+layer, resolves the SwiGLU sub-modules through a model-alias registry
+(\texttt{gate\_proj} and \texttt{up\_proj} for the Qwen and Llama
+families), and reads the gate weight matrix. When the model is loaded with
+\texttt{bitsandbytes} quantisation to fit GPU memory, the gate weights are
+dequantised before bank construction, and in all cases they are cast to
+\texttt{float32} on CPU; the row norms and the log-sum-exp of
+Equation~\eqref{eq:modern_hopfield_energy} are sensitive to the reduced
+mantissa of half-precision formats, and computing them in single precision
+removes that error source at negligible cost, since the banks are built
+once per model.
+
+Row-wise L2 normalisation is then applied, and the per-row norms are stored
+alongside the normalised rows, so that the raw gate pre-activations of
+Equation~\eqref{eq:gate_preactivations} remain recoverable from the
+retrieval scores by the fixed rescaling of
+Equation~\eqref{eq:retrieval_scores}. The output artefact
+\texttt{banks.pt}, serialised with \texttt{torch.save}, stores
+$\{l \mapsto \texttt{Tensor}[K_l, D]\}$ together with a metadata record of
+per-layer dimensions, the stored norms, and the bank identifier.
+
+The primary and only evaluated configuration is the gate bank
+$\mathbf{M}^{(l)} = \mathbf{A}^{(l)}$ of
+Equation~\eqref{eq:memory_bank_definition}. The extraction interface also
+supports the un-gated value branch $\mathbf{B}^{(l)}$ and the rows of
+${\mathbf{W}_2}^{\!\top}$ as alternative configurations; these are
+implementation capabilities rather than evaluated conditions, and no result
+in this thesis depends on them. The raw \texttt{down\_proj} weight in its
+native orientation is rejected explicitly, because its rows live in the
+output dimension and would silently confuse keys with values.
+
+% ----------------------------------------------------------------
+\subsection{Stage 2: Trajectory Capture}
+\label{subsec:stage2}
+% ----------------------------------------------------------------
+
+For each sample, this stage runs the two forward passes of
+Section~\ref{subsec:pa_probe_positions} and realises
+Algorithm~\ref{alg:per_sample}. The prompt is wrapped through the
+tokenizer's \texttt{apply\_chat\_template} method, which applies the
+template shipped with the checkpoint itself; using the shipped template
+rather than a hand-written one guarantees that $q$ reaches the model in the
+conversational format of its instruction tuning, and that prefill and
+generation share the identical prompt prefix required by
+Section~\ref{subsec:pa_probe_positions}. Decoding uses
+\texttt{model.generate} with sampling disabled and a fixed
+\texttt{max\_new\_tokens} cap, which implements the greedy argmax decoding
+of Section~\ref{sec:problem_description} with $T_g \le T_{\max}$.
+
+The probe point is captured with PyTorch forward pre-hooks
+(\texttt{register\_forward\_pre\_hook}) registered on the \texttt{mlp}
+module of every decoder layer. A pre-hook receives the exact input tensor
+of the module it is attached to, which at this position is
+$\mathbf{r}_t^{(l)}$, the output of the post-attention RMSNorm and the
+argument of the gate and value projections
+(Figure~\ref{fig:transformer_block}). The hook mechanism is chosen over
+patching the model's forward method because it observes without rewriting:
+the computation graph is untouched, which realises the read-only constraint
+of this chapter mechanically rather than by convention. All passes run
+under \texttt{torch.inference\_mode}, which disables gradient tracking and
+makes any accidental parameter mutation an error. During prefill the hook
+retains only the state at the last prompt position, yielding
+$\mathbf{r}^{(l,\mathrm{ref})}$; during generation it retains the state of
+each newly produced token.
+
+Inside the hook, the captured state is multiplied by the row-normalised
+bank, so the resulting vector is exactly the score vector
+$\mathbf{s}_t^{(l)}$ of Equation~\eqref{eq:retrieval_scores}; the energy,
+the retrieval distribution, and all derived quantities therefore operate on
+the rescaled scores, never on the raw pre-activations, in accordance with
+Section~\ref{subsec:retrieval_scoring}. The log-sum-exp term of the energy
+is evaluated with \texttt{scipy.special.logsumexp}, which shifts by the
+maximum score before exponentiating and thereby avoids the overflow that a
+literal evaluation of Equation~\eqref{eq:modern_hopfield_energy} produces
+at large $\beta$; the log-sum-exp and quadratic terms are stored as
+separate fields, preserving the decomposition required by
+Section~\ref{subsec:pa_scale_confounds}. The Jensen--Shannon divergence
+requires a convention reconciliation:
+\texttt{scipy.spatial.distance.jensenshannon} returns the square root of
+the divergence in the logarithm base passed to it, so the package squares
+the returned value and converts to natural logarithms,
+\begin{equation}
+    \mathrm{JS}_{\mathrm{nats}}(P, Q)
+    =
+    \bigl[\texttt{jensenshannon}(P, Q,\ \mathrm{base}=2)\bigr]^{2}
+    \cdot \log 2,
+    \label{eq:js_convention}
+\end{equation}
+which pins every reported divergence to the nats convention of
+Section~\ref{sec:divergences} and keeps the bound
+$\mathrm{JS} \le \log 2$ exact. The squared Hellinger distance is
+implemented directly in NumPy from Equation~\eqref{eq:hellinger_squared},
+since it involves only square roots and a sum and needs no library wrapper.
+
+Hidden states themselves are never persisted: the bank multiplication and
+the divergences are computed online inside the hook, and only the resulting
+$[L]$ and $[L, T_g]$ scalar arrays are written to a compressed per-sample
+artefact, together with a metadata file recording the question, the gold
+answers, the generated text, and the token count. The stage exposes a
+sharding interface that slices the dataset into non-overlapping chunks by
+stride, so several workers can populate the same trajectory directory in
+parallel, as used in the HPC array-job submission; the per-sample
+aggregation of Stage~4 is unaffected by the order in which shards complete.
+
+% ----------------------------------------------------------------
+\subsection{Inverse-Temperature Calibration}
+\label{subsec:impl_beta}
+% ----------------------------------------------------------------
+
+The calibration of Section~\ref{subsec:beta_calibration} is realised as a
+warm-up pass that precedes the main Stage~2 run. The prefill reference
+scores of $N_c$ training-split questions are captured once, and the mean
+normalised entropy of the induced softmax is evaluated for every $\beta$ on
+a fixed, approximately logarithmic grid by recomputing the softmax from the
+cached score
+vectors, without further forward passes. The selected $\beta^\star$ is
+obtained by linear interpolation in $\log \beta$ between the two grid
+points bracketing the target $\bar{H}^\star$; when the target is not
+bracketed, the nearest grid endpoint is taken and the clamping is recorded
+in the run metadata. The calibrated value is written into the experiment
+configuration snapshot so that every subsequent stage reads the same
+$\beta^\star$.
+
+% ----------------------------------------------------------------
+\subsection{Stage 3: Labelling}
+\label{subsec:stage3_labeling}
+% ----------------------------------------------------------------
+
+Labels are produced by the external judge of
+Section~\ref{sec:problem_description}, queried through an OpenAI-compatible
+chat-completions interface with the locked prompt template that presents
+$q$, $\hat{y}$, and $\mathcal{A}_q$ and requests a binary supported or
+unsupported verdict. The raw judge response is archived verbatim alongside
+the parsed label in a per-sample label artefact, so the parsing rule can be
+audited and re-applied without re-querying the service. Labels are stored
+separately from the trajectory artefacts, which makes relabelling a
+CPU-only operation that never touches the GPU stages. The agreement of the
+judge with a human-labelled subset, reported as Cohen's $\kappa$, is
+computed in this stage and carried into Chapter~\ref{chap:results}.
+
+% ----------------------------------------------------------------
+\subsection{Stage 4: Feature Aggregation and Probing}
+\label{subsec:stage4}
+% ----------------------------------------------------------------
+
+This stage is CPU-only and reads only the artefacts of Stages~2 and~3. For
+each sample it loads the per-token scalar arrays, pools them over the full
+set of generated positions $\{1, \ldots, T_g\}$ as specified in
+Section~\ref{subsec:feature_design}, computes the per-layer features of
+Equations~\eqref{eq:delta_energy}--\eqref{eq:mean_hellinger}, and assembles
+the matrix whose rows are the vectors $\boldsymbol{\phi}_q$ of
+Equation~\eqref{eq:feature_vector}. No gold answer enters this computation;
+the pooling consults only the generated sequence, so the features remain
+computable at inference time, and the labels of Stage~3 are joined to the
+feature matrix only at fitting time.
+
+The probe of Section~\ref{subsec:probe} is realised as a scikit-learn
+\texttt{Pipeline} chaining \texttt{SimpleImputer} with the median strategy,
+\texttt{StandardScaler}, and \texttt{LogisticRegression} with the
+\texttt{lbfgs} solver. The \texttt{Pipeline} class is used deliberately
+rather than applying the preprocessing steps manually: when the pipeline is
+passed to the cross-validation utilities, the imputer and the scaler are
+re-fit inside every training fold and applied unchanged to the
+corresponding held-out fold, which enforces by construction that no
+test-fold statistics leak into the standardisation. Splitting and fold
+generation use \texttt{StratifiedKFold} and a stratified
+\texttt{train\_test\_split} with fixed seeds, preserving the class balance
+of $z_q$ in every partition, and discrimination is computed with
+\texttt{roc\_auc\_score}. The scikit-learn objective is parameterised as
+$\tfrac{1}{2}\|\mathbf{w}\|_2^2 + C\sum_q \mathrm{BCE}$, which coincides
+with Equation~\eqref{eq:logistic_objective} up to the positive factor
+$CN$, leaving the minimiser unchanged; the
+$C$ values reported in this work refer to the scikit-learn convention. The
+per-layer AUROC and single-feature diagnostics of
+Section~\ref{subsec:probe} are computed in the same stage directly from the
+feature matrix, with no fitted model involved.
+
+% =============================================================
+% =============================================================
+% =============================================================
+% =============================================================
+\section{Analysis Method}
+\label{sec:analysis_method}
+% =============================================================
+
+This section fixes the statistical procedures behind the quantitative
+claims of Chapter~\ref{chap:results}. The thesis makes four claims that
+require statistical support: that the probe discriminates hallucinated from
+grounded answers, that the Hopfield features contribute information beyond
+what the generation process already exposes, that the signal admits a
+depth-axis localisation consistent with the mechanistic objective of this
+chapter, and that the judge labels supporting all of the above are
+reliable. One procedure is fixed per claim, and the section closes by
+separating the confirmatory claims from the exploratory ones.
+
+% ----------------------------------------------------------------
+\subsection{Discrimination of the Probe}
+\label{subsec:an_discrimination}
+% ----------------------------------------------------------------
+
+The primary endpoint is the AUROC of the probe on the locked test split of
+Section~\ref{subsec:probe}, reported with a non-parametric bootstrap $95\%$
+confidence interval from $B = 10\,000$ resamples of the test predictions;
+the resample count controls only the numerical stability of the interval,
+while the width of the interval reflects the size of the test split. A
+lower confidence bound above $0.5$ is the condition for claiming
+discrimination. Resamples containing a single class, for which the AUROC is
+undefined, are redrawn. Because the test split is small relative to the category
+structure of TruthfulQA, no stratified inferential procedure is attempted
+at the category level; instead, the AUROC computed separately within the
+largest categories is reported descriptively, to verify that the
+discrimination is not the artefact of a single category with an atypical
+hallucination rate.
+
+% ----------------------------------------------------------------
+\subsection{Contribution of the Hopfield Features}
+\label{subsec:an_contribution}
+% ----------------------------------------------------------------
+
+Discrimination alone does not establish the thesis: a detector could
+discriminate using only the model's own confidence in its output. The
+central claim is therefore comparative. Two baseline scalars are computed
+from the same greedy decoding pass: the length-normalised sequence
+log-probability and the mean token-level predictive entropy of the
+generated answer. Two probes are fit under the identical protocol of
+Section~\ref{subsec:probe}, a base probe on the two baselines alone and a
+full probe on the baselines concatenated with $\boldsymbol{\phi}_q$. For
+each of $B = 10\,000$ paired bootstrap resamples of the test set,
+$\Delta\mathrm{AUROC} = \mathrm{AUROC}^{\mathrm{full}} -
+\mathrm{AUROC}^{\mathrm{base}}$ is recomputed, and the Hopfield
+contribution is claimed significant only if the lower bound of the
+resulting $95\%$ confidence interval is positive. The pairing is essential:
+both probes are evaluated on the same resample, so the variance of the
+difference excludes the sampling noise common to both and the test isolates
+the added value of the features.
+
+% ----------------------------------------------------------------
+\subsection{Localisation Along the Depth Axis}
+\label{subsec:an_localisation}
+% ----------------------------------------------------------------
+
+The per-layer AUROC profiles of Section~\ref{subsec:probe} serve the
+interpretability objective and are exploratory; they support no
+confirmatory claim. Because the direction of the effect is unknown per
+layer (Section~\ref{subsec:pa_aggregation}), the per-layer statistic is the
+folded value $\max(\mathrm{AUROC},\,1-\mathrm{AUROC})$. The best layer is
+then a scan statistic: even under pure chance, the maximum over $L$ layers
+exceeds any pointwise threshold with high probability, so the profile is
+protected by a permutation null of the scan maximum. Labels are shuffled,
+the maximum folded AUROC over all layer and feature combinations entering
+the observed profiles is recomputed, and the procedure is
+repeated $B_{\mathrm{perm}} = 1000$ times; a layer band is described as
+carrying signal only where the observed values exceed the $95$th percentile
+of this null.
+
+% ----------------------------------------------------------------
+\subsection{Label Reliability}
+\label{subsec:an_label_reliability}
+% ----------------------------------------------------------------
+
+Every claim above inherits the quality of the judge labels of
+Section~\ref{sec:problem_description}. Agreement between the judge and the
+human-labelled subset is quantified by Cohen's $\kappa$, reported together
+with the subset size. A value of $\kappa \ge 0.6$, substantial agreement
+under the convention of \citet{landis1977measurement}, is the condition for
+treating the judge labels as an acceptable ground truth; if the threshold
+is not met, the affected results are reported with this limitation stated
+explicitly rather than withheld.
+
+% ----------------------------------------------------------------
+\subsection{Sensitivity and Confirmatory Family}
+\label{subsec:an_sensitivity}
+% ----------------------------------------------------------------
+
+The sensitivity of the test AUROC to the calibrated inverse temperature is
+examined descriptively by recomputing the features over the $\beta$ grid of
+Section~\ref{subsec:beta_calibration} from the cached score tensors,
+without further forward passes, and reporting the AUROC as a function of
+$\beta$. The confirmatory family consists of exactly two hypotheses, the
+discrimination claim of Section~\ref{subsec:an_discrimination} and the
+contribution claim of Section~\ref{subsec:an_contribution}, tested with
+Bonferroni correction at family level $\alpha = 0.05$. All remaining
+analyses, including the depth-axis profiles, the per-category breakdown,
+and the $\beta$ sensitivity curve, are exploratory or descriptive and carry
+no corrected significance claim.
+
+% =============================================================
+% =============================================================
+\section{Experimental Configuration}
+\label{sec:experimental_config}
+% =============================================================
+
+This section fixes the configuration under which the final pipeline runs.
+Nothing here overrides the design decisions above; the purpose is to set
+every free parameter before execution so that the results of
+Chapter~\ref{chap:results} are reproducible from a single configuration
+file.
+
+% ----------------------------------------------------------------
+\subsection{Models}
+\label{subsec:models}
+% ----------------------------------------------------------------
+
+Two instruction-tuned decoder-only models are evaluated.
+\textbf{Qwen2.5-3B-Instruct} \citep{qwen2025qwen25}
+($L = 36$, $D = 2048$, $D_{\mathrm{ff}} = 11008$) is the primary model,
+used for calibration, hyperparameter selection, and the headline result.
+\textbf{Llama-3.2-3B-Instruct} \citep{grattafiori2024llama3}
+($L = 28$, $D = 3072$, $D_{\mathrm{ff}} = 8192$) is the replication model
+for cross-architecture transfer. All reported runs execute on a single
+A100 GPU in BF16; 4-bit NF4 quantisation (\texttt{bitsandbytes}) is used
+only for local development and produces no reported number, in keeping
+with the fixed-precision determinism constraint of this chapter. Bank
+extraction always dequantises the gate matrix to \texttt{float32} on CPU
+before row-wise L2 normalisation
+(Section~\ref{subsec:stage1}).
+
+% ----------------------------------------------------------------
+\subsection{Datasets}
+\label{subsec:datasets}
+% ----------------------------------------------------------------
+
+\textbf{TruthfulQA} \citep{lin2022truthfulqa} ($817$ adversarial questions
+across $38$ categories) is the primary dataset: it provides curated
+correct and incorrect reference answers, is a standard benchmark for
+hallucination detection on factoid QA, and its category metadata supports
+the descriptive per-category breakdown of
+Section~\ref{subsec:an_discrimination}. \textbf{TriviaQA}
+(\texttt{rc.nocontext} split, \citealt{joshi2017triviaqa}, $500$ samples
+drawn at the fixed seed) provides a secondary cross-dataset evaluation,
+executed only if the primary analysis completes within the compute budget;
+its results are reported as exploratory in either case.
+
+% ----------------------------------------------------------------
+\subsection{Experiments}
+\label{subsec:experiments}
+% ----------------------------------------------------------------
+
+Three runs are defined, in strict priority order. \textbf{E1} (primary):
+Qwen2.5-3B-Instruct on TruthfulQA; this run supports both confirmatory
+hypotheses of Section~\ref{subsec:an_sensitivity}, the depth-axis profile,
+the per-category breakdown, and the $\beta$ sensitivity curve. \textbf{E2}
+(replication): Llama-3.2-3B-Instruct on TruthfulQA under the identical
+configuration, with $\beta^\star$ recalibrated for the model; this run
+tests whether the discrimination and contribution findings transfer across
+architectures and is reported descriptively against the E1 outcome.
+\textbf{E3} (secondary, contingent): Qwen2.5-3B-Instruct on TriviaQA,
+reported as exploratory cross-dataset evidence. The $\beta$ sensitivity
+analysis requires no additional GPU run, since it recomputes features from
+the score tensors cached during E1
+(Section~\ref{subsec:an_sensitivity}). For the label-reliability check of
+Section~\ref{subsec:an_label_reliability}, a random subset of $60$ E1
+samples is labelled by hand and compared against the judge.
+
+% ----------------------------------------------------------------
+\subsection{Hyperparameters}
+\label{subsec:hyperparameters}
+% ----------------------------------------------------------------
+
+Table~\ref{tab:hyperparameters} lists every hyperparameter of the final
+pipeline. These values are fixed before execution and are not varied
+across the runs that produce the headline result.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{p{0.36\linewidth} p{0.28\linewidth} p{0.28\linewidth}}
+        \toprule
+        Parameter & Value & Provenance \\
+        \midrule
+        \multicolumn{3}{l}{\emph{Memory bank}} \\
+        \hspace{1em}\texttt{bank}
+            & \texttt{gate}
+            & Eq.~\eqref{eq:memory_bank_definition} \\
+        \hspace{1em}\texttt{normalize}
+            & \texttt{True} (row L2)
+            & \S\ref{subsec:retrieval_scoring} \\
+        \hspace{1em}\texttt{hook\_target}
+            & \texttt{mlp\_input}
+            & \S\ref{subsec:pa_probe_positions} \\
+        \multicolumn{3}{l}{\emph{Energy and divergences}} \\
+        \hspace{1em}\texttt{score}
+            & gate pre-activation, rescaled
+            & Eq.~\eqref{eq:retrieval_scores} \\
+        \hspace{1em}\texttt{normalize\_query}
+            & \texttt{False}
+            & \S\ref{subsec:retrieval_scoring} \\
+        \hspace{1em}$\beta^\star$
+            & calibrated, target $\bar{H}^\star{=}0.55$
+            & \S\ref{subsec:beta_calibration} \\
+        \hspace{1em}$\beta$ grid
+            & $\{1,2,5,10,15,20,30,50,100\}$
+            & \S\ref{subsec:beta_calibration} \\
+        \hspace{1em}Operating band
+            & $\bar{H} \in [0.3,\,0.7]$
+            & \S\ref{subsec:beta_calibration} \\
+        \hspace{1em}\texttt{calibration\_samples}
+            & $N_c = 30$
+            & \S\ref{subsec:beta_calibration} \\
+        \multicolumn{3}{l}{\emph{Generation}} \\
+        \hspace{1em}Decoding
+            & greedy
+            & \S\ref{sec:problem_description} \\
+        \hspace{1em}$T_{\max}$
+            & $50$ tokens
+            & \S\ref{subsec:feature_design} \\
+        \hspace{1em}Chat template
+            & checkpoint default
+            & \S\ref{subsec:stage2} \\
+        \multicolumn{3}{l}{\emph{Feature aggregation}} \\
+        \hspace{1em}Pooling
+            & mean over all generated tokens
+            & Eqs.~\eqref{eq:delta_energy}--\eqref{eq:mean_hellinger} \\
+        \multicolumn{3}{l}{\emph{Baselines}} \\
+        \hspace{1em}Baseline features
+            & seq.\ log-prob.\ (length-norm.), mean token entropy
+            & \S\ref{subsec:an_contribution} \\
+        \multicolumn{3}{l}{\emph{Probe}} \\
+        \hspace{1em}Regulariser
+            & L2
+            & Eq.~\eqref{eq:logistic_objective} \\
+        \hspace{1em}$C$ grid
+            & $\{0.01,\,0.1,\,1,\,10\}$
+            & \S\ref{subsec:probe} \\
+        \hspace{1em}Inner CV
+            & $3$-fold stratified
+            & \S\ref{subsec:probe} \\
+        \hspace{1em}Outer CV
+            & $5$-fold stratified
+            & \S\ref{subsec:probe} \\
+        \hspace{1em}Split
+            & $70/15/15$
+            & \S\ref{subsec:probe} \\
+        \multicolumn{3}{l}{\emph{Statistics}} \\
+        \hspace{1em}Bootstrap resamples
+            & $B = 10\,000$
+            & \S\ref{subsec:an_discrimination} \\
+        \hspace{1em}Permutation resamples
+            & $B_{\mathrm{perm}} = 1000$
+            & \S\ref{subsec:an_localisation} \\
+        \hspace{1em}Confirmatory family
+            & Bonferroni, $\alpha{=}0.05$, $2$ tests
+            & \S\ref{subsec:an_sensitivity} \\
+        \multicolumn{3}{l}{\emph{Labelling}} \\
+        \hspace{1em}Judge model
+            & \texttt{gpt-4o-mini}
+            & \S\ref{sec:problem_description} \\
+        \hspace{1em}Human-labelled subset
+            & $60$ samples
+            & \S\ref{subsec:an_label_reliability} \\
+        \multicolumn{3}{l}{\emph{Determinism}} \\
+        \hspace{1em}Random seed
+            & $42$
+            & --- \\
+        \bottomrule
+    \end{tabular}
+    \caption{Final pipeline hyperparameters. The provenance column gives
+    the section in which each choice is justified.}
+    \label{tab:hyperparameters}
+\end{table}
+
+% =============================================================
+\section{Summary}
+\label{sec:method_summary}
+% =============================================================
+
+The method turns the theoretical framework of Chapter~\ref{chap:theory} into a
+concrete, auditable pipeline. The probe treats the hidden state entering each
+SwiGLU sublayer as a query against the layer's gate matrix $\mathbf{A}^{(l)}$,
+whose rows are the pattern detectors of the feed-forward sublayer. The
+retrieval scores are a fixed per-row rescaling of the gate pre-activations the
+model already computes; as Section~\ref{subsec:retrieval_scoring} makes
+explicit, they are a deterministic derived view of the matching step rather
+than the raw activations themselves. The method computes the retrieval energy
+and the divergences against the prefill last-token reference, pools the
+per-token quantities over all generated tokens, and feeds the per-layer
+features into an L2-regularised logistic regression evaluated on a locked
+$15\%$ test split. The gate bank is the primary and only evaluated
+configuration; the value-branch and value-space banks are retained as
+implementation capabilities (Section~\ref{subsec:stage1}) and support no
+result reported in this thesis. The four-stage implementation writes typed
+artefacts at every step, supports parallel sharded execution on HPC
+infrastructure, and is validated by unit and integration tests. The
+configuration of Section~\ref{sec:experimental_config} is the one that
+Chapter~\ref{chap:results} executes and reports against pre-registered
+baselines and statistical procedures.

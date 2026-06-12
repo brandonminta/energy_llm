@@ -3,14 +3,14 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hopfield_llm"
-version = "0.2.0"
-description = "Energy-based hallucination detection for LLMs using Modern Hopfield networks."
+name = "energy_llm"
+version = "1.0.0"
+description = "Hallucination detection in LLMs via Modern Hopfield retrieval over SwiGLU memory banks (thesis pipeline)."
 readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 authors = [
-  { name = "hopfield_llm contributors" },
+  { name = "Brandon Minta" },
 ]
 keywords = [
   "llm",
@@ -19,16 +19,16 @@ keywords = [
   "hopfield",
 ]
 
-[project.scripts]
-hopfield-llm = "hopfield_llm.cli.run:main"
-
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["energy_llm"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

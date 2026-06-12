@@ -1,0 +1,50 @@
+# E2 (replication): Llama-3.2-3B-Instruct on TruthfulQA under the identical
+# configuration, beta* recalibrated for the model (subsec:experiments).
+# Reported descriptively against the E1 outcome.
+name: e2_llama_truthfulqa
+seed: 42
+output_dir: results/e2
+
+model:
+  alias: llama32_3b           # meta-llama/Llama-3.2-3B-Instruct (L=28, D=3072, Dff=8192)
+  dtype: bfloat16
+  load_in_4bit: false
+
+dataset:
+  name: truthfulqa
+  num_samples: null
+
+bank:
+  bank_id: gate
+  path: ""
+
+calibration:
+  num_samples: 30
+  beta_grid: [1, 2, 5, 10, 15, 20, 30, 50, 100]
+  target_norm_entropy: 0.55
+  beta_star: null             # recalibrated per model — run calibrate_beta.py for E2
+
+generation:
+  max_new_tokens: 50
+
+trajectory:
+  cache_score_tensors: false  # sensitivity analysis is defined on E1 only
+  score_dtype: float32
+  log_memory_every: 10
+
+labeling:
+  judge_model: gpt-4o-mini
+  api_base: null
+  max_retries: 6
+  human_subset_size: 60
+
+probe:
+  c_grid: [0.01, 0.1, 1.0, 10.0]
+  split: [0.70, 0.15, 0.15]
+  inner_cv_folds: 3
+  outer_cv_folds: 5
+
+stats:
+  n_bootstrap: 10000
+  n_permutation: 1000
+  alpha: 0.05

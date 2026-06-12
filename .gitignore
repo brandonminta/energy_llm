@@ -46,6 +46,8 @@ Thumbs.db
 # Experiment outputs, caches, and data (all runtime-generated)
 data/
 outputs/
+results/
+archive/
 runs/
 artifacts/
 

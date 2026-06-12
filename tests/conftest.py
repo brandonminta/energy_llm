@@ -1,68 +1,104 @@
-"""Shared fixtures for hopfield_llm tests."""
+"""Shared fixtures: a tiny random-weight Qwen2-style SwiGLU model and a
+matching whitespace tokenizer with a chat template. Everything runs on CPU
+with no downloads."""
 
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-@pytest.fixture
-def tmp_dir(tmp_path: Path) -> Path:
-    return tmp_path
-
-
-@pytest.fixture
-def synthetic_banks() -> dict[int, torch.Tensor]:
-    """Synthetic W_down banks: 4 layers, shape [64, 128]."""
-    torch.manual_seed(42)
-    return {i: torch.randn(64, 128) for i in range(4)}
-
-
-@pytest.fixture
-def synthetic_h_pre() -> torch.Tensor:
-    """Synthetic h_pre query vector of shape [128]."""
-    torch.manual_seed(0)
-    return torch.randn(128)
+WORDS = [
+    "what", "is", "the", "color", "of", "sky", "capital", "france", "who",
+    "wrote", "hamlet", "where", "are", "alps", "tallest", "mountain", "river",
+    "longest", "ocean", "deepest", "planet", "largest", "smallest", "country",
+    "city", "animal", "fastest", "bird", "fish", "tree", "oldest", "answer",
+] + [f"w{i}" for i in range(64)]
 
 
-@pytest.fixture
-def synthetic_trajectory_dir(tmp_path: Path) -> Path:
-    """Synthetic trajectory directory with 5 samples (L=4, T=10)."""
-    traj_dir = tmp_path / "trajectories"
-    traj_dir.mkdir()
-    rng = np.random.RandomState(42)
-    L, T = 4, 10
+def make_tiny_tokenizer():
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
 
-    for i in range(5):
-        sid = f"test_{i}"
-        np.savez_compressed(
-            traj_dir / f"{sid}.npz",
-            prefill_energy=rng.randn(L).astype(np.float32),
-            prefill_entropy=rng.rand(L).astype(np.float32),
-            prefill_norm_entropy=rng.rand(L).astype(np.float32),
-            prefill_lse=rng.randn(L).astype(np.float32),
-            prefill_quadratic=rng.randn(L).astype(np.float32),
-            prefill_top_act=rng.randn(L).astype(np.float32),
-            prefill_n_active=rng.randint(0, 100, L).astype(np.int32),
-            gen_energy=rng.randn(L, T).astype(np.float32),
-            gen_entropy=rng.rand(L, T).astype(np.float32),
-            gen_norm_entropy=rng.rand(L, T).astype(np.float32),
-            gen_lse=rng.randn(L, T).astype(np.float32),
-            gen_quadratic=rng.randn(L, T).astype(np.float32),
-            gen_top_act=rng.randn(L, T).astype(np.float32),
-            gen_n_active=rng.randint(0, 100, (L, T)).astype(np.int32),
-            token_ids=rng.randint(0, 32000, T).astype(np.int32),
-        )
-        (traj_dir / f"{sid}.json").write_text(json.dumps({
-            "id": sid, "source": "test",
-            "question": f"Test question {i}?",
-            "gold_answers": [f"Answer {i}"],
-            "generated_text": f"Generated answer {i}",
-            "model": "test_model", "n_layers": L, "n_tokens_generated": T,
-        }, indent=2), encoding="utf-8")
+    vocab = {"<unk>": 0, "<eos>": 1, "<pad>": 2}
+    for w in WORDS:
+        vocab[w] = len(vocab)
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    fast = PreTrainedTokenizerFast(
+        tokenizer_object=tok, unk_token="<unk>", eos_token="<eos>", pad_token="<pad>"
+    )
+    fast.chat_template = (
+        "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+        "{% if add_generation_prompt %} answer{% endif %}"
+    )
+    return fast
 
-    return traj_dir
+
+def make_tiny_model(vocab_size: int, n_layers: int = 2, hidden: int = 32,
+                    intermediate: int = 48, seed: int = 0):
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(seed)
+    config = Qwen2Config(
+        vocab_size=vocab_size,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_hidden_layers=n_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=256,
+        tie_word_embeddings=True,
+    )
+    model = Qwen2ForCausalLM(config)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+@pytest.fixture(scope="session")
+def tiny_tokenizer():
+    return make_tiny_tokenizer()
+
+
+@pytest.fixture(scope="session")
+def tiny_model(tiny_tokenizer):
+    return make_tiny_model(vocab_size=tiny_tokenizer.vocab_size + 4)
+
+
+@pytest.fixture(scope="session")
+def tiny_banks(tiny_model):
+    from energy_llm.banks import build_banks
+    return build_banks(tiny_model, model_id="tiny-qwen2", bank_id="gate")
+
+
+def make_questions(n: int, seed: int = 7) -> list[str]:
+    import random
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        words = rng.sample(WORDS, rng.randint(4, 7))
+        out.append(" ".join(words))
+    return out
+
+
+def make_tiny_samples(n: int = 8):
+    from energy_llm.data import Sample
+    questions = make_questions(n)
+    return [
+        Sample(sample_id=f"tiny_{i:03d}", question=q, gold_answers=["sky", "blue"],
+               category="cat_a" if i % 2 == 0 else "cat_b", source="tiny")
+        for i, q in enumerate(questions)
+    ]
+
+
+@pytest.fixture()
+def tiny_samples():
+    return make_tiny_samples(8)

@@ -85,10 +85,22 @@ def js_nats(p: np.ndarray, q: np.ndarray, axis: int = -1) -> np.ndarray:
     scipy returns the square root of the divergence in the given base, so the
     square restores the divergence and the log(2) factor converts bits to
     nats, keeping the bound JS <= log 2 exact.
+
+    A floor of EPS_P = 1e-300 is applied before passing to scipy to prevent
+    inf when one distribution assigns exact float64 zero where the other does
+    not (this arises in early layers where float16 score tensors produce many
+    exp underflows after the softmax; the renormalisation error is O(K*EPS_P)
+    which is negligible for K=11008).
     """
-    root = jensenshannon(np.asarray(p, dtype=np.float64),
-                         np.asarray(q, dtype=np.float64),
-                         base=2, axis=axis)
+    EPS_P = 1e-300
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    # Floor then renormalise to keep valid probability vectors.
+    p = np.where(p < EPS_P, EPS_P, p)
+    p = p / p.sum(axis=axis, keepdims=True)
+    q = np.where(q < EPS_P, EPS_P, q)
+    q = q / q.sum(axis=axis, keepdims=True)
+    root = jensenshannon(p, q, base=2, axis=axis)
     # Identical distributions can yield a NaN root from a 0/0 inside scipy;
     # the divergence there is exactly 0.
     root = np.nan_to_num(root, nan=0.0)

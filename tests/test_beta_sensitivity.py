@@ -1,5 +1,10 @@
 """Tests for scripts/run_beta_sensitivity.py — beta grid, CSV columns, and
-no NaN values, exercised on 10 samples of the tiny random Qwen2 model."""
+no NaN values, exercised on 10 samples of the tiny random Qwen2 model.
+
+The fixture builds the full pre-requisite chain:
+  banks → calibrate → trajectories (cache_score_tensors=True) → labels
+  → features.csv   ← required by the new single-pass implementation
+"""
 
 import sys
 from pathlib import Path
@@ -15,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 from energy_llm.banks import build_banks, load_banks
 from energy_llm.calibration import calibrate_beta
 from energy_llm.config import ExperimentConfig, load_config
+from energy_llm.features import build_feature_table
 from energy_llm.labeling import label_samples, load_labels
 from energy_llm.trajectory import run_trajectories
 from scripts.run_beta_sensitivity import BETA_GRID, run_beta_sensitivity
@@ -53,7 +59,14 @@ def beta_sens_data(tmp_path_factory):
     run_trajectories(cfg, model, tokenizer, banks, samples)
     label_samples(cfg.trajectories_dir, cfg.labels_dir, FakeJudge())
 
-    df = run_beta_sensitivity(cfg)
+    # Build features.csv — required by the single-pass implementation.
+    labels = load_labels(cfg.labels_dir)
+    df_feat = build_feature_table(cfg.trajectories_dir, labels=labels)
+    cfg.features_dir.mkdir(parents=True, exist_ok=True)
+    df_feat.to_csv(cfg.features_dir / "features.csv", index=False)
+
+    # Use n_jobs=1 to avoid subprocess overhead in tests.
+    df = run_beta_sensitivity(cfg, n_jobs=1)
     return cfg, df
 
 

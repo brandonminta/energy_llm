@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=energy-features
-#SBATCH --partition=shared
+#SBATCH --partition=cpu
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=01:00:00

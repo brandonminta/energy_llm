@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=energy-traj
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100_2g.10gb:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --gres=gpu:a100-sxm4-40gb:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/traj_%A_%a.out
 #SBATCH --error=logs/traj_%A_%a.err
@@ -67,15 +67,29 @@ forward() { [ "$PYTHON_PID" -ne 0 ] && kill -"$1" "$PYTHON_PID" 2>/dev/null || t
 trap 'forward USR1' USR1
 trap 'forward TERM' TERM
 
-python scripts/capture_trajectories.py \
-    --config "$CONFIG" \
-    --shard-index "$SLURM_ARRAY_TASK_ID" \
-    --num-shards "$NUM_SHARDS" \
-    --score-dtype "$SCORE_DTYPE" \
-    "${EXTRA_ARGS[@]}" &
-PYTHON_PID=$!
-wait "$PYTHON_PID"
-STATUS=$?
+MAX_RETRIES=3
+ATTEMPT=0
+STATUS=1
+
+while [ $ATTEMPT -lt $MAX_RETRIES ] && [ $STATUS -ne 0 ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    echo "[traj] attempt $ATTEMPT/$MAX_RETRIES shard=${SLURM_ARRAY_TASK_ID} $(date)"
+
+    python scripts/capture_trajectories.py \
+        --config "$CONFIG" \
+        --shard-index "$SLURM_ARRAY_TASK_ID" \
+        --num-shards "$NUM_SHARDS" \
+        --score-dtype "$SCORE_DTYPE" \
+        "${EXTRA_ARGS[@]}" &
+    PYTHON_PID=$!
+    wait "$PYTHON_PID"
+    STATUS=$?
+
+    if [ $STATUS -ne 0 ] && [ $ATTEMPT -lt $MAX_RETRIES ]; then
+        echo "[traj] attempt $ATTEMPT failed (status $STATUS), waiting 60s before retry"
+        sleep 60
+    fi
+done
 
 echo "[traj] shard ${SLURM_ARRAY_TASK_ID} exited with status $STATUS at $(date)"
 

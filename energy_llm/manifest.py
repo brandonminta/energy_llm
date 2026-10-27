@@ -58,6 +58,17 @@ def hardware() -> dict:
     return info
 
 
+def peak_gpu_memory_gb(device) -> dict | None:
+    """Peak allocated/reserved memory on ``device`` since the last reset
+    (None when the model is not on a GPU)."""
+    import torch
+
+    if device.type != "cuda":
+        return None
+    return {"allocated": round(torch.cuda.max_memory_allocated(device) / 1e9, 3),
+            "reserved": round(torch.cuda.max_memory_reserved(device) / 1e9, 3)}
+
+
 def set_determinism(seed: int) -> None:
     """Seed every RNG and keep float32 matmuls at full precision (no TF32)."""
     import random

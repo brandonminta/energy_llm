@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from energy_llm import manifest
-from energy_llm.bank import build_bank, place_bank, read_bank_fingerprint, write_bank_h5
+from energy_llm.bank import build_bank, read_bank_fingerprint, write_bank_h5
 from energy_llm.capture import ResidualHooks, forward_item, norm_entropy_curve
 from energy_llm.config import RunConfig
 from energy_llm.model import ModelBundle
@@ -104,7 +104,6 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     check_template(bundle.tokenizer, cfg.prompt.date_string)
     bank = build_bank(bundle.model, bundle.dims)
     ensure_bank_record(cfg, bank, bundle)
-    place_bank(bank, cfg.extraction.bank_device, bundle.device)
 
     failed_path = cal / "failed.jsonl"
     attempts: dict[str, int] = {}

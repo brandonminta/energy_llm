@@ -11,6 +11,9 @@ residual hooks, and every per-layer metric.
 4. Phases, per layer (layers never mixed):
    - prompt   = last prompt position (the state that emits the first answer token)
    - response = positions whose input token is a generated non-stop token
+   An empty response (the first generated token is a stop token) is a valid
+   sample: prompt-phase features are computed, response-phase ones are NaN
+   by design, and ``empty_response`` is set.
    E and H_bar are averaged over response positions; JS, Hellinger^2 and
    top-k Jaccard compare the AVERAGED response distribution with the prompt
    one. Variant ``first`` uses the first response position instead of the
@@ -37,15 +40,16 @@ FEATURES = (
     "margin_prompt", "margin_resp",
 )
 VARIANTS = ("mean", "first")
+# Features that depend on the response phase: NaN by design for an empty response.
+RESPONSE_FEATURES = frozenset({
+    "energy_resp", "delta_energy", "norm_entropy_resp", "delta_norm_entropy",
+    "js", "hellinger_sq", "jaccard_topk", "margin_resp",
+})
 FP16_MAX = float(np.finfo(np.float16).max)
 
 
-class EmptyResponseError(RuntimeError):
-    """The model produced no non-stop token: response features are undefined."""
-
-
 class NonFiniteError(RuntimeError):
-    pass
+    """A NaN/inf where none is expected: a real failure."""
 
 
 # ----------------------------------------------------------------------
@@ -99,6 +103,10 @@ class ForwardTrace:
         return len(self.prompt.input_ids)
 
     @property
+    def empty_response(self) -> bool:
+        return not self.response_positions
+
+    @property
     def roles(self) -> list[int]:
         stops = set() if self.stop_token_id is None else {self.stop_token_id}
         gen_roles = [ROLE_TEMPLATE if t in stops else ROLE_RESPONSE for t in self.gen_ids]
@@ -120,7 +128,7 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     )
     gen = out.sequences[0, n:].tolist()
     if not gen:
-        raise EmptyResponseError("generation returned no tokens")
+        raise RuntimeError("generation returned no tokens")
     logits = torch.stack(out.logits, dim=0)[:, 0, :].float()   # [T_g, V]
     del out
     logp = torch.log_softmax(logits, dim=-1)
@@ -134,8 +142,6 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     stop_id = gen[-1] if gen[-1] in stops else None
     truncated = len(gen) >= max_new and stop_id is None
     resp_pos = [n + j for j, t in enumerate(gen) if t not in stops]
-    if not resp_pos:
-        raise EmptyResponseError("the response consists only of stop tokens")
 
     full = torch.tensor([prompt.input_ids + gen], device=dev)
     hooks.x = {}
@@ -179,7 +185,7 @@ class ItemResult:
 
 def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
     x_hat = metrics.rms_normalise(x.to(bank.device), eps)
-    return x_hat, metrics.cosine_scores(x_hat, bank.rows[l])
+    return x_hat, bank.scores(l, x_hat)
 
 
 def _phase_features(s_sel: torch.Tensor, m_sel: torch.Tensor, beta: float, k: int,
@@ -188,6 +194,9 @@ def _phase_features(s_sel: torch.Tensor, m_sel: torch.Tensor, beta: float, k: in
     logp = metrics.log_distribution(s_sel, beta)
     e = metrics.energy(s_sel, beta)
     h = metrics.norm_entropy(logp)
+    if s_sel.shape[0] == 1:   # empty response: response phase undefined
+        nan = torch.full((), float("nan"), device=s_sel.device)
+        return [e[0], nan, nan, h[0], nan, nan, nan, nan, nan, m_sel[0], nan]
     p = logp.exp()
     if variant == "mean":
         e_r, h_r, m_r = e[1:].mean(), h[1:].mean(), m_sel[1:].mean()
@@ -234,15 +243,16 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         margin_tr[l] = m_all.cpu()
         del x_hat, s
 
+    empty = trace.empty_response
     hp, hr = [], []
-    last_resp = trace.response_positions[-1]
     for l in hidden_layers:
         x = trace.residuals[l].float()
         hp.append(x[trace.n_prompt - 1].cpu())
-        hr.append(x[last_resp].cpu())
+        hr.append(x[trace.response_positions[-1]].cpu() if not empty
+                  else torch.full((dims.d_model,), float("nan")))
     hidden_p = torch.stack(hp).numpy()
     hidden_r = torch.stack(hr).numpy()
-    if max(np.abs(hidden_p).max(), np.abs(hidden_r).max()) > FP16_MAX:
+    if np.nanmax(np.abs(np.concatenate([hidden_p, hidden_r]))) > FP16_MAX:
         raise NonFiniteError("residual exceeds the float16 range")
 
     out = {
@@ -250,6 +260,9 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "norm_entropy": entropy_tr.numpy(), "margin": margin_tr.numpy(),
     }
     for name, arr in out.items():
+        if name == "features" and empty:
+            prompt_cols = [i for i, f in enumerate(FEATURES) if f not in RESPONSE_FEATURES]
+            arr = arr[..., prompt_cols]
         if not np.isfinite(arr).all():
             raise NonFiniteError(f"non-finite values in {name}")
 
@@ -266,6 +279,7 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "n_prompt_tokens": trace.n_prompt,
         "n_generated_tokens": len(gen),
         "n_response_tokens": len(resp_j),
+        "empty_response": empty,
         "truncated": bool(trace.truncated),
         "stop_token_id": trace.stop_token_id,
         "token_logprobs": trace.token_logprobs.tolist(),
@@ -275,12 +289,14 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "xhat_norm_max_rel_dev": float(max_dev),
     }
     lp = trace.token_logprobs[resp_j]
-    baselines = {
+    nan = float("nan")
+    baselines = {   # over response tokens; NaN for an empty response
         "id": item_id,
-        "mean_logprob": float(lp.mean()),
-        "min_logprob": float(lp.min()),
-        "mean_token_entropy": float(trace.token_entropies[resp_j].mean()),
+        "mean_logprob": float(lp.mean()) if not empty else nan,
+        "min_logprob": float(lp.min()) if not empty else nan,
+        "mean_token_entropy": float(trace.token_entropies[resp_j].mean()) if not empty else nan,
         "n_response_tokens": len(resp_j),
+        "empty_response": empty,
     }
     return ItemResult(
         item_id=item_id, answer=answer, baselines=baselines, betas=betas,

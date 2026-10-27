@@ -35,13 +35,13 @@ def test_gamma_folded_bank_reproduces_gate_preactivation(pair):
     xs, gates = _capture(model, ids)
     for l in range(dims.n_layers):
         x_hat = metrics.rms_normalise(xs[l], dims.rms_norm_eps)
-        s = metrics.cosine_scores(x_hat, bank.rows[l])
+        s = bank.scores(l, x_hat)
         recon = bank.row_norms[l] * math.sqrt(dims.d_model) * s
         np.testing.assert_allclose(recon.numpy(), gates[l].numpy(), rtol=1e-4, atol=1e-5)
         assert s.abs().max() <= 1.0 + 1e-5
 
 
-def test_bank_definition(pair):
+def test_bank_definition_without_materialising_it(pair):
     model, _ = pair
     dims = model_dims(model)
     bank = build_bank(model, dims)
@@ -49,12 +49,29 @@ def test_bank_definition(pair):
         w_g = layer.mlp.gate_proj.weight.float()
         gamma = layer.post_attention_layernorm.weight.float()
         assert not torch.allclose(gamma, torch.ones_like(gamma))
-        assert bank.rows[l].shape == (dims.d_ff, dims.d_model)
-        assert bank.rows[l].dtype == torch.float32
-        np.testing.assert_allclose(bank.rows[l].norm(dim=1).numpy(), 1.0, atol=1e-6)
+        assert bank.gate_weights[l] is layer.mlp.gate_proj.weight   # no copy kept
+        assert bank.row_norms[l].shape == (dims.d_ff,) and bank.row_norms[l].dtype == torch.float32
         np.testing.assert_allclose(bank.row_norms[l].numpy(),
                                    (w_g * gamma).norm(dim=1).numpy(), rtol=1e-6)
         np.testing.assert_array_equal(bank.gamma[l].numpy(), gamma.numpy())
+
+
+def test_scores_match_precomputed_bank(pair):
+    """On-the-fly scores == (unit rows of W_g*gamma) @ x_hat / sqrt(D), and are cosines."""
+    model, _ = pair
+    dims = model_dims(model)
+    bank = build_bank(model, dims)
+    x_hat = metrics.rms_normalise(torch.randn(9, dims.d_model) * 3, dims.rms_norm_eps)
+    for l, layer in enumerate(model.model.layers):
+        w_tilde = layer.mlp.gate_proj.weight.float() * layer.post_attention_layernorm.weight.float()
+        rows = w_tilde / w_tilde.norm(dim=1, keepdim=True)
+        ref = x_hat @ rows.T / math.sqrt(dims.d_model)
+        s = bank.scores(l, x_hat)
+        assert s.dtype == torch.float32
+        np.testing.assert_allclose(s.numpy(), ref.numpy(), rtol=1e-5, atol=1e-6)
+        cos = torch.nn.functional.cosine_similarity(x_hat[:, None, :], rows[None], dim=-1)
+        np.testing.assert_allclose(s.numpy(), cos.numpy(), atol=1e-3)  # ||x_hat|| ~ sqrt(D)
+        assert s.abs().max() <= 1.0 + 1e-5
 
 
 def test_dims_come_from_model_config(pair):

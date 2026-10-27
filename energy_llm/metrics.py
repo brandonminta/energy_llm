@@ -4,7 +4,7 @@ Per layer and token, with x the residual at the input of
 post_attention_layernorm and the unit-row bank of :mod:`energy_llm.bank`:
 
     x_hat  = x / sqrt(mean(x^2) + eps)
-    s      = (bank @ x_hat) / sqrt(D)          cosines in [-1, 1]
+    s      = (bank @ x_hat) / sqrt(D)          cosines in [-1, 1]  (computed in bank.Bank.scores)
     p      = softmax(beta * s)
     E      = -(1/beta) * logsumexp(beta * s)   (1/2 ||x_hat||^2 ~ D/2 is constant, omitted)
     H_bar  = H(p) / log(D_ff)
@@ -26,12 +26,6 @@ LN2 = math.log(2.0)
 def rms_normalise(x: torch.Tensor, eps: float) -> torch.Tensor:
     x = x.float()
     return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-
-
-def cosine_scores(x_hat: torch.Tensor, bank_rows: torch.Tensor) -> torch.Tensor:
-    """[T, D] x [D_ff, D] -> [T, D_ff]."""
-    d = x_hat.shape[-1]
-    return (x_hat.float() @ bank_rows.T) / math.sqrt(d)
 
 
 def energy(s: torch.Tensor, beta: float) -> torch.Tensor:

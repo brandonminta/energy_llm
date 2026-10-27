@@ -1,25 +1,32 @@
-"""Memory bank, built once per layer.
+"""Memory bank, defined per layer as
 
     W_g      = gate_proj.weight                     [D_ff, D]
     gamma    = post_attention_layernorm.weight      [D]
     W_tilde  = W_g * gamma   (column j scaled by gamma_j)
     bank     = rows of W_tilde normalised to unit norm
 
-With x_hat = x / sqrt(mean(x^2) + eps), the model's gate pre-activation is
-g_i = w_i . (gamma * x_hat) = w_tilde_i . x_hat, so with the cosine scores
-s_i = (bank_i . x_hat) / sqrt(D) we have g_i = ||w_tilde_i|| * sqrt(D) * s_i
-exactly (up to the eps in ||x_hat||). Everything is float32.
+The bank is NEVER materialised: only gamma and the row norms ||w_tilde_i||
+(one D_ff vector per layer) are kept, and the cosine scores are computed as
+
+    s = (W_g.float() @ (gamma * x_hat)) / (||w_tilde|| * sqrt(D))
+
+converting only the current layer's W_g to float32 and freeing it right
+after. This is algebraically identical to (bank @ x_hat) / sqrt(D), and the
+model's gate pre-activation is g_i = w_i . (gamma * x_hat) = ||w_tilde_i|| *
+sqrt(D) * s_i. Everything is float32.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from energy_llm.model import ModelDims, decoder_layers
 from energy_llm.storage import atomic_path
@@ -29,10 +36,21 @@ log = logging.getLogger("energy_llm.bank")
 
 @dataclass
 class Bank:
-    rows: list[torch.Tensor]       # per layer [D_ff, D] float32, unit-norm rows
-    gamma: list[torch.Tensor]      # per layer [D] float32 (diagnostic)
-    row_norms: list[torch.Tensor]  # per layer [D_ff] float32, ||w_tilde_i|| (diagnostic)
-    device: torch.device
+    gate_weights: list[nn.Parameter]   # per layer W_g, model dtype, on the model device (not copied)
+    gamma: list[torch.Tensor]          # per layer [D] float32, model device
+    row_norms: list[torch.Tensor]      # per layer [D_ff] float32, ||w_tilde_i||, model device
+    d_model: int
+
+    @property
+    def device(self) -> torch.device:
+        return self.gamma[0].device
+
+    def scores(self, l: int, x_hat: torch.Tensor) -> torch.Tensor:
+        """Cosine scores [T, D_ff] for float32 x_hat [T, D] at layer l."""
+        w = self.gate_weights[l].detach().float()          # transient [D_ff, D]
+        s = (x_hat * self.gamma[l]) @ w.T
+        del w
+        return s / (self.row_norms[l] * math.sqrt(self.d_model))
 
     def fingerprint(self) -> str:
         """sha256 over gamma and row norms: identifies the exact weights."""
@@ -42,44 +60,22 @@ class Bank:
             h.update(n.cpu().numpy().astype(np.float32).tobytes())
         return h.hexdigest()
 
-    def nbytes(self) -> int:
-        return sum(r.numel() * 4 for r in self.rows)
-
 
 @torch.no_grad()
 def build_bank(model, dims: ModelDims) -> Bank:
-    rows, gammas, norms = [], [], []
+    weights, gammas, norms = [], [], []
     for layer in decoder_layers(model):
-        w_g = layer.mlp.gate_proj.weight.detach().to("cpu", torch.float32)
-        gamma = layer.post_attention_layernorm.weight.detach().to("cpu", torch.float32)
-        w_tilde = w_g * gamma.unsqueeze(0)
+        w_g = layer.mlp.gate_proj.weight
+        gamma = layer.post_attention_layernorm.weight.detach().float()
+        w_tilde = w_g.detach().float() * gamma.unsqueeze(0)      # transient, one layer
         n = torch.linalg.vector_norm(w_tilde, dim=1)
+        del w_tilde
         if not torch.all(n > 0):
             raise ValueError("bank has an all-zero row")
-        rows.append(w_tilde / n.unsqueeze(1))
+        weights.append(w_g)
         gammas.append(gamma)
         norms.append(n)
-    return Bank(rows=rows, gamma=gammas, row_norms=norms, device=torch.device("cpu"))
-
-
-def place_bank(bank: Bank, requested: str, model_device: torch.device) -> Bank:
-    """Move the bank rows to the matmul device. ``auto`` uses the GPU only
-    when the rows fit with 2 GiB to spare (they do not on a 10 GB MIG slice
-    next to a 3B bf16 model), otherwise the CPU. Precision is float32 either way."""
-    target = requested
-    if requested == "auto":
-        target = "cpu"
-        if model_device.type == "cuda":
-            free, _ = torch.cuda.mem_get_info(model_device)
-            if free > bank.nbytes() + (2 << 30):
-                target = "cuda"
-    if target == "cuda" and model_device.type != "cuda":
-        raise RuntimeError("bank_device=cuda but the model is not on a GPU")
-    device = model_device if target == "cuda" else torch.device("cpu")
-    log.info("bank on %s (%.2f GB float32)", device, bank.nbytes() / 1e9)
-    bank.rows = [r.to(device) for r in bank.rows]
-    bank.device = device
-    return bank
+    return Bank(gate_weights=weights, gamma=gammas, row_norms=norms, d_model=dims.d_model)
 
 
 def write_bank_h5(path: str | Path, bank: Bank, attrs: dict) -> None:

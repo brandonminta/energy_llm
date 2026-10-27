@@ -197,3 +197,37 @@ def test_cli_extract_skips_finished_shard_without_loading_model(calibrated, tmp_
     code = cli_main(["extract", "--config", str(cfg_path), "--input", str(ev),
                      "--name", "k", "--shard-index", "2"])
     assert code == 0 and '"skipped_model_load": true' in capsys.readouterr().out
+
+
+def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
+    from energy_llm.capture import ResidualHooks, forward_item
+    from energy_llm.prompting import build_prompt
+
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    hooks = ResidualHooks(bundle.model)
+    first = forward_item(bundle, hooks, build_prompt(
+        bundle.tokenizer, cfg.prompt.system, items[0].question, None)).gen_ids[0]
+    hooks.remove()
+    stops = sorted(set(bundle.stop_token_ids) | {first})     # items[0] now stops at once
+    bundle.stop_token_ids = stops
+    bundle.generation_config.eos_token_id = stops
+
+    _, reports = _run_all(cfg, bundle, ev, "empty")
+    assert all(r["state"] == "done" for r in reports)
+    for k in range(len(reports)):
+        assert read_jsonl(shard_path(cfg.extraction_dir("empty"), k) / "failed.jsonl") == []
+    m = run_merge(cfg, items, ev, "empty")
+    assert m["exhausted_ids"] == {} and m["counts"]["completed"] == len(items)
+    assert m["checks"]["n_empty_response"] >= 1
+    d = cfg.extraction_dir("empty")
+    ans = pd.read_parquet(d / "answers.parquet").set_index("id")
+    assert ans.loc[items[0].id, "empty_response"] and ans.loc[items[0].id, "n_response_tokens"] == 0
+    feats = pd.read_parquet(d / "features.parquet")
+    f0 = feats[feats["id"] == items[0].id]
+    assert f0["empty_response"].all()
+    assert f0["energy_resp"].isna().all() and f0["js"].isna().all()
+    assert f0["energy_prompt"].notna().all() and f0["margin_prompt"].notna().all()
+    others = feats[~feats["empty_response"]]
+    assert others.drop(columns=["empty_response"]).notna().all().all()
+

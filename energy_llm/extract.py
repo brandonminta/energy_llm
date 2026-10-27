@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from energy_llm import manifest
-from energy_llm.bank import build_bank, place_bank, read_bank_fingerprint
+from energy_llm.bank import build_bank, read_bank_fingerprint
 from energy_llm.capture import ItemResult, ResidualHooks, compute_item, forward_item
 from energy_llm.config import RunConfig
 from energy_llm.model import ModelBundle
@@ -168,6 +168,8 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
     ``compute`` exist for tests (simulated interruption / failures)."""
     stopper = stopper or GracefulStop(install=False)
     started = time.time()
+    if bundle.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(bundle.device)
     ext_dir = cfg.extraction_dir(name)
     shards = plan_shards(items, cfg.extraction.samples_per_shard)
     if not 0 <= shard_index < len(shards):
@@ -200,7 +202,6 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
         if bank.fingerprint() != beta_rec["bank_fingerprint"] or \
                 read_bank_fingerprint(cfg.bank_h5_path) != bank.fingerprint():
             raise RuntimeError("model weights differ from the calibrated bank")
-        place_bank(bank, cfg.extraction.bank_device, bundle.device)
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
         mult = list(cfg.extraction.beta_multipliers)
         hooks = ResidualHooks(bundle.model)
@@ -250,6 +251,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
         "model_load_s": model_load_s,
         "sec_per_item": round(items_s / (n_done + n_failed), 3) if n_done + n_failed else None,
         "model_dtype": bundle.dtype,
+        "peak_gpu_mem_gb": manifest.peak_gpu_memory_gb(bundle.device),
         "hardware": manifest.hardware(),
         "code": manifest.code_version(),
     })

@@ -65,7 +65,6 @@ class ExtractionConfig:
     hidden_layers: str | list[int] = "all"
     samples_per_shard: int = 1000
     max_attempts: int = 3
-    bank_device: str = "auto"        # auto | cuda | cpu (cpu for small MIG slices)
 
 
 @dataclass
@@ -169,8 +168,6 @@ class RunConfig:
             raise ConfigError("extraction.hidden_layers must be 'all' or a list of ints")
         if e.samples_per_shard < 1 or e.max_attempts < 1:
             raise ConfigError("samples_per_shard and max_attempts must be >= 1")
-        if e.bank_device not in ("auto", "cuda", "cpu"):
-            raise ConfigError("extraction.bank_device must be auto|cuda|cpu")
         return self
 
     @classmethod

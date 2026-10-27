@@ -31,4 +31,3 @@ extraction:
   hidden_layers: all                  # residuals saved in float16 for the probe
   samples_per_shard: 1000             # see README "Shard sizing"
   max_attempts: 3                     # per id, across runs
-  bank_device: auto                   # cpu on a 10 GB MIG slice

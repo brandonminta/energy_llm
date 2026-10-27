@@ -112,29 +112,6 @@ def make_questions(n: int, words: list[str], seed: int) -> list[str]:
     return [" ".join(rng.sample(words, rng.randint(4, 7))) for _ in range(n)]
 
 
-def answerable_questions(bundle, n: int, words: list[str], seed: int) -> list[str]:
-    """Questions for which the tiny model produces a non-empty response (an
-    immediate stop token is a legitimate extraction failure, tested apart)."""
-    from energy_llm.capture import EmptyResponseError, ResidualHooks, forward_item
-    from energy_llm.prompting import build_prompt
-
-    hooks = ResidualHooks(bundle.model)
-    out = []
-    try:
-        for q in make_questions(10 * n, words, seed):
-            try:
-                forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, q, None))
-            except EmptyResponseError:
-                continue
-            if q not in out:
-                out.append(q)
-            if len(out) == n:
-                return out
-    finally:
-        hooks.remove()
-    raise AssertionError("not enough answerable questions")
-
-
 def write_jsonl(path: Path, questions: list[str], prefix: str, extra: bool = True) -> Path:
     with open(path, "w") as fh:
         for i, q in enumerate(questions):
@@ -156,7 +133,7 @@ def make_cfg(out_dir: Path, arch: str = "qwen2", **extraction):
         "calibration": {"target_norm_entropy": 0.55, "log10_beta_min": -1.0,
                         "log10_beta_max": 4.0, "num_grid": 51},
         "extraction": {"jaccard_top_k": 8, "samples_per_shard": 3, "max_attempts": 3,
-                       "bank_device": "cpu"} | extraction,
+                       } | extraction,
     }
     return RunConfig.from_dict(raw)
 
@@ -170,10 +147,8 @@ def calibrated(tmp_path, qwen_pair):
     model, tok = qwen_pair
     bundle = make_bundle(model, tok)
     cfg = make_cfg(tmp_path / "run")
-    warm = write_jsonl(tmp_path / "warmup.jsonl",
-                       answerable_questions(bundle, 4, WARMUP_WORDS, 1), "warm")
+    warm = write_jsonl(tmp_path / "warmup.jsonl", make_questions(4, WARMUP_WORDS, 1), "warm")
     rec = run_calibrate(cfg, bundle, read_items(warm), warm)
     assert rec is not None
-    ev = write_jsonl(tmp_path / "eval.jsonl",
-                     answerable_questions(bundle, 7, QUESTION_WORDS, 2), "q")
+    ev = write_jsonl(tmp_path / "eval.jsonl", make_questions(7, QUESTION_WORDS, 2), "q")
     return cfg, bundle, ev, rec

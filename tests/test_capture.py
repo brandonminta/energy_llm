@@ -8,7 +8,7 @@ from scipy.special import logsumexp
 from energy_llm import capture, metrics
 from energy_llm.bank import build_bank
 from energy_llm.capture import (
-    FEATURES, EmptyResponseError, NonFiniteError, ResidualHooks, compute_item, forward_item,
+    FEATURES, RESPONSE_FEATURES, NonFiniteError, ResidualHooks, compute_item, forward_item,
 )
 from energy_llm.prompting import (
     ROLE_INSTRUCTION, ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, PromptError,
@@ -77,10 +77,7 @@ def test_teacher_forcing_reproduces_greedy(pair, seed):
     bundle = make_bundle(*pair, max_new_tokens=10)
     checked = 0
     for q in make_questions(4, QUESTION_WORDS, seed):
-        try:
-            tr = _trace(bundle, q)
-        except EmptyResponseError:
-            continue
+        tr = _trace(bundle, q)
         checked += 1
         assert tr.tf_mismatch_positions == []
         # and greedy equals an explicit argmax loop without any logits processor
@@ -90,7 +87,7 @@ def test_teacher_forcing_reproduces_greedy(pair, seed):
                 nxt = bundle.model(input_ids=torch.tensor([ids])).logits[0, -1].argmax().item()
             assert nxt == t
             ids.append(t)
-    assert checked >= 2
+    assert checked == 4
 
 
 def test_residual_hook_reads_norm_input(qwen_pair):
@@ -136,12 +133,27 @@ def test_every_stop_token_is_excluded(pair):
     assert tr.roles.count(ROLE_RESPONSE) == first
 
 
-def test_empty_response_is_an_error(qwen_pair):
-    bundle = make_bundle(*qwen_pair)
+def test_empty_response_is_a_valid_sample(pair):
+    bundle = make_bundle(*pair)
+    bank = build_bank(bundle.model, bundle.dims)
     first = _trace(bundle).gen_ids[0]
-    _set_stops(bundle, set(bundle.stop_token_ids) | {first})
-    with pytest.raises(EmptyResponseError):
-        _trace(bundle)
+    _set_stops(bundle, set(bundle.stop_token_ids) | {first})   # the model stops at once
+    tr = _trace(bundle)
+    assert tr.empty_response and tr.gen_ids == [first] and not tr.truncated
+    res = compute_item(bundle, bank, tr, "e", 5.0, [0.5, 1.0, 2.0], 8,
+                       list(range(bundle.dims.n_layers)))
+    assert res.answer["empty_response"] and res.answer["n_response_tokens"] == 0
+    assert res.answer["response"] == ""
+    for i, name in enumerate(FEATURES):
+        col = res.features[..., i]
+        if name in RESPONSE_FEATURES:
+            assert np.isnan(col).all(), name
+        else:
+            assert np.isfinite(col).all(), name
+    assert np.isfinite(res.energy).all() and np.isfinite(res.norm_entropy).all()
+    assert np.isnan(res.hidden_response_last).all()
+    assert np.isfinite(res.hidden_prompt_last).all()
+    assert res.baselines["empty_response"] and np.isnan(res.baselines["mean_logprob"])
 
 
 # ------------------------------------------------------------ item metrics

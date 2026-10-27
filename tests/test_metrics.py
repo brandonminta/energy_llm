@@ -32,15 +32,6 @@ def test_xhat_norm(scale):
         np.testing.assert_allclose(x_hat.norm(dim=-1).numpy(), math.sqrt(d), rtol=1e-5)
 
 
-def test_scores_are_cosines():
-    bank = torch.nn.functional.normalize(torch.randn(K, 64), dim=1)
-    x_hat = metrics.rms_normalise(torch.randn(10, 64), 1e-6)
-    s = metrics.cosine_scores(x_hat, bank)
-    assert s.abs().max() <= 1.0 + 1e-5
-    ref = torch.nn.functional.cosine_similarity(x_hat[:, None, :], bank[None], dim=-1)
-    np.testing.assert_allclose(s.numpy(), ref.numpy(), atol=1e-5)
-
-
 @pytest.mark.parametrize("beta", [1e-3, 1.0, 50.0, 1e4])
 def test_distribution_sums_to_one_and_entropy_bounded(beta):
     _, s = _dist(0)

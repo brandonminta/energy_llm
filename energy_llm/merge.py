@@ -74,8 +74,8 @@ def status_report(cfg: RunConfig, items: list[Item], name: str, input_path: str 
     return report
 
 
-def _features_long(ids: list[str], feats: list[np.ndarray], betas: np.ndarray,
-                   mult: np.ndarray):
+def _features_long(ids: list[str], empty: list[bool], feats: list[np.ndarray],
+                   betas: np.ndarray, mult: np.ndarray):
     import pandas as pd
 
     L, nb, nv, nf = feats[0].shape
@@ -83,8 +83,9 @@ def _features_long(ids: list[str], feats: list[np.ndarray], betas: np.ndarray,
     li, bi, vi = li.ravel(), bi.ravel(), vi.ravel()
     n = len(li)
     frames = []
-    for item_id, arr in zip(ids, feats):
+    for item_id, is_empty, arr in zip(ids, empty, feats):
         df = pd.DataFrame(arr.reshape(n, nf), columns=list(FEATURES))
+        df.insert(0, "empty_response", bool(is_empty))
         df.insert(0, "variant", np.asarray(VARIANTS)[vi])
         df.insert(0, "beta_multiplier", mult[bi])
         df.insert(0, "beta", betas[bi])
@@ -147,7 +148,9 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
     _write_parquet(pd.DataFrame(answers), ext_dir / "answers.parquet")
     _write_parquet(pd.DataFrame(baselines), ext_dir / "baselines.parquet")
     if feats:
-        _write_parquet(_features_long(order, feats, betas, mult), ext_dir / "features.parquet")
+        empty = [a["empty_response"] for a in answers]
+        _write_parquet(_features_long(order, empty, feats, betas, mult),
+                       ext_dir / "features.parquet")
     with atomic_path(ext_dir / "bank.h5") as tmp:
         shutil.copyfile(cfg.bank_h5_path, tmp)
 
@@ -156,6 +159,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
         for r in read_jsonl(shard_path(ext_dir, st.index) / "runs.jsonl"):
             runs.append({k: r.get(k) for k in ("shard_index", "started", "elapsed_s",
                                                "model_load_s", "sec_per_item", "model_dtype",
+                                               "peak_gpu_mem_gb",
                                                "n_done_this_run", "n_failed_this_run",
                                                "stopped_by_signal", "hardware", "code")})
     dtypes = sorted({r["model_dtype"] for r in runs if r.get("model_dtype")})
@@ -178,6 +182,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             "xhat_norm_max_rel_dev": max((a["xhat_norm_max_rel_dev"] for a in answers), default=None),
             "tf_mismatch_ids": [a["id"] for a in answers if a["tf_mismatch_count"]],
             "n_truncated": sum(bool(a["truncated"]) for a in answers),
+            "n_empty_response": sum(bool(a["empty_response"]) for a in answers),
         },
         "model_dtype": dtypes,
         "features": list(FEATURES),

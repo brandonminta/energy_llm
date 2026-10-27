@@ -49,11 +49,15 @@ energy_llm/            the package (CLI: energy-llm / python -m energy_llm)
   extract.py           sharded, resumable runner
   merge.py             final files + manifest; shard status
   smoke.py             extract + merge on N questions in one process, summary
+  verify.py            verification only: checks vs the model and dev/reference.py
+  inspection.py        verification only: position/phase table of one id
   signals.py storage.py manifest.py
 configs/               qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
 hpc/                   env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
-                       merge, smoke), missing_shards.sh
+                       merge, smoke, verify), missing_shards.sh, RUNBOOK.md
 tests/                 CPU-only, tiny random Qwen2 + Llama models
+dev/                   verification only, never for the paper: dev questions, warm-up,
+                       naive float64 reference implementation (reference.py)
 docs/                  thesis .tex (unchanged) + MAPPING.md
 downstream/            NOT part of the module: labelling, probes, stats, notebooks
 ```
@@ -116,6 +120,44 @@ python -m energy_llm status    --config C --input eval.jsonl --name N [--missing
 python -m energy_llm merge     --config C --input eval.jsonl --name N [--allow-incomplete]
 python -m energy_llm smoke     --config C --input eval.jsonl [--n 20]
 ```
+
+## Verification (before fixing datasets or parameters)
+
+The cluster sequence is in [`hpc/RUNBOOK.md`](hpc/RUNBOOK.md): environment,
+real tokenizers, calibrate on `dev/dev_warmup.jsonl`, verify, smoke, manual
+inspection, requeue test. The β\* from the dev warm-up set is for
+verification only; the definitive calibration comes once datasets are fixed.
+
+```bash
+python -m energy_llm verify  --config C --input dev/dev_questions.jsonl [--n 4] \
+                             [--reference-n 2] [--reference-layers 0,18,35]
+python -m energy_llm inspect --run <extraction_dir> --id dev-known-01
+hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 min walltime
+```
+
+`verify` runs the production extract + merge on the first N questions into
+`extract/verify-<time>/` and prints PASS/FAIL per check with the maximum
+observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`):
+
+| check | what it compares |
+|---|---|
+| `reference` | production vs `dev/reference.py` (naive float64, explicit loops, no `energy_llm` code); tolerances from first-order Lipschitz bounds on the observed score error |
+| `gate` | real `gate_proj` output vs `‖w̃_i‖·√D·s_i` (tolerance 4·u of the model dtype), with a no-γ negative control that must exceed 10× the tolerance |
+| `tf_vs_cache` | residual x in the teacher-forced pass vs x during cached token-by-token generation (bf16 tolerance provisional) |
+| `alignment` | the last prompt position emits the first generated token (TF and generation logits); response positions = generated non-stop tokens; role mask |
+| `hidden`, `files_vs_memory`, `determinism` | hidden.h5 is the x the metrics read; stored files equal an in-memory recomputation (bit-exact on CPU) |
+| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariance to permuting memories; β→0 / β→∞ limits; H̄ non-increasing in β; JS(p,p)=Hel²(p,p)=0; H̄(β\*) on the warm-up set inside the calibration bracket |
+
+`inspect` reads a finished extraction (no model) and prints each position
+(token, role, prompt/response phase) and, per layer, E, H̄ and margin of each
+phase at β\*, cross-checked against `features.parquet`.
+
+**Bug found by the reference:** at large β (cosine scores give β\* in the
+hundreds or more) float32 probabilities underflow, which made the old
+`js_divergence` hit its log 2 clamp (0.693 instead of 0.681 in the
+regression test) and made top-k Jaccard rank arbitrary zeros. JS,
+Hellinger², Jaccard and the mean response distribution are now computed
+from log-probabilities.
 
 ### Robustness
 

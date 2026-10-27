@@ -54,6 +54,24 @@
 | Missing-shard report | `merge.status_report`; `hpc/missing_shards.sh` | `energy-llm status` |
 | Orphaned-merge recovery | `hpc/missing_shards.sh --resubmit`, `hpc/env.sh:record_submission` | `<extraction_dir>/submissions.log` |
 | Smoke test | `smoke.run_smoke`; `hpc/smoke.sbatch` | `energy-llm smoke`; `smoke_report.json` |
+| Divergences in the log domain (no float32 underflow at large β) | `metrics.log_mean_distribution`, `js_divergence`, `hellinger_sq`, `jaccard_topk` (take log-probabilities) | — |
+
+## Verification → code (not part of the production path)
+
+| Check (MAPPING item verified) | Implementation | Tolerance and justification |
+|---|---|---|
+| Independent float64 reference of every quantity | `dev/reference.py` (no `energy_llm` imports) | — |
+| Production == reference | `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); derived quantities by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2βδ, JS/Hel² 4βδ, Δ· twice; Jaccard 1/k; +1e-5 float32 reduction floor |
+| Read point + γ integration (gate reconstruction) | `verify.check_gate` | 4·u of the model dtype (three roundings in the model path), floor 1e-5; no-γ control must exceed 10× |
+| TF == cached generation, per position | `verify.check_tf_vs_cache` | fp32 1e-4; bf16 5e-2 **provisional, empirical** (tokens must agree) |
+| Position alignment | `verify.run_verify` (alignment) | exact (booleans) |
+| hidden.h5 / traces / features coherence | `verify.run_verify` (hidden, files_vs_memory) | exact on CPU, 1e-5 on GPU |
+| Permutation invariance | `verify.PermutedBank`; `tests/test_invariance.py` | 1e-5 (float32 summation order) |
+| β limits, monotonicity, self-divergence | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰; JS(p,p) ≤ 1e-7 (one rounding in logaddexp) |
+| Calibration reproduces H* | `verify._calibration_check` | H̄ monotone ⇒ H̄(β*) must lie between the two bracketing grid values |
+| Determinism | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, 1e-5 on GPU |
+| Manual review | `inspection.inspect_item` (`energy-llm inspect`) | — |
+| Cluster sequence | `hpc/RUNBOOK.md`, `hpc/verify.sbatch` | — |
 
 ## Implementation notes
 

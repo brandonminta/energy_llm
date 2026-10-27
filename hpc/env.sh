@@ -30,6 +30,7 @@ TIME_EXTRACT="${TIME_EXTRACT:-03:00:00}"
 MEM_CALIBRATE="${MEM_CALIBRATE:-80G}"
 TIME_CALIBRATE="${TIME_CALIBRATE:-06:00:00}"
 TIME_SMOKE="${TIME_SMOKE:-00:30:00}"     # smoke test: short walltime
+TIME_VERIFY="${TIME_VERIFY:-00:45:00}"   # verify: float64 reference loops are slow on purpose
 
 # ---- CPU job (merge) -----------------------------------------------------
 PARTITION_CPU="${PARTITION_CPU:-cpu}"

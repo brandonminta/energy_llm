@@ -4,6 +4,7 @@
 #
 #   hpc/submit.sh calibrate <config.yaml> <warmup.jsonl>
 #   hpc/submit.sh smoke     <config.yaml> <input.jsonl> [N]
+#   hpc/submit.sh verify    <config.yaml> <input.jsonl> [N]
 #   hpc/submit.sh extract   <config.yaml> <input.jsonl> <name> [--only-missing]
 #
 # AFTER=<jobid> adds --dependency=afterok:<jobid> to the extraction array
@@ -16,7 +17,7 @@ activate_env
 mkdir -p logs
 mapfile -t ACCT < <(account_args)
 
-MODE="${1:?usage: submit.sh calibrate|smoke|extract ...}"; shift
+MODE="${1:?usage: submit.sh calibrate|smoke|verify|extract ...}"; shift
 case "$MODE" in
 calibrate)
     CONFIG="${1:?config}"; WARMUP="${2:?warmup.jsonl}"
@@ -31,6 +32,13 @@ smoke)
           --cpus-per-task="$CPUS_GPU" --mem="$MEM_EXTRACT" --time="$TIME_SMOKE" \
           hpc/smoke.sbatch "$CONFIG" "$INPUT" "$N")
     echo "smoke -> job $JOB (logs/smoke_$JOB.out)"
+    ;;
+verify)
+    CONFIG="${1:?config}"; INPUT="${2:?input.jsonl}"; N="${3:-4}"
+    JOB=$(sbatch --parsable "${ACCT[@]}" --partition="$PARTITION_GPU" --gres="$GRES" \
+          --cpus-per-task="$CPUS_GPU" --mem="$MEM_EXTRACT" --time="$TIME_VERIFY" \
+          hpc/verify.sbatch "$CONFIG" "$INPUT" "$N")
+    echo "verify -> job $JOB (logs/verify_$JOB.out)"
     ;;
 extract)
     CONFIG="${1:?config}"; INPUT="${2:?input.jsonl}"; NAME="${3:?name}"

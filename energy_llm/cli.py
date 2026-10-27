@@ -1,4 +1,6 @@
-"""Single entry point: ``energy-llm {calibrate,extract,merge,status,smoke}``.
+"""Single entry point: ``energy-llm {calibrate,extract,merge,status,smoke}``,
+plus the verification-only ``verify`` and ``inspect`` (they never write into
+production extractions).
 
 Exit codes: 0 = finished; 75 = work remains (interrupted by SIGUSR1/SIGTERM
 or failed ids still below max_attempts) — the batch script requeues on 75;
@@ -94,6 +96,24 @@ def cmd_smoke(args) -> int:
     return EXIT_DONE if s["n_failed"] == 0 and not s["stopped_by_signal"] else 1
 
 
+def cmd_verify(args) -> int:
+    from energy_llm.verify import format_report, run_verify
+
+    stopper = GracefulStop()
+    cfg, items, bundle, _ = _load(args, stopper)
+    layers = [int(x) for x in args.reference_layers.split(",")] if args.reference_layers else None
+    report = run_verify(cfg, bundle, items, n=args.n, ref_layers=layers, ref_n=args.reference_n)
+    print(format_report(report))
+    return EXIT_DONE if report["passed"] else 1
+
+
+def cmd_inspect(args) -> int:
+    from energy_llm.inspection import inspect_item
+
+    print(inspect_item(args.run, args.id))
+    return EXIT_DONE
+
+
 def _cfg_items(args):
     from energy_llm.config import load_config
     from energy_llm.storage import read_items
@@ -173,11 +193,23 @@ def main(argv: list[str] | None = None) -> int:
     common(sp, name=False)
     sp.add_argument("--n", type=int, default=20)
 
+    sp = sub.add_parser("verify", help="verification: checks vs the model and dev/reference.py")
+    common(sp, name=False)
+    sp.add_argument("--n", type=int, default=4, help="questions to verify (default 4)")
+    sp.add_argument("--reference-layers", default=None,
+                    help="comma-separated layers for the float64 reference (default 0,L/2,L-1)")
+    sp.add_argument("--reference-n", type=int, default=2,
+                    help="questions that go through the float64 reference (default 2)")
+    sp = sub.add_parser("inspect", help="print positions and per-layer phases of one id")
+    sp.add_argument("--run", required=True, help="extraction directory (with manifest.json)")
+    sp.add_argument("--id", required=True)
+
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return {"calibrate": cmd_calibrate, "extract": cmd_extract,
-            "merge": cmd_merge, "status": cmd_status, "smoke": cmd_smoke}[args.cmd](args)
+            "merge": cmd_merge, "status": cmd_status, "smoke": cmd_smoke,
+            "verify": cmd_verify, "inspect": cmd_inspect}[args.cmd](args)
 
 
 if __name__ == "__main__":

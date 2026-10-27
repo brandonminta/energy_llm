@@ -9,8 +9,6 @@ from __future__ import annotations
 import copy
 import datetime
 import json
-from pathlib import Path
-
 import numpy as np
 
 from energy_llm.config import RunConfig
@@ -21,22 +19,32 @@ from energy_llm.signals import GracefulStop
 from energy_llm.storage import Item, read_jsonl, write_json_atomic
 
 
-def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 20,
-              stopper: GracefulStop | None = None, model_load_s: float | None = None,
-              name: str | None = None) -> dict:
-    import pandas as pd
-
-    sel = items[:n]
-    name = name or "smoke-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
+def run_single_process(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], prefix: str,
+                       name: str | None = None, stopper: GracefulStop | None = None,
+                       model_load_s: float | None = None):
+    """The production extract + merge path on ``sel`` as one shard in this
+    process. Returns (cfg used, extraction dir, extract report, merge manifest)."""
+    name = name or prefix + "-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
     cfg = copy.deepcopy(cfg)
     cfg.extraction.samples_per_shard = len(sel)        # one shard, one process
     ext_dir = cfg.extraction_dir(name)
     ext_dir.mkdir(parents=True, exist_ok=True)
     inp = ext_dir / "input.jsonl"
     inp.write_text("".join(json.dumps({"id": it.id, "question": it.question}) + "\n" for it in sel))
-
     report = run_extract(cfg, bundle, sel, inp, name, 0, stopper=stopper, model_load_s=model_load_s)
     m = run_merge(cfg, sel, inp, name, allow_incomplete=True)
+    return cfg, ext_dir, report, m
+
+
+def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 20,
+              stopper: GracefulStop | None = None, model_load_s: float | None = None,
+              name: str | None = None) -> dict:
+    import pandas as pd
+
+    sel = items[:n]
+    cfg, ext_dir, report, m = run_single_process(cfg, bundle, sel, "smoke", name, stopper,
+                                                 model_load_s)
+    name = ext_dir.name
     run = read_jsonl(shard_path(ext_dir, 0) / "runs.jsonl")[-1]
     failed = read_jsonl(shard_path(ext_dir, 0) / "failed.jsonl")
 

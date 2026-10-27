@@ -1,4 +1,4 @@
-"""Single entry point: ``energy-llm {calibrate,extract,merge,status}``.
+"""Single entry point: ``energy-llm {calibrate,extract,merge,status,smoke}``.
 
 Exit codes: 0 = finished; 75 = work remains (interrupted by SIGUSR1/SIGTERM
 or failed ids still below max_attempts) — the batch script requeues on 75;
@@ -84,6 +84,16 @@ def _shard_already_done(args, shard: int) -> bool:
                        cfg.extraction.max_attempts).done
 
 
+def cmd_smoke(args) -> int:
+    from energy_llm.smoke import format_summary, run_smoke
+
+    stopper = GracefulStop()
+    cfg, items, bundle, load_s = _load(args, stopper)
+    s = run_smoke(cfg, bundle, items, n=args.n, stopper=stopper, model_load_s=round(load_s, 2))
+    print(format_summary(s))
+    return EXIT_DONE if s["n_failed"] == 0 and not s["stopped_by_signal"] else 1
+
+
 def _cfg_items(args):
     from energy_llm.config import load_config
     from energy_llm.storage import read_items
@@ -107,6 +117,9 @@ def cmd_status(args) -> int:
     cfg, items = _cfg_items(args)
     if args.num_shards:
         print(len(plan_shards(items, cfg.extraction.samples_per_shard)))
+        return EXIT_DONE
+    if args.extraction_dir:
+        print(cfg.extraction_dir(args.name))
         return EXIT_DONE
     rep = status_report(cfg, items, args.name, args.input)
     if args.missing:
@@ -154,12 +167,17 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--missing", action="store_true", help="print unfinished shard indices (a,b,c)")
     g.add_argument("--num-shards", action="store_true", help="print the number of shards")
     g.add_argument("--json", action="store_true")
+    g.add_argument("--extraction-dir", action="store_true", help="print the extraction directory")
+
+    sp = sub.add_parser("smoke", help="extract + merge the first N questions in one process")
+    common(sp, name=False)
+    sp.add_argument("--n", type=int, default=20)
 
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return {"calibrate": cmd_calibrate, "extract": cmd_extract,
-            "merge": cmd_merge, "status": cmd_status}[args.cmd](args)
+            "merge": cmd_merge, "status": cmd_status, "smoke": cmd_smoke}[args.cmd](args)
 
 
 if __name__ == "__main__":

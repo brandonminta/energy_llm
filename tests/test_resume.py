@@ -231,3 +231,18 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
     others = feats[~feats["empty_response"]]
     assert others.drop(columns=["empty_response"]).notna().all().all()
 
+
+def test_smoke_summary(calibrated, capsys):
+    from energy_llm.smoke import format_summary, run_smoke
+
+    cfg, bundle, ev, rec = calibrated
+    s = run_smoke(cfg, bundle, read_items(ev), n=5, name="smoke-test")
+    assert s["n_questions"] == 5 and s["n_completed"] == 5 and s["n_failed"] == 0
+    assert s["model_dtype"] == "float32" and s["beta_star"] == rec["beta_star"]
+    assert s["tf_token_match_pct"] == 100.0 and s["tf_exact_answers_pct"] == 100.0
+    assert s["sec_per_question"] > 0 and s["peak_gpu_mem_gb"] is None   # CPU
+    assert len(s["mean_norm_entropy_per_layer"]["prompt"]) == bundle.dims.n_layers
+    assert {"n_empty_response", "n_truncated", "xhat_norm_max_rel_dev"} <= set(s)
+    assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
+    text = format_summary(s)
+    assert "TF == greedy" in text and "layer   0" in text

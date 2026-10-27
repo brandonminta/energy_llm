@@ -124,7 +124,6 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     out = model.generate(
         input_ids=ids, attention_mask=torch.ones_like(ids),
         generation_config=bundle.generation_config,
-        return_dict_in_generate=True, output_logits=True,
     )
     gen = out.sequences[0, n:].tolist()
     if not gen:
@@ -197,18 +196,17 @@ def _phase_features(s_sel: torch.Tensor, m_sel: torch.Tensor, beta: float, k: in
     if s_sel.shape[0] == 1:   # empty response: response phase undefined
         nan = torch.full((), float("nan"), device=s_sel.device)
         return [e[0], nan, nan, h[0], nan, nan, nan, nan, nan, m_sel[0], nan]
-    p = logp.exp()
     if variant == "mean":
         e_r, h_r, m_r = e[1:].mean(), h[1:].mean(), m_sel[1:].mean()
-        p_r = p[1:].mean(dim=0)
+        lp_r = metrics.log_mean_distribution(logp[1:])
     else:
-        e_r, h_r, m_r, p_r = e[1], h[1], m_sel[1], p[1]
-    p_0 = p[0]
+        e_r, h_r, m_r, lp_r = e[1], h[1], m_sel[1], logp[1]
+    lp_0 = logp[0]
     return [
         e[0], e_r, e_r - e[0],
         h[0], h_r, h_r - h[0],
-        metrics.js_divergence(p_r, p_0), metrics.hellinger_sq(p_r, p_0),
-        metrics.jaccard_topk(p_r, p_0, k),
+        metrics.js_divergence(lp_r, lp_0), metrics.hellinger_sq(lp_r, lp_0),
+        metrics.jaccard_topk(lp_r, lp_0, k),
         m_sel[0], m_r,
     ]
 

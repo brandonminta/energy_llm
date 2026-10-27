@@ -98,6 +98,7 @@ def clean_generation_config(max_new_tokens: int, stop_ids: list[int], pad_id: in
         eos_token_id=list(stop_ids), pad_token_id=pad_id,
         repetition_penalty=1.0, temperature=1.0, top_k=None, top_p=1.0,
         no_repeat_ngram_size=0,
+        return_dict_in_generate=True, output_logits=True,   # raw logits for log-prob/entropy
     )
 
 

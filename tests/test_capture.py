@@ -204,8 +204,8 @@ def test_phases_and_variants_match_traces(item):
     # JS of the mean distribution, not mean of per-token JS
     l = 0
     _, s = capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps)
-    p = torch.softmax(beta * s, dim=-1)
-    js = metrics.js_divergence(p[R].mean(0), p[pi]).item()
+    lp = torch.log_softmax(beta * s, dim=-1)
+    js = metrics.js_divergence(torch.log(lp[R].exp().mean(0)), lp[pi]).item()
     assert f["js"][l, 0] == pytest.approx(js, rel=1e-5)
 
 

@@ -1,0 +1,33 @@
+# Llama-3.2-3B-Instruct — extraction run configuration (versioned).
+# Dimensions (L, D, D_ff, RMSNorm eps) are read from the checkpoint config.
+name: llama32_3b
+seed: 42
+output_dir: ${SCRATCH_ROOT}/energy_llm/runs/llama32_3b
+
+model:
+  id: meta-llama/Llama-3.2-3B-Instruct
+  revision: 0cb88a4f764b7a12671c53f0838cd831a0843b95   # hub commit, resolved 2026-10-26
+  dtype: bfloat16            # enforced: loading fails if parameters are not bf16
+  device: auto
+
+prompt:
+  # Single instruction, identical for every dataset; no few-shot. Passing it
+  # explicitly keeps the template's system block deterministic.
+  system: "Answer the question briefly and directly."
+  date_string: "26 Jul 2024"  # the template reads it; fixed for reproducibility
+
+generation:
+  max_new_tokens: 50         # greedy; repetition_penalty forced to 1.0
+
+calibration:
+  target_norm_entropy: 0.55  # H_bar*
+  log10_beta_min: 0.0        # scores are cosines: wide log grid, 10^0 .. 10^4
+  log10_beta_max: 4.0
+  num_grid: 81               # 20 points per decade
+
+extraction:
+  beta_multipliers: [0.5, 1.0, 2.0]   # features at beta*/2, beta*, 2 beta*
+  jaccard_top_k: 64
+  hidden_layers: all                  # residuals saved in float16 for the probe
+  samples_per_shard: 1000             # see README "Shard sizing"
+  max_attempts: 3                     # per id, across runs

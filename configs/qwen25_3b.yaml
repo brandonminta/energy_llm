@@ -1,0 +1,33 @@
+# Qwen2.5-3B-Instruct — extraction run configuration (versioned).
+# Dimensions (L, D, D_ff, RMSNorm eps) are read from the checkpoint config.
+name: qwen25_3b
+seed: 42
+output_dir: ${SCRATCH_ROOT}/energy_llm/runs/qwen25_3b
+
+model:
+  id: Qwen/Qwen2.5-3B-Instruct
+  revision: aa8e72537993ba99e69dfaafa59ed015b17504d1   # hub commit, resolved 2026-10-26
+  dtype: bfloat16            # enforced: loading fails if parameters are not bf16
+  device: auto
+
+prompt:
+  # Single instruction, identical for every dataset; no few-shot. Passing it
+  # explicitly stops Qwen's template from injecting its default system prompt.
+  system: "Answer the question briefly and directly."
+  date_string: null          # Qwen's template does not read a date
+
+generation:
+  max_new_tokens: 50         # greedy; repetition_penalty forced to 1.0
+
+calibration:
+  target_norm_entropy: 0.55  # H_bar*
+  log10_beta_min: 0.0        # scores are cosines: wide log grid, 10^0 .. 10^4
+  log10_beta_max: 4.0
+  num_grid: 81               # 20 points per decade
+
+extraction:
+  beta_multipliers: [0.5, 1.0, 2.0]   # features at beta*/2, beta*, 2 beta*
+  jaccard_top_k: 64
+  hidden_layers: all                  # residuals saved in float16 for the probe
+  samples_per_shard: 1000             # see README "Shard sizing"
+  max_attempts: 3                     # per id, across runs

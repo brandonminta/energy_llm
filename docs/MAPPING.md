@@ -21,6 +21,8 @@
 | β grid | {1,…,100}, clamped if not bracketed | log grid 10⁰…10⁴ (cosine scale); calibration **fails** if not bracketed |
 | Calibration positions | last prompt token only | last prompt token + response tokens (same exclusion as extract); warm-up JSONL disjoint from evaluation |
 | Scope | banks → probe → statistics | ends at the metrics; labelling, probes, statistics in `downstream/` |
+| Bank storage | float32 `m̂` per layer in `banks.pt` | never materialised: γ and `‖W̃_i‖` only; `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` one layer at a time |
+| Empty responses | n/a | valid samples: `empty_response = true`, prompt features computed, response features NaN by design, marked completed |
 
 ## Specification → code
 
@@ -34,8 +36,11 @@
 | Stop-token exclusion | `model.stop_token_ids`, `capture.forward_item` | `answers.parquet:stop_token_id, n_response_tokens` |
 | Teacher forcing, argmax == greedy check | `capture.forward_item` | `answers.parquet:tf_mismatch_*`; `manifest.json:checks` |
 | Hook at the input of `post_attention_layernorm` | `capture.ResidualHooks` | — |
-| Bank `W̃ = W_g·γ`, unit rows, γ and norms saved | `bank.build_bank`, `bank.write_bank_h5` | `bank.h5` |
-| x̂, scores, p, E, H̄, margin (float32) | `metrics.*`, `capture._layer_scores` | — |
+| Bank `W̃ = W_g·γ`: only γ and row norms precomputed and saved | `bank.build_bank`, `bank.write_bank_h5` | `bank.h5` |
+| Scores per layer, transient float32 `W_g` | `bank.Bank.scores`, `capture._layer_scores` | — |
+| x̂, p, E, H̄, margin (float32) | `metrics.*` | — |
+| Empty response as a valid sample | `capture._phase_features`, `capture.compute_item` (`RESPONSE_FEATURES`) | `answers/features.parquet:empty_response` |
+| Peak GPU memory per shard | `manifest.peak_gpu_memory_gb`, `extract.run_extract` | `runs.jsonl`, `manifest.json:shard_runs` |
 | Phases, variants mean/first, β*·{½,1,2} | `capture.compute_item`, `capture._phase_features` | `extraction.beta_multipliers`; `features.parquet` |
 | JS, Hellinger², Jaccard top-k | `metrics.js_divergence`, `hellinger_sq`, `jaccard_topk` | `extraction.jaccard_top_k` |
 | Per-token traces at β* | `capture.compute_item` | `traces.h5` |
@@ -47,6 +52,8 @@
 | SIGUSR1 / SIGTERM clean exit | `signals.GracefulStop`; `hpc/env.sh:run_requeueable` | exit code 75 |
 | Merge + manifest | `merge.run_merge` | `manifest.json` and the files above |
 | Missing-shard report | `merge.status_report`; `hpc/missing_shards.sh` | `energy-llm status` |
+| Orphaned-merge recovery | `hpc/missing_shards.sh --resubmit`, `hpc/env.sh:record_submission` | `<extraction_dir>/submissions.log` |
+| Smoke test | `smoke.run_smoke`; `hpc/smoke.sbatch` | `energy-llm smoke`; `smoke_report.json` |
 
 ## Implementation notes
 
@@ -61,10 +68,12 @@
    `post_attention_layernorm`), not the layer output.
 3. **Calibration weighting.** For each warm-up question H̄ is averaged over
    layers × calibration positions; questions are then weighted equally.
-4. **Empty responses** (the first generated token is a stop token) are
-   failures: response features are undefined. They are retried up to
-   `max_attempts` (deterministically failing again) and then listed in
-   `manifest.json:exhausted_ids`.
+4. **Empty responses** (the first generated token is a stop token) are valid
+   samples, not failures: greedy retries would reproduce them, and dropping
+   them would bias the comparison between datasets. Prompt-phase features
+   are computed; the response-phase features, the response baselines and
+   `hidden.h5:response_last` are NaN by design. The NaN/inf check exempts
+   exactly those fields; any other non-finite value is a real failure.
 5. **Stop tokens in the role mask** are coded `template` (they are turn
    delimiters of the chat template); only non-stop generated tokens are
    `response`.

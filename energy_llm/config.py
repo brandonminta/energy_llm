@@ -1,190 +1,200 @@
-"""Typed experiment configuration and snapshotting.
+"""Per-run configuration: one versioned YAML per model (configs/*.yaml).
 
-One YAML per experiment (configs/e1.yaml, e2.yaml, e3.yaml). Every stage
-loads the same file; the calibration stage writes ``beta_star`` into the
-frozen snapshot at ``<output_dir>/config_snapshot.yaml`` and all later stages
-read the snapshot, so a single beta_star flows through the whole run
-(subsec:impl_beta).
+The YAML is the complete scientific specification of a run: model and exact
+hub revision, dtype, prompt (single system instruction, no few-shot),
+generation cap, calibration target and grid, beta sensitivity multipliers,
+probe layers and seed. beta* itself is not in the YAML: ``calibrate`` writes
+it to ``<output_dir>/calibration/beta_star.json`` and ``extract`` reads it.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-DEFAULT_BETA_GRID = [1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0]
+from energy_llm.storage import sha256_text
+
+
+class ConfigError(ValueError):
+    pass
 
 
 @dataclass
 class ModelConfig:
-    alias: str = "qwen25_3b"
-    dtype: str = "bfloat16"          # reported runs: bfloat16 on A100
-    load_in_4bit: bool = False       # local dev only, never for reported runs
-    device: str = "auto"
+    id: str = ""
+    revision: str = ""               # exact hub commit hash
+    dtype: str = "bfloat16"          # the only accepted value
+    device: str = "auto"             # auto | cuda | cpu
 
 
 @dataclass
-class DatasetConfig:
-    name: str = "truthfulqa"         # truthfulqa | triviaqa
-    num_samples: int | None = None   # triviaqa: 500 drawn at seed (subsec:datasets)
-
-
-@dataclass
-class BankConfig:
-    bank_id: str = "gate"            # primary and only evaluated bank (subsec:stage1)
-    path: str = ""                   # default: <output_dir>/banks.pt
-
-
-@dataclass
-class CalibrationConfig:
-    num_samples: int = 30                       # N_c (tab:hyperparameters)
-    beta_grid: list[float] = field(default_factory=lambda: list(DEFAULT_BETA_GRID))
-    target_norm_entropy: float = 0.55           # H_bar* (tab:hyperparameters)
-    beta_star: float | None = None              # written by the calibrate stage
+class PromptConfig:
+    system: str = "Answer the question briefly and directly."
+    date_string: str | None = None   # required when the chat template reads it (Llama)
 
 
 @dataclass
 class GenerationConfig:
-    max_new_tokens: int = 50         # T_max (tab:hyperparameters)
+    max_new_tokens: int = 50
 
 
 @dataclass
-class TrajectoryConfig:
-    cache_score_tensors: bool = False  # E1: True (subsec:an_sensitivity)
-    score_dtype: str = "float32"       # dtype of the bank matmul on GPU
-    log_memory_every: int = 10
+class CalibrationConfig:
+    target_norm_entropy: float = 0.55
+    log10_beta_min: float = 0.0
+    log10_beta_max: float = 4.0
+    num_grid: int = 81
+
+    def beta_grid(self) -> list[float]:
+        n = self.num_grid
+        step = (self.log10_beta_max - self.log10_beta_min) / (n - 1)
+        return [10.0 ** (self.log10_beta_min + i * step) for i in range(n)]
 
 
 @dataclass
-class LabelingConfig:
-    judge_model: str = "gpt-4o-mini"
-    api_base: str | None = None      # None = api.openai.com
-    max_retries: int = 6
-    human_subset_size: int = 60      # subsec:an_label_reliability
+class ExtractionConfig:
+    beta_multipliers: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+    jaccard_top_k: int = 64
+    hidden_layers: str | list[int] = "all"
+    samples_per_shard: int = 1000
+    max_attempts: int = 3
+    bank_device: str = "auto"        # auto | cuda | cpu (cpu for small MIG slices)
 
 
 @dataclass
-class ProbeConfig:
-    c_grid: list[float] = field(default_factory=lambda: [0.01, 0.1, 1.0, 10.0])
-    split: list[float] = field(default_factory=lambda: [0.70, 0.15, 0.15])
-    inner_cv_folds: int = 3
-    outer_cv_folds: int = 5
-
-
-@dataclass
-class StatsConfig:
-    n_bootstrap: int = 10_000        # B (subsec:an_discrimination)
-    n_permutation: int = 1_000       # B_perm (subsec:an_localisation)
-    alpha: float = 0.05              # family level, Bonferroni over 2 tests
-
-
-@dataclass
-class ExperimentConfig:
-    name: str = "e1"
+class RunConfig:
+    name: str = ""
     seed: int = 42
-    output_dir: str = "results/e1"
+    output_dir: str = ""
     model: ModelConfig = field(default_factory=ModelConfig)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    bank: BankConfig = field(default_factory=BankConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
-    trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
-    labeling: LabelingConfig = field(default_factory=LabelingConfig)
-    probe: ProbeConfig = field(default_factory=ProbeConfig)
-    stats: StatsConfig = field(default_factory=StatsConfig)
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
 
-    # ---- derived paths -------------------------------------------------
+    # ---- paths -----------------------------------------------------------
     @property
     def out(self) -> Path:
-        return Path(self.output_dir)
-
-    @property
-    def banks_path(self) -> Path:
-        return Path(self.bank.path) if self.bank.path else self.out / "banks.pt"
-
-    @property
-    def trajectories_dir(self) -> Path:
-        return self.out / "trajectories"
-
-    @property
-    def labels_dir(self) -> Path:
-        return self.out / "labels"
+        path = os.path.expandvars(self.output_dir)
+        if "$" in path:
+            raise ConfigError(f"output_dir {self.output_dir!r} uses an unset environment variable")
+        return Path(path)
 
     @property
     def calibration_dir(self) -> Path:
         return self.out / "calibration"
 
     @property
-    def features_dir(self) -> Path:
-        return self.out / "features"
+    def beta_star_path(self) -> Path:
+        return self.calibration_dir / "beta_star.json"
 
     @property
-    def figures_dir(self) -> Path:
-        return self.out / "figures"
+    def bank_h5_path(self) -> Path:
+        return self.calibration_dir / "bank.h5"
 
-    @property
-    def snapshot_path(self) -> Path:
-        return self.out / "config_snapshot.yaml"
+    def extraction_dir(self, name: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise ConfigError(f"extraction name {name!r} must match [A-Za-z0-9._-]+")
+        return self.out / "extract" / name
 
-    # ---- (de)serialisation ----------------------------------------------
+    # ---- identity ---------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "ExperimentConfig":
-        sections = {
-            "model": ModelConfig, "dataset": DatasetConfig, "bank": BankConfig,
-            "calibration": CalibrationConfig, "generation": GenerationConfig,
-            "trajectory": TrajectoryConfig, "labeling": LabelingConfig,
-            "probe": ProbeConfig, "stats": StatsConfig,
+    def sha256(self) -> str:
+        """Hash of everything except ``output_dir`` (a location, not part of
+        the scientific specification). Shards refuse to resume under a
+        different hash."""
+        d = self.to_dict()
+        d.pop("output_dir")
+        return sha256_text(json.dumps(d, sort_keys=True))
+
+    def calibration_context(self) -> dict[str, Any]:
+        """The settings beta* depends on; extract refuses a beta* computed
+        under a different context."""
+        return {
+            "model": dataclasses.asdict(self.model) | {"device": None},
+            "prompt": dataclasses.asdict(self.prompt),
+            "generation": dataclasses.asdict(self.generation),
+            "calibration": dataclasses.asdict(self.calibration),
         }
+
+    def hidden_layer_indices(self, n_layers: int) -> list[int]:
+        hl = self.extraction.hidden_layers
+        if hl == "all":
+            return list(range(n_layers))
+        bad = [l for l in hl if not 0 <= l < n_layers]
+        if bad:
+            raise ConfigError(f"hidden_layers out of range for L={n_layers}: {bad}")
+        return sorted(set(hl))
+
+    # ---- validation ---------------------------------------------------------
+    def validate(self) -> "RunConfig":
+        if not self.name:
+            raise ConfigError("name is required")
+        if not self.output_dir:
+            raise ConfigError("output_dir is required")
+        if not self.model.id:
+            raise ConfigError("model.id is required")
+        if not re.fullmatch(r"[0-9a-f]{40}", self.model.revision or ""):
+            raise ConfigError("model.revision must be a 40-hex hub commit hash")
+        if self.model.dtype != "bfloat16":
+            raise ConfigError("model.dtype must be bfloat16")
+        if self.model.device not in ("auto", "cuda", "cpu"):
+            raise ConfigError("model.device must be auto|cuda|cpu")
+        if not self.prompt.system.strip():
+            raise ConfigError("prompt.system must be non-empty")
+        if self.generation.max_new_tokens < 1:
+            raise ConfigError("generation.max_new_tokens must be >= 1")
+        c = self.calibration
+        if not 0.0 < c.target_norm_entropy < 1.0:
+            raise ConfigError("calibration.target_norm_entropy must be in (0, 1)")
+        if c.num_grid < 2 or c.log10_beta_max <= c.log10_beta_min:
+            raise ConfigError("calibration grid is empty")
+        e = self.extraction
+        if 1.0 not in e.beta_multipliers or any(m <= 0 for m in e.beta_multipliers):
+            raise ConfigError("extraction.beta_multipliers must be positive and include 1.0")
+        if e.jaccard_top_k < 1:
+            raise ConfigError("extraction.jaccard_top_k must be >= 1")
+        if e.hidden_layers != "all" and not (
+            isinstance(e.hidden_layers, list) and all(isinstance(l, int) for l in e.hidden_layers)
+        ):
+            raise ConfigError("extraction.hidden_layers must be 'all' or a list of ints")
+        if e.samples_per_shard < 1 or e.max_attempts < 1:
+            raise ConfigError("samples_per_shard and max_attempts must be >= 1")
+        if e.bank_device not in ("auto", "cuda", "cpu"):
+            raise ConfigError("extraction.bank_device must be auto|cuda|cpu")
+        return self
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RunConfig":
+        sections = {
+            "model": ModelConfig, "prompt": PromptConfig,
+            "generation": GenerationConfig, "calibration": CalibrationConfig,
+            "extraction": ExtractionConfig,
+        }
+        top = {f.name for f in dataclasses.fields(cls)}
         kwargs: dict[str, Any] = {}
         for key, value in raw.items():
             if key in sections:
                 known = {f.name for f in dataclasses.fields(sections[key])}
-                unknown = set(value) - known
+                unknown = set(value or {}) - known
                 if unknown:
-                    raise KeyError(f"Unknown config keys in '{key}': {sorted(unknown)}")
-                kwargs[key] = sections[key](**value)
-            elif key in {f.name for f in dataclasses.fields(cls)}:
+                    raise ConfigError(f"unknown keys in '{key}': {sorted(unknown)}")
+                kwargs[key] = sections[key](**(value or {}))
+            elif key in top:
                 kwargs[key] = value
             else:
-                raise KeyError(f"Unknown config section: '{key}'")
-        return cls(**kwargs)
-
-    def save_snapshot(self) -> Path:
-        """Freeze the config (including beta_star once calibrated)."""
-        from energy_llm.io_artifacts import save_json_atomic  # noqa: F401 (atomic pattern)
-        self.out.mkdir(parents=True, exist_ok=True)
-        tmp = self.snapshot_path.with_name(self.snapshot_path.name + ".tmp")
-        tmp.write_text(yaml.safe_dump(self.to_dict(), sort_keys=False))
-        tmp.replace(self.snapshot_path)
-        return self.snapshot_path
+                raise ConfigError(f"unknown config key '{key}'")
+        return cls(**kwargs).validate()
 
 
-def load_config(path: str | Path, prefer_snapshot: bool = True) -> ExperimentConfig:
-    """Load an experiment config.
-
-    If the run's frozen snapshot exists and ``prefer_snapshot`` is True, the
-    snapshot wins: it carries the calibrated beta_star and is what every
-    post-calibration stage must read (subsec:impl_beta).
-    """
-    raw = yaml.safe_load(Path(path).read_text())
-    cfg = ExperimentConfig.from_dict(raw)
-    if prefer_snapshot and cfg.snapshot_path.exists():
-        snap = yaml.safe_load(cfg.snapshot_path.read_text())
-        cfg = ExperimentConfig.from_dict(snap)
-    return cfg
-
-
-def require_beta_star(cfg: ExperimentConfig) -> float:
-    if cfg.calibration.beta_star is None:
-        raise RuntimeError(
-            "beta_star is not calibrated. Run scripts/calibrate_beta.py first; "
-            "it writes beta_star into the config snapshot read by all later stages."
-        )
-    return float(cfg.calibration.beta_star)
+def load_config(path: str | Path) -> RunConfig:
+    return RunConfig.from_dict(yaml.safe_load(Path(path).read_text()))

@@ -5,32 +5,24 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=06:00:00
+#SBATCH --signal=B:USR1@120
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=logs/calibrate_%j.out
 #SBATCH --error=logs/calibrate_%j.err
 #
-# beta* calibration — N_c=30 prefill passes, writes beta_star into the
-# config snapshot (results/<exp>/config_snapshot.yaml) that every later
-# stage reads. Resource directives preserved verbatim from the previous
-# working full-GPU job (scripts/hpc/jobs/run_experiment.sh); the job
-# finishes in minutes.
-#
-# Submit from repo root:
-#   sbatch hpc/calibrate.sbatch configs/e1.yaml
-#
-set -euo pipefail
-
-CONFIG="${1:?usage: sbatch hpc/calibrate.sbatch <config.yaml>}"
+# beta* calibration on the warm-up JSONL. Submit with hpc/submit.sh calibrate
+# (the #SBATCH lines are fallbacks; hpc/env.sh values override them).
+set -uo pipefail
+CONFIG="${1:?usage: calibrate.sbatch <config.yaml> <warmup.jsonl>}"
+WARMUP="${2:?usage: calibrate.sbatch <config.yaml> <warmup.jsonl>}"
 REPO_ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-
-export HF_HOME="${HF_HOME:-$HOME/hf_cache}"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-eval "$($HOME/.local/bin/micromamba shell hook --shell bash)"
-micromamba activate "${MAMBA_ENV_NAME:-hopfield-llm}"
-
 cd "$REPO_ROOT"
-mkdir -p logs
+source hpc/env.sh
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+activate_env
 
-echo "[calibrate] config=$CONFIG node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo n/a)"
-python scripts/calibrate_beta.py --config "$CONFIG"
-echo "[calibrate] done: $(date)"
+echo "[calibrate] job=$SLURM_JOB_ID node=$(hostname) config=$CONFIG warmup=$WARMUP"
+echo "[calibrate] gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo n/a)"
+run_requeueable "$SLURM_JOB_ID" python -m energy_llm calibrate --config "$CONFIG" --input "$WARMUP"

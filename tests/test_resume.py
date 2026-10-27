@@ -1,108 +1,199 @@
-"""Resume semantics (HPC robustness): run Stage 2 on 5 samples, stop after 2
-(simulated kill), rerun, and assert exactly 3 more are processed while the
-first 2 artifacts are untouched byte-for-byte."""
+"""Interrupted + resumed runs produce outputs identical to an uninterrupted
+run; failures are never marked complete and are retried up to max_attempts."""
 
+import json
+import shutil
+
+import h5py
+import numpy as np
+import pandas as pd
 import pytest
 
-from energy_llm.config import ExperimentConfig
-from energy_llm.io_artifacts import sha256_file
-from energy_llm.trajectory import run_trajectories
+from energy_llm.capture import compute_item
+from energy_llm.cli import main as cli_main
+from energy_llm.extract import plan_shards, run_extract, shard_path, shard_state
+from energy_llm.merge import run_merge, status_report
+from energy_llm.storage import item_key, read_items, read_jsonl
 
-from .conftest import make_tiny_samples
-
-
-@pytest.fixture()
-def cfg(tmp_path):
-    cfg = ExperimentConfig(name="resume_test", output_dir=str(tmp_path / "run"))
-    cfg.calibration.beta_star = 5.0
-    cfg.generation.max_new_tokens = 4
-    cfg.trajectory.cache_score_tensors = False
-    return cfg
+PARQUETS = ("answers.parquet", "features.parquet", "baselines.parquet")
 
 
-class TestResume:
-    def test_kill_and_rerun_is_noop_for_finished_samples(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks
-    ):
-        samples = make_tiny_samples(5)
+def _run_all(cfg, bundle, ev, name, **kw):
+    items = read_items(ev)
+    reports = [run_extract(cfg, bundle, items, ev, name, k, **kw)
+               for k in range(len(plan_shards(items, cfg.extraction.samples_per_shard)))]
+    return items, reports
 
-        # first run "killed" after 2 samples (max_samples_per_job simulates
-        # the preemption boundary: stop cleanly between samples)
-        report1 = run_trajectories(
-            cfg, tiny_model, tiny_tokenizer, tiny_banks, samples,
-            max_samples_per_job=2,
-        )
-        assert report1["n_done"] == 2 and report1["n_failed"] == 0
 
-        done = sorted(p.name for p in cfg.trajectories_dir.glob("*.json"))
-        assert len(done) == 2
-        hashes_before = {
-            name: sha256_file(cfg.trajectories_dir / name) for name in done
-        }
-        npz_hashes_before = {
-            p.name: sha256_file(p) for p in cfg.trajectories_dir.glob("*.npz")
-        }
+def _h5_dict(path):
+    out = {}
+    with h5py.File(path) as f:
+        f.visititems(lambda k, v: out.__setitem__(k, v[()]) if isinstance(v, h5py.Dataset) else None)
+    return out
 
-        # rerun: exactly the 3 remaining are processed
-        report2 = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report2["n_done"] == 3
-        assert report2["n_skipped"] == 2
 
-        # finished artifacts are untouched (the rerun was a no-op for them)
-        for name, h in hashes_before.items():
-            assert sha256_file(cfg.trajectories_dir / name) == h
-        for name, h in npz_hashes_before.items():
-            assert sha256_file(cfg.trajectories_dir / name) == h
+def _assert_same_outputs(a, b):
+    for name in PARQUETS:
+        pd.testing.assert_frame_equal(pd.read_parquet(a / name), pd.read_parquet(b / name))
+    for name in ("traces.h5", "hidden.h5", "bank.h5"):
+        da, db = _h5_dict(a / name), _h5_dict(b / name)
+        assert da.keys() == db.keys()
+        for k in da:
+            np.testing.assert_array_equal(da[k], db[k])
 
-        # third run: everything skipped
-        report3 = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report3["n_done"] == 0 and report3["n_skipped"] == 5
 
-    def test_requires_calibrated_beta(self, cfg, tiny_model, tiny_tokenizer, tiny_banks):
-        cfg.calibration.beta_star = None
-        with pytest.raises(RuntimeError, match="beta_star is not calibrated"):
-            run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks,
-                             make_tiny_samples(1))
+def test_resume_after_interruption_is_identical_to_full_run(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items, reports = _run_all(cfg, bundle, ev, "full")
+    assert all(r["state"] == "done" for r in reports)
+    run_merge(cfg, items, ev, "full")
 
-    def test_failure_isolation_writes_nan_row_and_failures_jsonl(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks, monkeypatch
-    ):
-        import numpy as np
+    # interrupted run: shard 0 stops after one id, plus crash debris
+    r = run_extract(cfg, bundle, items, ev, "resumed", 0, stop_after=1)
+    assert r["state"] == "pending" and r["n_completed"] == 1
+    sdir = shard_path(cfg.extraction_dir("resumed"), 0)
+    (sdir / "items" / ".stale.h5.123.tmp").write_bytes(b"partial")
+    orphan = sdir / "items" / f"{item_key(items[1].id)}.h5"     # written, not indexed
+    shutil.copy(next((sdir / "items").glob("*.h5")), orphan)
+    assert items[1].id not in shard_state(sdir, 0, [items[1].id], 3).completed
+    with pytest.raises(RuntimeError, match="not finished"):
+        run_merge(cfg, items, ev, "resumed")
+    _, reports = _run_all(cfg, bundle, ev, "resumed")
+    assert all(r["state"] == "done" for r in reports)
+    run_merge(cfg, items, ev, "resumed")
 
-        import energy_llm.trajectory as traj_mod
-        from energy_llm.io_artifacts import load_json, read_jsonl
+    _assert_same_outputs(cfg.extraction_dir("full"), cfg.extraction_dir("resumed"))
+    # completion index has no duplicates; the rerun skipped finished ids
+    done = [r["id"] for r in read_jsonl(sdir / "completed.jsonl")]
+    assert len(done) == len(set(done)) == 3
 
-        samples = make_tiny_samples(3)
-        original = traj_mod.capture_sample
-        calls = {"n": 0}
 
-        def flaky(*args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise RuntimeError("simulated OOM")
-            return original(*args, **kwargs)
+def test_outputs_indexed_by_id_without_input_extras(calibrated):
+    cfg, bundle, ev, rec = calibrated
+    items, _ = _run_all(cfg, bundle, ev, "x")
+    m = run_merge(cfg, items, ev, "x")
+    d = cfg.extraction_dir("x")
+    ans = pd.read_parquet(d / "answers.parquet")
+    assert list(ans["id"]) == [it.id for it in items]
+    assert "gold" not in ans.to_json() and "category" not in ans.columns
+    feats = pd.read_parquet(d / "features.parquet")
+    L = bundle.dims.n_layers
+    assert len(feats) == len(items) * L * 3 * 2
+    assert set(feats["variant"]) == {"mean", "first"}
+    np.testing.assert_allclose(sorted(feats["beta"].unique()),
+                               [rec["beta_star"] * k for k in (0.5, 1.0, 2.0)])
+    with h5py.File(d / "traces.h5") as f:
+        assert set(f.keys()) == {it.id for it in items}
+    assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
+    assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
+    assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
 
-        monkeypatch.setattr(traj_mod, "capture_sample", flaky)
-        report = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report["n_done"] == 2 and report["n_failed"] == 1
 
-        failures = read_jsonl(cfg.trajectories_dir / "failures.jsonl")
-        assert len(failures) == 1
-        failed_id = failures[0]["sample_id"]
-        assert "simulated OOM" in failures[0]["error"]
-        assert "traceback" in failures[0]
+def _flaky(fail_ids, times):
+    calls = {}
 
-        meta = load_json(cfg.trajectories_dir / f"{failed_id}.json")
-        assert meta["failed"] is True
-        with np.load(cfg.trajectories_dir / f"{failed_id}.npz") as npz:
-            assert np.isnan(npz["ref_lse_term"]).all()
+    def compute(bundle, bank, trace, item_id, *a):
+        calls[item_id] = calls.get(item_id, 0) + 1
+        if item_id in fail_ids and calls[item_id] <= times:
+            raise RuntimeError("CUDA out of memory (simulated)")
+        return compute_item(bundle, bank, trace, item_id, *a)
+    return compute
 
-    def test_shard_runs_populate_one_directory(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks
-    ):
-        samples = make_tiny_samples(5)
-        for k in range(2):
-            run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples,
-                             shard_index=k, num_shards=2)
-        done = sorted(p.stem for p in cfg.trajectories_dir.glob("*.json"))
-        assert done == sorted(s.sample_id for s in samples)
+
+def test_failures_are_retried_and_not_marked_complete(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    bad = items[0].id
+    compute = _flaky({bad}, times=2)
+    sdir = shard_path(cfg.extraction_dir("f"), 0)
+    for attempt in (1, 2):
+        r = run_extract(cfg, bundle, items, ev, "f", 0, compute=compute)
+        assert r["state"] == "pending"
+        st = shard_state(sdir, 0, [it.id for it in items[:3]], 3)
+        assert bad not in st.completed and st.attempts[bad] == attempt
+    r = run_extract(cfg, bundle, items, ev, "f", 0, compute=compute)
+    assert r["state"] == "done" and r["n_completed"] == 3
+    recs = read_jsonl(sdir / "failed.jsonl")
+    assert [x["attempt"] for x in recs] == [1, 2] and "out of memory" in recs[0]["error"]
+
+
+def test_exhausted_ids_end_the_shard_and_are_reported(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    bad = items[1].id
+    compute = _flaky({bad}, times=99)
+    states = [run_extract(cfg, bundle, items, ev, "e", 0, compute=compute)["state"]
+              for _ in range(3)]
+    assert states == ["pending", "pending", "done"]
+    for k in (1, 2):
+        run_extract(cfg, bundle, items, ev, "e", k)
+    m = run_merge(cfg, items, ev, "e")
+    assert list(m["exhausted_ids"]) == [bad] and m["counts"]["completed"] == 6
+    ans = pd.read_parquet(cfg.extraction_dir("e") / "answers.parquet")
+    assert bad not in set(ans["id"])
+
+
+def test_changed_config_refuses_to_resume(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    run_extract(cfg, bundle, items, ev, "c", 0, stop_after=1)
+    cfg.extraction.jaccard_top_k = 4
+    with pytest.raises(RuntimeError, match="differs"):
+        run_extract(cfg, bundle, items, ev, "c", 0)
+
+
+def test_status_reports_missing_shards(calibrated, tmp_path, capsys):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    run_extract(cfg, bundle, items, ev, "s", 1)
+    rep = status_report(cfg, items, "s", ev)
+    assert rep["num_shards"] == 3 and rep["missing_shards"] == [0, 2]
+    assert rep["throughput"]["suggested_samples_per_shard"] >= 1
+
+    import yaml
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg.to_dict()))
+    args = ["--config", str(cfg_path), "--input", str(ev), "--name", "s"]
+    assert cli_main(["status", *args, "--missing"]) == 0
+    assert capsys.readouterr().out.strip() == "0,2"
+    assert cli_main(["status", *args, "--num-shards"]) == 0
+    assert capsys.readouterr().out.strip() == "3"
+
+
+def test_sigusr1_stops_after_current_id_and_resume_completes(calibrated):
+    import os
+    import signal
+
+    from energy_llm.signals import GracefulStop
+
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    stopper = GracefulStop()
+
+    def compute(*a):
+        res = compute_item(*a)
+        os.kill(os.getpid(), signal.SIGUSR1)   # SLURM's pre-walltime warning
+        return res
+
+    try:
+        r = run_extract(cfg, bundle, items, ev, "sig", 0, stopper=stopper, compute=compute)
+    finally:
+        signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    assert r["stopped_by_signal"] and r["signal"] == "SIGUSR1"
+    assert r["state"] == "pending" and r["n_completed"] == 1   # the in-flight id was finished
+    r = run_extract(cfg, bundle, items, ev, "sig", 0)
+    assert r["state"] == "done" and r["n_done_this_run"] == 2
+
+
+def test_cli_extract_skips_finished_shard_without_loading_model(calibrated, tmp_path, capsys):
+    import yaml
+
+    cfg, bundle, ev, _ = calibrated
+    run_extract(cfg, bundle, read_items(ev), ev, "k", 2)
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg.to_dict()))
+    # the tiny model id does not exist on the hub: reaching the loader would raise
+    code = cli_main(["extract", "--config", str(cfg_path), "--input", str(ev),
+                     "--name", "k", "--shard-index", "2"])
+    assert code == 0 and '"skipped_model_load": true' in capsys.readouterr().out

@@ -18,25 +18,23 @@ from __future__ import annotations
 import datetime
 import logging
 import math
-import time
-import traceback
 from pathlib import Path
 
 import numpy as np
 
 from energy_llm import manifest
-from energy_llm.bank import build_bank, read_bank_fingerprint, write_bank_h5
-from energy_llm.capture import ResidualHooks, forward_item, norm_entropy_curve
 from energy_llm.config import RunConfig
-from energy_llm.model import ModelBundle
-from energy_llm.prompting import build_prompt, check_template
-from energy_llm.signals import GracefulStop
+from energy_llm.core.bank import build_bank, read_bank_fingerprint, write_bank_h5
+from energy_llm.core.capture import ResidualHooks, forward_item, norm_entropy_curve
+from energy_llm.core.model import ModelBundle, release_cuda
+from energy_llm.core.prompting import build_prompt, check_template
+from energy_llm.pipeline.signals import GracefulStop
 from energy_llm.storage import (
-    Item, append_jsonl, item_key, load_json, normalise_question, read_jsonl,
+    Item, append_failure, item_key, load_json, normalise_question, read_failures,
     sha256_file, sha256_text, write_json_atomic,
 )
 
-log = logging.getLogger("energy_llm.calibrate")
+log = logging.getLogger("energy_llm.pipeline.calibrate")
 
 
 class CalibrationError(RuntimeError):
@@ -106,9 +104,7 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     ensure_bank_record(cfg, bank, bundle)
 
     failed_path = cal / "failed.jsonl"
-    attempts: dict[str, int] = {}
-    for rec in read_jsonl(failed_path):
-        attempts[rec["id"]] = attempts.get(rec["id"], 0) + 1
+    attempts, _ = read_failures(failed_path)
     max_attempts = cfg.extraction.max_attempts
 
     hooks = ResidualHooks(bundle.model)
@@ -116,7 +112,7 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
         for it in items:
             if stopper.requested:
                 break
-            path = cal / "items" / f"{item_key(it.id)}.json"
+            path = _curve_path(cal, it.id)
             if path.exists() or attempts.get(it.id, 0) >= max_attempts:
                 continue
             try:
@@ -131,16 +127,13 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
                 del trace
             except Exception as exc:
                 attempts[it.id] = attempts.get(it.id, 0) + 1
-                append_jsonl(failed_path, {
-                    "id": it.id, "attempt": attempts[it.id], "error": repr(exc),
-                    "traceback": traceback.format_exc(), "time": time.time(),
-                })
+                append_failure(failed_path, it.id, attempts[it.id], max_attempts, exc)
                 log.error("warm-up %s failed (attempt %d): %r", it.id, attempts[it.id], exc)
-                _release_cuda()
+                release_cuda()
     finally:
         hooks.remove()
 
-    done = {it.id: cal / "items" / f"{item_key(it.id)}.json" for it in items}
+    done = {it.id: _curve_path(cal, it.id) for it in items}
     done = {k: p for k, p in done.items() if p.exists()}
     pending = [it.id for it in items
                if it.id not in done and attempts.get(it.id, 0) < max_attempts]
@@ -176,11 +169,6 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     return record
 
 
-def _release_cuda() -> None:
-    import gc
-
-    import torch
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+def _curve_path(cal_dir: Path, item_id: str) -> Path:
+    """Per-question H_bar curve (atomic file, the unit of resumption)."""
+    return cal_dir / "items" / f"{item_key(item_id)}.json"

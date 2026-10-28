@@ -5,9 +5,9 @@ import numpy as np
 import pytest
 import torch
 
-from energy_llm.bank import build_bank
-from energy_llm.capture import ResidualHooks, compute_item, forward_item
-from energy_llm.prompting import build_prompt
+from energy_llm.core.bank import build_bank
+from energy_llm.core.capture import ResidualHooks, compute_item, forward_item
+from energy_llm.core.prompting import build_prompt
 from tests.conftest import SYSTEM, make_bundle, make_pair
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")

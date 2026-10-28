@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import signal
 
-log = logging.getLogger("energy_llm.signals")
+log = logging.getLogger("energy_llm.pipeline.signals")
 
 EXIT_DONE = 0
 EXIT_PENDING = 75   # EX_TEMPFAIL: work remains (signal or retryable failures)

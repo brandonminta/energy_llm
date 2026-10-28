@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from energy_llm.prompting import ROLE_NAMES, ROLE_RESPONSE
+from energy_llm.core.prompting import ROLE_NAMES, ROLE_RESPONSE
 from energy_llm.storage import load_json
 
 

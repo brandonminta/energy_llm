@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 import torch
 
-from energy_llm import metrics
-from energy_llm.bank import build_bank, read_bank_fingerprint, write_bank_h5
-from energy_llm.model import model_dims
+from energy_llm.core import metrics
+from energy_llm.core.bank import build_bank, read_bank_fingerprint, write_bank_h5
+from energy_llm.core.model import model_dims
 
 
 def _capture(model, ids):
@@ -93,7 +93,7 @@ def test_bank_h5_roundtrip(tmp_path, qwen_pair):
 
 
 def test_bf16_required_by_default(qwen_pair):
-    from energy_llm.model import prepare_bundle
+    from energy_llm.core.model import prepare_bundle
 
     model, tok = qwen_pair
     with pytest.raises(RuntimeError, match="bfloat16"):

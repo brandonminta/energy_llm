@@ -1,6 +1,6 @@
 """Production pipeline vs the naive float64 reference (dev/reference.py).
 
-Tolerances (energy_llm.verify.reference_tolerances / score_tolerance):
+Tolerances (energy_llm.verification.verify.reference_tolerances / score_tolerance):
 - scores: |ds| <= D u_fp32 (first-order bound for a float32 dot product of D
   terms; Cauchy-Schwarz bounds the normalised term sum by 1);
 - every derived quantity: first-order Lipschitz bound in the max norm from
@@ -12,10 +12,10 @@ Tolerances (energy_llm.verify.reference_tolerances / score_tolerance):
 import numpy as np
 import pytest
 
-from energy_llm.bank import build_bank
-from energy_llm.capture import FEATURES, VARIANTS, ResidualHooks, compute_item, forward_item
-from energy_llm.prompting import build_prompt
-from energy_llm.verify import compare_with_reference, load_reference
+from energy_llm.core.bank import build_bank
+from energy_llm.core.capture import FEATURES, VARIANTS, ResidualHooks, compute_item, forward_item
+from energy_llm.core.prompting import build_prompt
+from energy_llm.verification.verify import compare_with_reference, load_reference
 from tests.conftest import DATE, QUESTION_WORDS, SYSTEM, make_bundle, make_questions
 
 ref = load_reference()
@@ -70,7 +70,7 @@ def test_reference_handles_empty_response(qwen_pair):
 
 def test_reference_detects_a_wrong_pipeline(qwen_pair, monkeypatch):
     """Negative control: dropping gamma from the production scores must fail."""
-    from energy_llm import bank as bank_mod
+    from energy_llm.core import bank as bank_mod
 
     bundle = make_bundle(*qwen_pair)
     bank = build_bank(bundle.model, bundle.dims)

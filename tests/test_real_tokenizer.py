@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from energy_llm.prompting import (
+from energy_llm.core.prompting import (
     ROLE_INSTRUCTION, ROLE_QUESTION, build_prompt, check_template,
 )
 

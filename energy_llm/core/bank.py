@@ -28,10 +28,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from energy_llm.model import ModelDims, decoder_layers
+from energy_llm.core.model import ModelDims, decoder_layers
 from energy_llm.storage import atomic_path
 
-log = logging.getLogger("energy_llm.bank")
+log = logging.getLogger("energy_llm.core.bank")
 
 
 @dataclass

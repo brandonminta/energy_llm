@@ -6,7 +6,7 @@ import torch
 from scipy.spatial.distance import jensenshannon
 from scipy.special import logsumexp
 
-from energy_llm import metrics
+from energy_llm.core import metrics
 
 K = 512
 

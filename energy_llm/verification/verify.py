@@ -26,7 +26,6 @@ gives the maximum observed error and the tolerance for each check.
 from __future__ import annotations
 
 import importlib.util
-import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
@@ -35,16 +34,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from energy_llm import metrics
-from energy_llm.bank import Bank, build_bank
-from energy_llm.capture import FEATURES, VARIANTS, ResidualHooks, compute_item, forward_item, norm_entropy_curve
 from energy_llm.config import RunConfig
-from energy_llm.extract import load_beta_star
-from energy_llm.model import ModelBundle, decoder_layers
-from energy_llm.prompting import ROLE_RESPONSE, build_prompt
-from energy_llm.storage import Item, load_json, read_items, sha256_file, write_json_atomic
+from energy_llm.core import metrics
+from energy_llm.core.bank import Bank, build_bank
+from energy_llm.core.capture import FEATURES, VARIANTS, ResidualHooks, compute_item, forward_item, norm_entropy_curve
+from energy_llm.core.model import ModelBundle, decoder_layers
+from energy_llm.core.prompting import ROLE_RESPONSE, build_prompt
+from energy_llm.pipeline.extract import load_beta_star
+from energy_llm.storage import Item, read_items, sha256_file, write_json_atomic
 
-REFERENCE_PATH = Path(__file__).resolve().parents[1] / "dev" / "reference.py"
+REFERENCE_PATH = Path(__file__).resolve().parents[2] / "dev" / "reference.py"
 
 # Unit roundoff u = 2^-p (p = significand bits incl. the implicit one).
 UNIT_ROUNDOFF = {"bfloat16": 2.0 ** -8, "float16": 2.0 ** -11, "float32": 2.0 ** -24}
@@ -289,7 +288,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     """``ref_n`` questions x ``ref_layers`` go through the float64 reference
     (~75 s per layer and question at Qwen2.5-3B size on one CPU core); every
     other check runs on all ``n`` questions and all layers."""
-    from energy_llm.smoke import run_single_process
+    from energy_llm.pipeline.smoke import run_single_process
 
     started = time.time()
     reference = load_reference()

@@ -19,11 +19,9 @@ completed; it is retried on the next run until ``max_attempts``.
 from __future__ import annotations
 
 import datetime
-import gc
 import json
 import logging
 import time
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,18 +29,19 @@ import numpy as np
 import torch
 
 from energy_llm import manifest
-from energy_llm.bank import build_bank, read_bank_fingerprint
-from energy_llm.capture import ItemResult, ResidualHooks, compute_item, forward_item
 from energy_llm.config import RunConfig
-from energy_llm.model import ModelBundle
-from energy_llm.prompting import build_prompt, check_template
-from energy_llm.signals import GracefulStop
+from energy_llm.core.bank import build_bank, read_bank_fingerprint
+from energy_llm.core.capture import ItemResult, ResidualHooks, compute_item, forward_item
+from energy_llm.core.model import ModelBundle, release_cuda
+from energy_llm.core.prompting import build_prompt, check_template
+from energy_llm.pipeline.signals import GracefulStop
 from energy_llm.storage import (
-    Item, append_jsonl, atomic_path, item_key, load_json, normalise_question,
-    read_jsonl, sha256_file, sha256_text, write_json_atomic,
+    Item, append_failure, append_jsonl, atomic_path, item_key, load_json,
+    normalise_question, read_failures, read_jsonl, sha256_file, sha256_text,
+    write_json_atomic,
 )
 
-log = logging.getLogger("energy_llm.extract")
+log = logging.getLogger("energy_llm.pipeline.extract")
 
 
 def plan_shards(items: list[Item], samples_per_shard: int) -> list[list[Item]]:
@@ -51,6 +50,11 @@ def plan_shards(items: list[Item], samples_per_shard: int) -> list[list[Item]]:
 
 def shard_path(ext_dir: Path, k: int) -> Path:
     return ext_dir / "shards" / f"shard_{k:05d}"
+
+
+def item_path(sdir: Path, item_id: str) -> Path:
+    """The one HDF5 file holding every output of ``item_id`` in shard ``sdir``."""
+    return sdir / "items" / f"{item_key(item_id)}.h5"
 
 
 def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
@@ -78,8 +82,7 @@ def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
 def write_item(sdir: Path, res: ItemResult, multipliers: list[float]) -> None:
     import h5py
 
-    key = item_key(res.item_id)
-    with atomic_path(sdir / "items" / f"{key}.h5") as tmp:
+    with atomic_path(item_path(sdir, res.item_id)) as tmp:
         with h5py.File(tmp, "w") as f:
             f.attrs["id"] = res.item_id
             # datasets, not attributes: HDF5 attributes are limited to 64 KB
@@ -91,7 +94,8 @@ def write_item(sdir: Path, res: ItemResult, multipliers: list[float]) -> None:
             for name in ("energy", "norm_entropy", "margin", "role_mask",
                          "hidden_prompt_last", "hidden_response_last"):
                 f.create_dataset(name, data=getattr(res, name))
-    append_jsonl(sdir / "completed.jsonl", {"id": res.item_id, "key": key, "time": time.time()})
+    append_jsonl(sdir / "completed.jsonl",
+                 {"id": res.item_id, "key": item_key(res.item_id), "time": time.time()})
 
 
 def read_item(path: Path) -> dict:
@@ -127,12 +131,8 @@ class ShardState:
 
 def shard_state(sdir: Path, index: int, ids: list[str], max_attempts: int) -> ShardState:
     completed = {r["id"] for r in read_jsonl(sdir / "completed.jsonl")
-                 if (sdir / "items" / f"{item_key(r['id'])}.h5").exists()}
-    attempts: dict[str, int] = {}
-    last_error: dict[str, str] = {}
-    for r in read_jsonl(sdir / "failed.jsonl"):
-        attempts[r["id"]] = attempts.get(r["id"], 0) + 1
-        last_error[r["id"]] = r.get("error", "")
+                 if item_path(sdir, r["id"]).exists()}
+    attempts, last_error = read_failures(sdir / "failed.jsonl")
     exhausted = {i for i in ids if i not in completed and attempts.get(i, 0) >= max_attempts}
     return ShardState(index, ids, completed & set(ids), exhausted, attempts, last_error)
 
@@ -147,12 +147,6 @@ def _ensure_identity(sdir: Path, identity: dict) -> None:
                                "use a new extraction name")
     else:
         write_json_atomic(path, identity)
-
-
-def _release_cuda() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 # ----------------------------------------------------------------------
@@ -199,8 +193,9 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
     if todo and not stopper.requested:
         check_template(bundle.tokenizer, cfg.prompt.date_string)
         bank = build_bank(bundle.model, bundle.dims)
-        if bank.fingerprint() != beta_rec["bank_fingerprint"] or \
-                read_bank_fingerprint(cfg.bank_h5_path) != bank.fingerprint():
+        fingerprint = bank.fingerprint()
+        if fingerprint != beta_rec["bank_fingerprint"] or \
+                read_bank_fingerprint(cfg.bank_h5_path) != fingerprint:
             raise RuntimeError("model weights differ from the calibrated bank")
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
         mult = list(cfg.extraction.beta_multipliers)
@@ -221,15 +216,11 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                     n_done += 1
                 except Exception as exc:
                     attempt = st.attempts.get(it.id, 0) + 1
-                    append_jsonl(sdir / "failed.jsonl", {
-                        "id": it.id, "attempt": attempt, "max_attempts": max_attempts,
-                        "error": repr(exc), "traceback": traceback.format_exc(),
-                        "time": time.time(), "host": manifest.hardware()["hostname"],
-                    })
+                    append_failure(sdir / "failed.jsonl", it.id, attempt, max_attempts, exc)
                     n_failed += 1
                     log.error("id %s failed (attempt %d/%d): %r", it.id, attempt, max_attempts, exc)
                 finally:
-                    _release_cuda()
+                    release_cuda()
         finally:
             hooks.remove()
         items_s = time.time() - t_items

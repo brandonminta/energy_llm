@@ -8,72 +8,81 @@ the package). It is dataset-agnostic: the input is a JSONL of
 `{"id", "question"}` records; every other field is ignored and never
 propagated. All outputs are indexed by `id`.
 
-The specification → code mapping, and the list of deliberate departures from
-the thesis `.tex`, is in [`docs/MAPPING.md`](docs/MAPPING.md).
+Three documents describe it:
 
-## What is computed
+| document | read it for |
+|---|---|
+| this README | setup, how to run on SLURM, what the output files are |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | what the code **actually does**, module by module, file by file, formula by formula — plus an audit of its inconsistencies and of where it departs from the thesis |
+| [`docs/MAPPING.md`](docs/MAPPING.md) | the extraction specification → code mapping, item by item, with the approved departures from the thesis `.tex` and the verification tolerances |
+
+## What is computed (short version)
 
 Per layer, from the residual `x` at the input of `post_attention_layernorm`
 (float32): `x̂ = x/√(mean(x²)+eps)`, bank = unit rows of `W̃ = W_g·γ`,
-`s = bank·x̂/√D`. The bank is never materialised: only γ and `‖W̃_i‖` are
-kept, and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
-to float32 at a time, then frees it. Then `p = softmax(β*s)`, `E = -(1/β*)·logsumexp(β*s)`,
+`s = bank·x̂/√D` (cosines). The bank is never materialised: only γ and `‖W̃_i‖`
+are kept and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
+to float32 at a time. Then `p = softmax(β*s)`, `E = -(1/β*)·logsumexp(β*s)`,
 `H̄ = H(p)/log D_ff`, margin = top1 − top2. Phases: the last prompt token and
 the response tokens (every stop token excluded). Features per layer, β ∈
 {β*/2, β*, 2β*} and variant (`mean` over response positions, or `first`
 response position): `energy_prompt, energy_resp, delta_energy,
 norm_entropy_prompt, norm_entropy_resp, delta_norm_entropy, js,
-hellinger_sq, jaccard_topk, margin_prompt, margin_resp`.
+hellinger_sq, jaccard_topk, margin_prompt, margin_resp`. JS, Hellinger² and
+Jaccard compare the **mean** response distribution with the prompt one and
+are computed from log-probabilities (float32 underflow at large β).
 
 **Empty responses** (the model emits a stop token first) are valid samples,
-not failures: greedy decoding would reproduce them on every retry, and
-dropping them would bias the comparison between datasets. They are marked
-`empty_response = true` in `answers.parquet` and `features.parquet`, counted
-as completed, and never appear in `failed.jsonl`. Prompt-phase features are
-computed normally; response-phase features (`energy_resp`, `delta_*`, `js`,
-`hellinger_sq`, `jaccard_topk`, `margin_resp`), response baselines and
-`hidden.h5:response_last` are NaN by design.
+not failures: `empty_response = true`, prompt-phase features computed,
+response-phase features NaN by design, counted as completed.
+
+Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
 ## Layout
 
 ```
-energy_llm/            the package (CLI: energy-llm / python -m energy_llm)
-  cli.py               calibrate | extract | merge | status | smoke
-  config.py            per-run YAML (model + revision, prompt, beta grid, ...)
-  model.py             loading at a pinned revision, bf16 check, clean greedy config
-  bank.py              gamma + row norms of W_g * gamma (bank never materialised), bank.h5
-  prompting.py         chat template, system instruction, role mask
-  capture.py           greedy + teacher forcing + hooks + all metrics per question
-  metrics.py           float32 primitives
-  calibrate.py         beta* on a warm-up JSONL
-  extract.py           sharded, resumable runner
-  merge.py             final files + manifest; shard status
-  smoke.py             extract + merge on N questions in one process, summary
-  verify.py            verification only: checks vs the model and dev/reference.py
-  inspection.py        verification only: position/phase table of one id
-  signals.py storage.py manifest.py
-configs/               qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
-hpc/                   env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
-                       merge, smoke, verify), missing_shards.sh, RUNBOOK.md
-tests/                 CPU-only, tiny random Qwen2 + Llama models
-dev/                   verification only, never for the paper: dev questions, warm-up,
-                       naive float64 reference implementation (reference.py)
-docs/                  thesis .tex (unchanged) + MAPPING.md
-downstream/            NOT part of the module: labelling, probes, stats, notebooks
+energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
+  cli.py                 calibrate | extract | merge | status | smoke | verify | inspect
+  config.py              per-run YAML (model + revision, prompt, beta grid, shards, ...)
+  storage.py             atomic writes, JSONL logs, failure log, hashing, input items
+  manifest.py            provenance: git commit, library versions, hardware, seeds
+  core/                  what is computed (never touches the output dir)
+    model.py             loading at a pinned revision, bf16 check, clean greedy config
+    prompting.py         chat template, single system instruction, role mask
+    bank.py              gamma + row norms of W_g * gamma (bank never materialised), bank.h5
+    metrics.py           float32 primitives (E, H_bar, margin, JS, Hellinger^2, Jaccard)
+    capture.py           greedy + teacher forcing + hooks + all metrics per question
+  pipeline/              how it runs (everything under <output_dir>)
+    signals.py           SIGUSR1/SIGTERM -> finish the current id, exit 75
+    calibrate.py         beta* on a warm-up JSONL
+    extract.py           one shard: identity, resume, per-id files, failure log
+    merge.py             shard status; final files + manifest
+    smoke.py             extract + merge on N questions in one process, summary
+  verification/          never production outputs
+    verify.py            checks vs the model and dev/reference.py
+    inspection.py        position/phase table of one id
+configs/                 qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
+hpc/                     env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
+                         merge, smoke, verify), missing_shards.sh, RUNBOOK.md
+tests/                   CPU-only, tiny random Qwen2 + Llama models
+dev/                     verification only, never for the paper: dev questions, warm-up,
+                         naive float64 reference implementation (reference.py)
+docs/                    ARCHITECTURE.md, MAPPING.md, thesis .tex (unchanged)
+downstream/              NOT part of the module: labelling, probes, stats, notebooks
 ```
 
 ## Setup
 
 ```bash
-micromamba activate hopfield-llm          # cluster env name (hpc/env.sh: MAMBA_ENV)
+micromamba activate hopfield-llm          # cluster env name (hpc/env.sh: MAMBA_ENV); local dev: energy-lab
 pip install -r requirements.txt && pip install -e ".[dev]"
-pytest                                    # CPU only, ~30 s
+pytest                                    # CPU only, ~45 s, 106 tests
 ```
 
-`requirements.txt` is the single pinned dependency set. The cluster env
-previously had `transformers==4.45.2`, which ignores `dtype=` and loads
-float32 — update it with the command above. Loading fails unless the
-parameters are bfloat16; the actual dtype is recorded in every manifest.
+`requirements.txt` is the single pinned dependency set. transformers ≥ 4.56
+is required (older releases ignore `dtype=` and load float32). Loading fails
+unless the parameters are bfloat16; the actual dtype is recorded in every
+manifest.
 
 Optional check against real tokenizers (Llama needs `HF_TOKEN`):
 `ENERGY_LLM_TOKENIZER_DIRS=<qwen_dir>:<llama_dir> pytest tests/test_real_tokenizer.py`.
@@ -121,6 +130,55 @@ python -m energy_llm merge     --config C --input eval.jsonl --name N [--allow-i
 python -m energy_llm smoke     --config C --input eval.jsonl [--n 20]
 ```
 
+Exit codes: 0 done; 75 work remains (signal or retryable failures: the
+batch script requeues); anything else is a crash.
+
+### Robustness (summary; details in ARCHITECTURE.md §7)
+
+- **Shards**: contiguous blocks of `extraction.samples_per_shard` ids; one
+  array task per shard, each writing only its own directory.
+- **Atomic, idempotent**: each id's outputs go to one file (tmp + fsync +
+  rename); the id is appended to `completed.jsonl` only afterwards.
+- **Failures** are real errors only (exception, OOM, unexpected NaN/inf):
+  `failed.jsonl` with the attempt number, retried by the next run up to
+  `extraction.max_attempts`, never marked complete. Empty responses are not
+  failures.
+- **Signals**: `--signal=B:USR1@120` and SIGTERM are trapped; Python finishes
+  the current id, closes its files and exits 75; the batch script then
+  `scontrol requeue`s the task (up to `MAX_REQUEUES`). That is the only retry
+  mechanism. Preemption is requeued by SLURM itself (`--requeue`).
+- **Guards**: a shard refuses to resume under a different input, config or
+  β*; `extract` refuses a β* calibrated under another model/prompt/generation
+  setting, and any evaluation question that is in the warm-up set.
+- **Offline compute nodes**: `HF_HUB_OFFLINE=1`; models pre-downloaded to
+  `$SCRATCH_ROOT/hf_cache`.
+- **Orphaned merge**: every submission is logged in
+  `<extraction_dir>/submissions.log`; `missing_shards.sh … --resubmit`
+  cancels the pending merge of earlier submissions, relaunches only the
+  unfinished shards with no task still active, and submits a new merge with
+  `afterok` on the relaunched array and on the still-active earlier tasks.
+- **Logs**: `logs/extract_<array>_<task>.out` (appended across requeues).
+  Peak GPU memory per shard run is in `runs.jsonl` and
+  `manifest.json:shard_runs[].peak_gpu_mem_gb`.
+- Batch size is 1 (padding changes bf16 results).
+
+### Shard sizing
+
+Target: ~2 h per shard including model load, inside the 3 h walltime. The
+default `samples_per_shard: 1000` is an unmeasured, conservative estimate.
+Run the smoke test first: its seconds/question and model load time give the
+size directly (`(7200 − load) / s_per_question`). After the first real shard,
+`hpc/missing_shards.sh …` prints the same suggestion from measured runs.
+Changing it changes the shard plan, so use it for a **new** extraction name.
+
+### MIG profile
+
+`GRES` is a variable in `hpc/env.sh`. For the `a100_2g.10gb` trial:
+`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …` first (check the exact name
+with `sinfo -o '%P %G'`) and read the peak-memory line. Beyond the bf16 model
+and activations, only one layer's `W_g` in float32 (~90 MB for Qwen2.5-3B) is
+resident at a time.
+
 ## Verification (before fixing datasets or parameters)
 
 The cluster sequence is in [`hpc/RUNBOOK.md`](hpc/RUNBOOK.md): environment,
@@ -137,75 +195,14 @@ hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 m
 
 `verify` runs the production extract + merge on the first N questions into
 `extract/verify-<time>/` and prints PASS/FAIL per check with the maximum
-observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`):
-
-| check | what it compares |
-|---|---|
-| `reference` | production vs `dev/reference.py` (naive float64, explicit loops, no `energy_llm` code); tolerances from first-order Lipschitz bounds on the observed score error |
-| `gate` | real `gate_proj` output vs `‖w̃_i‖·√D·s_i` (tolerance 4·u of the model dtype), with a no-γ negative control that must exceed 10× the tolerance |
-| `tf_vs_cache` | residual x in the teacher-forced pass vs x during cached token-by-token generation (bf16 tolerance provisional) |
-| `alignment` | the last prompt position emits the first generated token (TF and generation logits); response positions = generated non-stop tokens; role mask |
-| `hidden`, `files_vs_memory`, `determinism` | hidden.h5 is the x the metrics read; stored files equal an in-memory recomputation (bit-exact on CPU) |
-| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariance to permuting memories; β→0 / β→∞ limits; H̄ non-increasing in β; JS(p,p)=Hel²(p,p)=0; H̄(β\*) on the warm-up set inside the calibration bracket |
-
-`inspect` reads a finished extraction (no model) and prints each position
-(token, role, prompt/response phase) and, per layer, E, H̄ and margin of each
-phase at β\*, cross-checked against `features.parquet`.
-
-**Bug found by the reference:** at large β (cosine scores give β\* in the
-hundreds or more) float32 probabilities underflow, which made the old
-`js_divergence` hit its log 2 clamp (0.693 instead of 0.681 in the
-regression test) and made top-k Jaccard rank arbitrary zeros. JS,
-Hellinger², Jaccard and the mean response distribution are now computed
-from log-probabilities.
-
-### Robustness
-
-- **Shards**: contiguous blocks of `extraction.samples_per_shard` ids; one
-  array task per shard, each writing only its own directory.
-- **Atomic, idempotent**: each id's outputs go to one file (tmp + fsync +
-  rename); the id is appended to `completed.jsonl` only afterwards.
-- **Failures** are real errors only (exception, OOM, unexpected NaN/inf).
-  They are never marked complete: they go to `failed.jsonl` with the attempt
-  number and are retried by the next run, up to `extraction.max_attempts`.
-  Empty responses are not failures (see above).
-- **Signals**: `--signal=B:USR1@120` and SIGTERM are trapped; Python finishes
-  the current id, closes its files and exits 75; the batch script then
-  `scontrol requeue`s the task (up to `MAX_REQUEUES`). That is the only retry
-  mechanism. Preemption is requeued by SLURM itself (`--requeue`).
-- **Guards**: a shard refuses to resume under a different input, config or
-  β*; `extract` refuses a β* calibrated under another model/prompt/generation
-  setting, and any evaluation question that is in the warm-up set.
-- **Offline compute nodes**: `HF_HUB_OFFLINE=1`; models pre-downloaded to
-  `$SCRATCH_ROOT/hf_cache`.
-- **Orphaned merge**: if a task runs out of requeues, its merge waits forever
-  (`DependencyNeverSatisfied`). Every submission is logged in
-  `<extraction_dir>/submissions.log`; `missing_shards.sh … --resubmit`
-  cancels the pending merge of earlier submissions, relaunches only the
-  unfinished shards with no task still active (never two writers on one
-  shard), and submits a new merge with `afterok` on the relaunched array and
-  on the still-active earlier tasks.
-- **Logs**: `logs/extract_<array>_<task>.out` (appended across requeues).
-- **Memory**: peak GPU memory per shard run is recorded in `runs.jsonl` and
-  in `manifest.json:shard_runs[].peak_gpu_mem_gb`.
-- Batch size is 1 (padding changes bf16 results).
-
-### Shard sizing
-
-Target: ~2 h per shard including model load, inside the 3 h walltime. The
-default `samples_per_shard: 1000` is an unmeasured, conservative estimate.
-Run the smoke test first: its seconds/question and model load time give the
-size directly (`(7200 − load) / s_per_question`). After the first real shard,
-`hpc/missing_shards.sh …` prints the same suggestion from measured runs. Changing it changes
-the shard plan, so use it for a **new** extraction name.
-
-### MIG profile
-
-`GRES` is a variable in `hpc/env.sh`. For the `a100_2g.10gb` trial:
-`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …` first (check the exact name
-with `sinfo -o '%P %G'`) and read the peak-memory line. The bank is never
-materialised: beyond the bf16 model and activations, only one layer's `W_g`
-in float32 (~90 MB for Qwen2.5-3B) is resident at a time.
+observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`).
+The checks (`reference`, `gate`, `tf_vs_cache`, `alignment`, `hidden`,
+`files_vs_memory`, `permutation`, `limits`, `monotone`, `self_divergence`,
+`determinism`, `calibration`) and their tolerances are tabulated in
+[`docs/MAPPING.md`](docs/MAPPING.md). `inspect` reads a finished extraction
+(no model) and prints each position (token, role, prompt/response phase)
+and, per layer, E, H̄ and margin of each phase at β\*, cross-checked against
+`features.parquet`.
 
 ## Outputs (`$SCRATCH_ROOT/energy_llm/runs/<model>/extract/<name>/`)
 
@@ -219,21 +216,19 @@ in float32 (~90 MB for Qwen2.5-3B) is resident at a time.
 | `hidden.h5` | `/<id>/{prompt_last, response_last}` `[layers, D]` float16 |
 | `bank.h5` | γ and `‖W̃_i‖` per layer |
 
-## What moved or was removed in the restructure
+Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.
 
-- **Moved to `downstream/`** (kept intact, not installed, written for the
-  previous artefact format): labelling (`labeling.py`, `label_samples.py`,
-  `label_human.py`), probe / CV / statistics (`probe.py`, `stats.py`,
-  `run_probe.py`), the old feature table and β-sensitivity scripts, the
-  TruthfulQA/TriviaQA loaders (`downstream/prep/`, to export the JSONL
-  inputs), all notebooks, the E1–E3 configs, their SLURM jobs and tests, and
-  the audit documents of the old runs.
-- **Removed** (approved): `scripts/build_banks.py`, `calibrate_beta.py`,
-  `capture_trajectories.py` (replaced by the CLI); `hpc/banks.sbatch`,
-  `calibrate.sbatch`, `trajectories.sbatch`, `submit_pipeline.sh` (replaced;
-  their resource values are preserved in `hpc/env.sh`; the bash retry loop
-  is gone); `requirements-hpc.txt` (conflicting pins); `.env.example`
-  (stale); `pytest_local.log`.
-- **Rewritten**: bank (γ folded in), hook location, metrics, prompting,
-  calibration, runner, output format. Value/`w2` banks and 4-bit loading
-  were dropped (no experiment may use them; reported runs are bf16).
+## History
+
+- **2026-10-27**: package split into `core/` (what is computed), `pipeline/`
+  (how it runs) and `verification/`; duplicated helpers merged (failure log,
+  CUDA release, item paths, shard-run reading); behaviour unchanged (same
+  106 tests). `docs/ARCHITECTURE.md` added.
+- **2026-10 restructure**: labelling, probe/CV/statistics, the old feature
+  table and β-sensitivity scripts, the TruthfulQA/TriviaQA loaders, all
+  notebooks, the E1–E3 configs and their jobs/tests moved to `downstream/`
+  (intact, not installed, written for the previous artefact format);
+  `scripts/*.py`, the old sbatch files, `requirements-hpc.txt` and
+  `.env.example` removed; bank (γ folded in), hook location, metrics,
+  prompting, calibration, runner and output format rewritten. Value/`w2`
+  banks and 4-bit loading dropped. Pre-restructure state: commit `28f00ce`.

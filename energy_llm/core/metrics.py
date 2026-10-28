@@ -1,7 +1,7 @@
 """Retrieval metrics, all in float32 torch.
 
 Per layer and token, with x the residual at the input of
-post_attention_layernorm and the unit-row bank of :mod:`energy_llm.bank`:
+post_attention_layernorm and the unit-row bank of :mod:`energy_llm.core.bank`:
 
     x_hat  = x / sqrt(mean(x^2) + eps)
     s      = (bank @ x_hat) / sqrt(D)          cosines in [-1, 1]  (computed in bank.Bank.scores)

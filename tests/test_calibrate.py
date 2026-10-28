@@ -3,8 +3,8 @@ import json
 import numpy as np
 import pytest
 
-from energy_llm.calibrate import CalibrationError, interpolate_log_beta, run_calibrate
-from energy_llm.extract import run_extract
+from energy_llm.pipeline.calibrate import CalibrationError, interpolate_log_beta, run_calibrate
+from energy_llm.pipeline.extract import run_extract
 from energy_llm.storage import read_items
 from tests.conftest import QUESTION_WORDS, make_bundle, make_cfg, make_questions, write_jsonl
 

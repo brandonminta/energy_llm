@@ -5,10 +5,10 @@ import json
 
 import pytest
 
-from energy_llm.calibrate import run_calibrate
-from energy_llm.inspection import inspect_item
+from energy_llm.pipeline.calibrate import run_calibrate
+from energy_llm.verification.inspection import inspect_item
 from energy_llm.storage import read_items
-from energy_llm.verify import format_report, run_verify
+from energy_llm.verification.verify import format_report, run_verify
 from tests.conftest import QUESTION_WORDS, WARMUP_WORDS, make_bundle, make_cfg, make_questions, write_jsonl
 
 
@@ -38,7 +38,7 @@ def test_verify_all_pass_on_tiny_models(run):
 
 
 def test_verify_fails_when_gamma_is_ignored(run, monkeypatch):
-    from energy_llm import bank as bank_mod
+    from energy_llm.core import bank as bank_mod
 
     cfg, bundle, items = run
 
@@ -59,7 +59,7 @@ def test_cli_verify_exit_code(run, tmp_path, monkeypatch):
     from energy_llm import cli
 
     cfg, bundle, items = run
-    monkeypatch.setattr(cli, "_load", lambda args, stopper: (cfg, items, bundle, 0.0))
+    monkeypatch.setattr(cli, "_load", lambda args: (cfg, items, bundle, 0.0))
     p = tmp_path / "c.yaml"
     p.write_text(yaml.safe_dump(cfg.to_dict()))
     assert cli.main(["verify", "--config", str(p), "--input", "unused", "--n", "1"]) == 0

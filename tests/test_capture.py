@@ -5,12 +5,12 @@ import pytest
 import torch
 from scipy.special import logsumexp
 
-from energy_llm import capture, metrics
-from energy_llm.bank import build_bank
-from energy_llm.capture import (
+from energy_llm.core import capture, metrics
+from energy_llm.core.bank import build_bank
+from energy_llm.core.capture import (
     FEATURES, RESPONSE_FEATURES, NonFiniteError, ResidualHooks, compute_item, forward_item,
 )
-from energy_llm.prompting import (
+from energy_llm.core.prompting import (
     ROLE_INSTRUCTION, ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, PromptError,
     build_prompt, check_template,
 )

@@ -92,7 +92,7 @@ def make_pair(arch: str):
 
 
 def make_bundle(model, tok, max_new_tokens: int = 8):
-    from energy_llm.model import prepare_bundle
+    from energy_llm.core.model import prepare_bundle
 
     return prepare_bundle(model, tok, max_new_tokens, require_bf16=False)
 
@@ -141,7 +141,7 @@ def make_cfg(out_dir: Path, arch: str = "qwen2", **extraction):
 @pytest.fixture()
 def calibrated(tmp_path, qwen_pair):
     """A calibrated tiny Qwen run with an evaluation JSONL of 7 items."""
-    from energy_llm.calibrate import run_calibrate
+    from energy_llm.pipeline.calibrate import run_calibrate
     from energy_llm.storage import read_items
 
     model, tok = qwen_pair

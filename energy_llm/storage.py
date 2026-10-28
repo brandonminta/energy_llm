@@ -12,6 +12,9 @@ import hashlib
 import json
 import os
 import re
+import socket
+import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -84,6 +87,32 @@ def read_jsonl(path: str | Path) -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return records
+
+
+# ----------------------------------------------------------------------
+# Failure log: one record per failed attempt of one id (calibrate and extract)
+# ----------------------------------------------------------------------
+
+def read_failures(path: str | Path) -> tuple[dict[str, int], dict[str, str]]:
+    """Attempts so far per id and the last recorded error, from a
+    ``failed.jsonl`` (missing file: no attempts)."""
+    attempts: dict[str, int] = {}
+    last_error: dict[str, str] = {}
+    for rec in read_jsonl(path):
+        attempts[rec["id"]] = attempts.get(rec["id"], 0) + 1
+        last_error[rec["id"]] = rec.get("error", "")
+    return attempts, last_error
+
+
+def append_failure(path: str | Path, item_id: str, attempt: int, max_attempts: int,
+                   exc: BaseException) -> None:
+    """Record one failed attempt. Call from inside the ``except`` block so
+    the traceback is the one of ``exc``."""
+    append_jsonl(path, {
+        "id": item_id, "attempt": attempt, "max_attempts": max_attempts,
+        "error": repr(exc), "traceback": traceback.format_exc(),
+        "time": time.time(), "host": socket.gethostname(),
+    })
 
 
 def sha256_file(path: str | Path) -> str:

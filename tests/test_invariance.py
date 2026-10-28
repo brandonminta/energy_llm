@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from energy_llm import metrics
-from energy_llm.bank import build_bank
-from energy_llm.capture import ResidualHooks, compute_item, forward_item
-from energy_llm.prompting import build_prompt
-from energy_llm.verify import PermutedBank
+from energy_llm.core import metrics
+from energy_llm.core.bank import build_bank
+from energy_llm.core.capture import ResidualHooks, compute_item, forward_item
+from energy_llm.core.prompting import build_prompt
+from energy_llm.verification.verify import PermutedBank
 from tests.conftest import DATE, SYSTEM, make_bundle
 
 Q = "what is the capital of france"

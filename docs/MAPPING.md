@@ -5,7 +5,9 @@
 > overrides `docs/fundamentals-FINAL.tex` and `docs/metodology-FINAL.tex`
 > wherever they disagree. The `.tex` files are intentionally left untouched.
 > The previous mapping (which followed the `.tex` exactly) is in git history
-> at commit `28f00ce`.
+> at commit `28f00ce`. For a description of what the code does today, module by
+> module, and an audit of its inconsistencies, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> Module paths below are relative to `energy_llm/` (`core.model` = `energy_llm/core/model.py`).
 
 ## Deliberate departures from the `.tex` (approved 2026-10-26)
 
@@ -29,48 +31,48 @@
 | Specification item | Module / function | Config key / artefact |
 |---|---|---|
 | Input JSONL `{id, question}`, other fields dropped | `storage.read_items` | `--input` |
-| Model + exact revision, bf16 enforced, dims from checkpoint | `model.load_model`, `model.prepare_bundle`, `model.model_dims` | `model.id`, `model.revision`, `model.dtype` |
-| Chat template, single system instruction, `date_string` | `prompting.build_prompt`, `prompting.check_template` | `prompt.system`, `prompt.date_string` |
-| Role mask (template / instruction / question / response) | `prompting.build_prompt` (offset mapping), `capture.ForwardTrace.roles` | `traces.h5:/<id>/role_mask` |
-| Greedy generation, per-token log-prob / entropy, truncation | `capture.forward_item`, `model.clean_generation_config` | `generation.max_new_tokens`; `answers.parquet` |
-| Stop-token exclusion | `model.stop_token_ids`, `capture.forward_item` | `answers.parquet:stop_token_id, n_response_tokens` |
-| Teacher forcing, argmax == greedy check | `capture.forward_item` | `answers.parquet:tf_mismatch_*`; `manifest.json:checks` |
-| Hook at the input of `post_attention_layernorm` | `capture.ResidualHooks` | — |
-| Bank `W̃ = W_g·γ`: only γ and row norms precomputed and saved | `bank.build_bank`, `bank.write_bank_h5` | `bank.h5` |
-| Scores per layer, transient float32 `W_g` | `bank.Bank.scores`, `capture._layer_scores` | — |
-| x̂, p, E, H̄, margin (float32) | `metrics.*` | — |
-| Empty response as a valid sample | `capture._phase_features`, `capture.compute_item` (`RESPONSE_FEATURES`) | `answers/features.parquet:empty_response` |
-| Peak GPU memory per shard | `manifest.peak_gpu_memory_gb`, `extract.run_extract` | `runs.jsonl`, `manifest.json:shard_runs` |
-| Phases, variants mean/first, β*·{½,1,2} | `capture.compute_item`, `capture._phase_features` | `extraction.beta_multipliers`; `features.parquet` |
-| JS, Hellinger², Jaccard top-k | `metrics.js_divergence`, `hellinger_sq`, `jaccard_topk` | `extraction.jaccard_top_k` |
-| Per-token traces at β* | `capture.compute_item` | `traces.h5` |
-| Residuals for the probe, float16 | `capture.compute_item` | `extraction.hidden_layers`; `hidden.h5` |
-| Baselines | `capture.compute_item` | `baselines.parquet` |
-| β* calibration, H̄* = 0.55 | `calibrate.run_calibrate`, `calibrate.interpolate_log_beta` | `calibration.*`; `calibration/beta_star.json` |
-| extract never recalibrates; context + disjointness checks | `extract.load_beta_star` | — |
-| Shards, completion index, failures, resume | `extract.run_extract`, `extract.shard_state` | `extraction.samples_per_shard`, `extraction.max_attempts` |
-| SIGUSR1 / SIGTERM clean exit | `signals.GracefulStop`; `hpc/env.sh:run_requeueable` | exit code 75 |
-| Merge + manifest | `merge.run_merge` | `manifest.json` and the files above |
-| Missing-shard report | `merge.status_report`; `hpc/missing_shards.sh` | `energy-llm status` |
+| Model + exact revision, bf16 enforced, dims from checkpoint | `core.model.load_model`, `core.model.prepare_bundle`, `core.model.model_dims` | `model.id`, `model.revision`, `model.dtype` |
+| Chat template, single system instruction, `date_string` | `core.prompting.build_prompt`, `core.prompting.check_template` | `prompt.system`, `prompt.date_string` |
+| Role mask (template / instruction / question / response) | `core.prompting.build_prompt` (offset mapping), `core.capture.ForwardTrace.roles` | `traces.h5:/<id>/role_mask` |
+| Greedy generation, per-token log-prob / entropy, truncation | `core.capture.forward_item`, `core.model.clean_generation_config` | `generation.max_new_tokens`; `answers.parquet` |
+| Stop-token exclusion | `core.model.stop_token_ids`, `core.capture.forward_item` | `answers.parquet:stop_token_id, n_response_tokens` |
+| Teacher forcing, argmax == greedy check | `core.capture.forward_item` | `answers.parquet:tf_mismatch_*`; `manifest.json:checks` |
+| Hook at the input of `post_attention_layernorm` | `core.capture.ResidualHooks` | — |
+| Bank `W̃ = W_g·γ`: only γ and row norms precomputed and saved | `core.bank.build_bank`, `core.bank.write_bank_h5` | `bank.h5` |
+| Scores per layer, transient float32 `W_g` | `core.bank.Bank.scores`, `core.capture._layer_scores` | — |
+| x̂, p, E, H̄, margin (float32) | `core.metrics.*` | — |
+| Empty response as a valid sample | `core.capture._phase_features`, `core.capture.compute_item` (`RESPONSE_FEATURES`) | `answers/features.parquet:empty_response` |
+| Peak GPU memory per shard | `manifest.peak_gpu_memory_gb`, `pipeline.extract.run_extract` | `runs.jsonl`, `manifest.json:shard_runs` |
+| Phases, variants mean/first, β*·{½,1,2} | `core.capture.compute_item`, `core.capture._phase_features` | `extraction.beta_multipliers`; `features.parquet` |
+| JS, Hellinger², Jaccard top-k | `core.metrics.js_divergence`, `hellinger_sq`, `jaccard_topk` | `extraction.jaccard_top_k` |
+| Per-token traces at β* | `core.capture.compute_item` | `traces.h5` |
+| Residuals for the probe, float16 | `core.capture.compute_item` | `extraction.hidden_layers`; `hidden.h5` |
+| Baselines | `core.capture.compute_item` | `baselines.parquet` |
+| β* calibration, H̄* = 0.55 | `pipeline.calibrate.run_calibrate`, `pipeline.calibrate.interpolate_log_beta` | `calibration.*`; `calibration/beta_star.json` |
+| extract never recalibrates; context + disjointness checks | `pipeline.extract.load_beta_star` | — |
+| Shards, completion index, failures, resume | `pipeline.extract.run_extract`, `pipeline.extract.shard_state` | `extraction.samples_per_shard`, `extraction.max_attempts` |
+| SIGUSR1 / SIGTERM clean exit | `pipeline.signals.GracefulStop`; `hpc/env.sh:run_requeueable` | exit code 75 |
+| Merge + manifest | `pipeline.merge.run_merge` | `manifest.json` and the files above |
+| Missing-shard report | `pipeline.merge.status_report`; `hpc/missing_shards.sh` | `energy-llm status` |
 | Orphaned-merge recovery | `hpc/missing_shards.sh --resubmit`, `hpc/env.sh:record_submission` | `<extraction_dir>/submissions.log` |
-| Smoke test | `smoke.run_smoke`; `hpc/smoke.sbatch` | `energy-llm smoke`; `smoke_report.json` |
-| Divergences in the log domain (no float32 underflow at large β) | `metrics.log_mean_distribution`, `js_divergence`, `hellinger_sq`, `jaccard_topk` (take log-probabilities) | — |
+| Smoke test | `pipeline.smoke.run_smoke`; `hpc/smoke.sbatch` | `energy-llm smoke`; `smoke_report.json` |
+| Divergences in the log domain (no float32 underflow at large β) | `core.metrics.log_mean_distribution`, `js_divergence`, `hellinger_sq`, `jaccard_topk` (take log-probabilities) | — |
 
 ## Verification → code (not part of the production path)
 
 | Check (MAPPING item verified) | Implementation | Tolerance and justification |
 |---|---|---|
 | Independent float64 reference of every quantity | `dev/reference.py` (no `energy_llm` imports) | — |
-| Production == reference | `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); derived quantities by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2βδ, JS/Hel² 4βδ, Δ· twice; Jaccard 1/k; +1e-5 float32 reduction floor |
-| Read point + γ integration (gate reconstruction) | `verify.check_gate` | 4·u of the model dtype (three roundings in the model path), floor 1e-5; no-γ control must exceed 10× |
-| TF == cached generation, per position | `verify.check_tf_vs_cache` | fp32 1e-4; bf16 5e-2 **provisional, empirical** (tokens must agree) |
-| Position alignment | `verify.run_verify` (alignment) | exact (booleans) |
-| hidden.h5 / traces / features coherence | `verify.run_verify` (hidden, files_vs_memory) | exact on CPU, 1e-5 on GPU |
-| Permutation invariance | `verify.PermutedBank`; `tests/test_invariance.py` | 1e-5 (float32 summation order) |
-| β limits, monotonicity, self-divergence | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰; JS(p,p) ≤ 1e-7 (one rounding in logaddexp) |
-| Calibration reproduces H* | `verify._calibration_check` | H̄ monotone ⇒ H̄(β*) must lie between the two bracketing grid values |
-| Determinism | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, 1e-5 on GPU |
-| Manual review | `inspection.inspect_item` (`energy-llm inspect`) | — |
+| Production == reference | `verification.verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); derived quantities by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2βδ, JS/Hel² 4βδ, Δ· twice; Jaccard 1/k; +1e-5 float32 reduction floor |
+| Read point + γ integration (gate reconstruction) | `verification.verify.check_gate` | 4·u of the model dtype (three roundings in the model path), floor 1e-5; no-γ control must exceed 10× |
+| TF == cached generation, per position | `verification.verify.check_tf_vs_cache` | fp32 1e-4; bf16 5e-2 **provisional, empirical** (tokens must agree) |
+| Position alignment | `verification.verify.run_verify` (alignment) | exact (booleans) |
+| hidden.h5 / traces / features coherence | `verification.verify.run_verify` (hidden, files_vs_memory) | exact on CPU, 1e-5 on GPU |
+| Permutation invariance | `verification.verify.PermutedBank`; `tests/test_invariance.py` | 1e-5 (float32 summation order) |
+| β limits, monotonicity, self-divergence | `verification.verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰; JS(p,p) ≤ 1e-7 (one rounding in logaddexp) |
+| Calibration reproduces H* | `verification.verify._calibration_check` | H̄ monotone ⇒ H̄(β*) must lie between the two bracketing grid values |
+| Determinism | `verification.verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, 1e-5 on GPU |
+| Manual review | `verification.inspection.inspect_item` (`energy-llm inspect`) | — |
 | Cluster sequence | `hpc/RUNBOOK.md`, `hpc/verify.sbatch` | — |
 
 ## Implementation notes

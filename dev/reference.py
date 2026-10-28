@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 
-# Written out independently of energy_llm.capture.FEATURES; a test checks the order.
+# Written out independently of energy_llm.core.capture.FEATURES; a test checks the order.
 FEATURES = (
     "energy_prompt", "energy_resp", "delta_energy",
     "norm_entropy_prompt", "norm_entropy_resp", "delta_norm_entropy",

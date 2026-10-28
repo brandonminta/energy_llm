@@ -9,10 +9,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from energy_llm.capture import compute_item
+from energy_llm.core.capture import compute_item
 from energy_llm.cli import main as cli_main
-from energy_llm.extract import plan_shards, run_extract, shard_path, shard_state
-from energy_llm.merge import run_merge, status_report
+from energy_llm.pipeline.extract import plan_shards, run_extract, shard_path, shard_state
+from energy_llm.pipeline.merge import run_merge, status_report
 from energy_llm.storage import item_key, read_items, read_jsonl
 
 PARQUETS = ("answers.parquet", "features.parquet", "baselines.parquet")
@@ -164,7 +164,7 @@ def test_sigusr1_stops_after_current_id_and_resume_completes(calibrated):
     import os
     import signal
 
-    from energy_llm.signals import GracefulStop
+    from energy_llm.pipeline.signals import GracefulStop
 
     cfg, bundle, ev, _ = calibrated
     items = read_items(ev)
@@ -200,8 +200,8 @@ def test_cli_extract_skips_finished_shard_without_loading_model(calibrated, tmp_
 
 
 def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
-    from energy_llm.capture import ResidualHooks, forward_item
-    from energy_llm.prompting import build_prompt
+    from energy_llm.core.capture import ResidualHooks, forward_item
+    from energy_llm.core.prompting import build_prompt
 
     cfg, bundle, ev, _ = calibrated
     items = read_items(ev)
@@ -233,7 +233,7 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
 
 
 def test_smoke_summary(calibrated, capsys):
-    from energy_llm.smoke import format_summary, run_smoke
+    from energy_llm.pipeline.smoke import format_summary, run_smoke
 
     cfg, bundle, ev, rec = calibrated
     s = run_smoke(cfg, bundle, read_items(ev), n=5, name="smoke-test")

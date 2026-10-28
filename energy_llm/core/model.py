@@ -7,13 +7,14 @@ checked against the actual weights; nothing is hardcoded per model.
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
-log = logging.getLogger("energy_llm.model")
+log = logging.getLogger("energy_llm.core.model")
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,13 @@ def prepare_bundle(model: nn.Module, tokenizer, max_new_tokens: int,
         generation_config=gen_cfg, device=next(model.parameters()).device,
         dtype=str(dtype).replace("torch.", ""),
     )
+
+
+def release_cuda() -> None:
+    """Free cached GPU memory between questions (after a failure or OOM)."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def load_model(model_id: str, revision: str, device: str = "auto"):

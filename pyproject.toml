@@ -17,8 +17,8 @@ dev = ["pytest==9.0.3", "scipy==1.17.0"]
 [project.scripts]
 energy-llm = "energy_llm.cli:main"
 
-[tool.setuptools]
-packages = ["energy_llm"]
+[tool.setuptools.packages.find]
+include = ["energy_llm*"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }

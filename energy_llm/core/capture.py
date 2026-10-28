@@ -28,10 +28,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from energy_llm import metrics
-from energy_llm.bank import Bank
-from energy_llm.model import ModelBundle, decoder_layers
-from energy_llm.prompting import ROLE_RESPONSE, ROLE_TEMPLATE, Prompt
+from energy_llm.core import metrics
+from energy_llm.core.bank import Bank
+from energy_llm.core.model import ModelBundle, decoder_layers
+from energy_llm.core.prompting import ROLE_RESPONSE, ROLE_TEMPLATE, Prompt
 
 FEATURES = (
     "energy_prompt", "energy_resp", "delta_energy",
@@ -265,8 +265,7 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
             raise NonFiniteError(f"non-finite values in {name}")
 
     gen = trace.gen_ids
-    stops = set(bundle.stop_token_ids)
-    resp_j = [j for j, t in enumerate(gen) if t not in stops]
+    resp_j = [p - trace.n_prompt for p in trace.response_positions]   # indices into gen
     tok = bundle.tokenizer
     answer = {
         "id": item_id,

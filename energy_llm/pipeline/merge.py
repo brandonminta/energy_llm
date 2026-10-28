@@ -21,13 +21,13 @@ from pathlib import Path
 import numpy as np
 
 from energy_llm import manifest
-from energy_llm.capture import FEATURES, VARIANTS
 from energy_llm.config import RunConfig
-from energy_llm.extract import ShardState, plan_shards, read_item, shard_path, shard_state
-from energy_llm.prompting import ROLE_NAMES
-from energy_llm.storage import (
-    Item, atomic_path, item_key, load_json, read_jsonl, sha256_file, write_json_atomic,
+from energy_llm.core.capture import FEATURES, VARIANTS
+from energy_llm.core.prompting import ROLE_NAMES
+from energy_llm.pipeline.extract import (
+    ShardState, item_path, plan_shards, read_item, shard_path, shard_state,
 )
+from energy_llm.storage import Item, atomic_path, load_json, read_jsonl, sha256_file, write_json_atomic
 
 
 def collect_states(cfg: RunConfig, items: list[Item], name: str,
@@ -46,22 +46,27 @@ def collect_states(cfg: RunConfig, items: list[Item], name: str,
     return states
 
 
+def _shard_runs(ext_dir: Path, states: list[ShardState]) -> list[dict]:
+    """Every process-run record (``runs.jsonl``) of every shard, in shard order."""
+    return [r for st in states for r in read_jsonl(shard_path(ext_dir, st.index) / "runs.jsonl")]
+
+
+def _exhausted_ids(states: list[ShardState]) -> dict[str, str]:
+    """id -> last error, for ids out of attempts."""
+    return {i: st.last_error.get(i, "") for st in states for i in sorted(st.exhausted)}
+
+
 def status_report(cfg: RunConfig, items: list[Item], name: str, input_path: str | Path) -> dict:
     states = collect_states(cfg, items, name, input_path)
-    ext_dir = cfg.extraction_dir(name)
-    rates, loads = [], []
-    for st in states:
-        for r in read_jsonl(shard_path(ext_dir, st.index) / "runs.jsonl"):
-            if r.get("sec_per_item"):
-                rates.append(r["sec_per_item"])
-            if r.get("model_load_s"):
-                loads.append(r["model_load_s"])
+    runs = _shard_runs(cfg.extraction_dir(name), states)
+    rates = [r["sec_per_item"] for r in runs if r.get("sec_per_item")]
+    loads = [r["model_load_s"] for r in runs if r.get("model_load_s")]
     report = {
         "num_shards": len(states),
         "missing_shards": [st.index for st in states if not st.done],
         "shards": [{"index": st.index, "ids": len(st.ids), "completed": len(st.completed),
                     "exhausted": len(st.exhausted), "pending": len(st.pending)} for st in states],
-        "exhausted_ids": {i: st.last_error.get(i, "") for st in states for i in sorted(st.exhausted)},
+        "exhausted_ids": _exhausted_ids(states),
     }
     if rates:
         spi = float(np.median(rates))
@@ -129,8 +134,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                                   "prompt_last = last prompt token, response_last = last "
                                   "non-stop response token: [layers, D] float16")
             for item_id in order:
-                rec = read_item(shard_path(ext_dir, shard_of[item_id]) / "items" /
-                                f"{item_key(item_id)}.h5")
+                rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
                 answers.append(rec["answer"])
                 baselines.append(rec["baselines"])
                 feats.append(rec["features"])
@@ -154,14 +158,10 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
     with atomic_path(ext_dir / "bank.h5") as tmp:
         shutil.copyfile(cfg.bank_h5_path, tmp)
 
-    runs = []
-    for st in states:
-        for r in read_jsonl(shard_path(ext_dir, st.index) / "runs.jsonl"):
-            runs.append({k: r.get(k) for k in ("shard_index", "started", "elapsed_s",
-                                               "model_load_s", "sec_per_item", "model_dtype",
-                                               "peak_gpu_mem_gb",
-                                               "n_done_this_run", "n_failed_this_run",
-                                               "stopped_by_signal", "hardware", "code")})
+    run_keys = ("shard_index", "started", "elapsed_s", "model_load_s", "sec_per_item",
+                "model_dtype", "peak_gpu_mem_gb", "n_done_this_run", "n_failed_this_run",
+                "stopped_by_signal", "hardware", "code")
+    runs = [{k: r.get(k) for k in run_keys} for r in _shard_runs(ext_dir, states)]
     dtypes = sorted({r["model_dtype"] for r in runs if r.get("model_dtype")})
     out = {
         "name": name,
@@ -176,7 +176,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                   "n_items": len(items)},
         "counts": {"completed": len(order), "exhausted": sum(len(s.exhausted) for s in states),
                    "pending": sum(len(s.pending) for s in states)},
-        "exhausted_ids": {i: st.last_error.get(i, "") for st in states for i in sorted(st.exhausted)},
+        "exhausted_ids": _exhausted_ids(states),
         "incomplete_shards": missing,
         "checks": {
             "xhat_norm_max_rel_dev": max((a["xhat_norm_max_rel_dev"] for a in answers), default=None),

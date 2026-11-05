@@ -26,7 +26,7 @@ def _both(bundle, bank, question, beta):
     tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, question, date))
     hooks.remove()
     L = bundle.dims.n_layers
-    prod = compute_item(bundle, bank, tr, "x", beta, list(range(L)))
+    prod = compute_item(bundle, bank, tr, "x", [beta], list(range(L)))
     r = ref.reference_item(bundle.model, {l: tr.residuals[l].numpy() for l in range(L)},
                            tr.n_prompt, tr.gen_ids, bundle.stop_token_ids, list(range(L)), beta)
     return tr, prod, r
@@ -76,7 +76,7 @@ def test_reference_detects_a_wrong_pipeline(qwen_pair, monkeypatch):
 
     monkeypatch.setattr(bank_mod.Bank, "scores", no_gamma)
     L = bundle.dims.n_layers
-    prod = compute_item(bundle, bank, tr, "x", 10.0, list(range(L)))
+    prod = compute_item(bundle, bank, tr, "x", [10.0], list(range(L)))
     r = ref.reference_item(bundle.model, {l: tr.residuals[l].numpy() for l in range(L)},
                            tr.n_prompt, tr.gen_ids, bundle.stop_token_ids, list(range(L)), 10.0)
     assert not compare_with_reference(bundle, bank, tr, prod, r, list(range(L)), 10.0)["ok"]

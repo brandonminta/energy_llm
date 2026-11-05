@@ -195,6 +195,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                 read_bank_fingerprint(cfg.bank_h5_path) != fingerprint:
             raise RuntimeError("model weights differ from the calibrated bank")
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
+        betas = cfg.extraction.betas(beta_star)
         hooks = ResidualHooks(bundle.model)
         t_items = time.time()
         try:
@@ -205,7 +206,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                     prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question,
                                           cfg.prompt.date_string)
                     trace = forward_item(bundle, hooks, prompt)
-                    res = compute(bundle, bank, trace, it.id, beta_star, layers_h)
+                    res = compute(bundle, bank, trace, it.id, betas, layers_h)
                     del trace
                     write_item(sdir, res)
                     n_done += 1

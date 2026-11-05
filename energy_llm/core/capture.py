@@ -173,8 +173,10 @@ def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
 
 @torch.inference_mode()
 def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: str,
-                 beta_star: float, hidden_layers: list[int]) -> ItemResult:
+                 betas: list[float], hidden_layers: list[int]) -> ItemResult:
+    """``betas``: the extraction grid with beta* last (``ExtractionConfig.betas``)."""
     dims = bundle.dims
+    beta_star = betas[-1]
     L, T = dims.n_layers, trace.n_prompt + len(trace.gen_ids)
 
     energy_tr = torch.empty(L, T)
@@ -242,7 +244,7 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "empty_response": empty,
     }
     return ItemResult(
-        item_id=item_id, answer=answer, baselines=baselines, betas=[beta_star],
+        item_id=item_id, answer=answer, baselines=baselines, betas=list(betas),
         role_mask=np.asarray(trace.roles, dtype=np.int8),
         hidden_prompt_last=hidden_p.astype(np.float16),
         hidden_response_last=hidden_r.astype(np.float16), **out,

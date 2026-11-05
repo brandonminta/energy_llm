@@ -26,8 +26,9 @@ calibration:
   num_grid: 81               # 20 points per decade
 
 extraction:
-  beta_multipliers: [0.5, 1.0, 2.0]   # features at beta*/2, beta*, 2 beta*
-  jaccard_top_k: 64
+  beta_grid_log10: {min: 0.0, max: 4.0, num: 9}   # absolute betas 10^0 .. 10^4; beta* appended last
+  topk_mass_k: 10                     # topk_mass: share of p in the 10 largest memories
+  topk_ids_k: 100                     # topk_ids: indices of the 100 largest memories
   hidden_layers: all                  # residuals saved in float16 for the probe
   samples_per_shard: 1000             # see README "Shard sizing"
   max_attempts: 3                     # per id, across runs

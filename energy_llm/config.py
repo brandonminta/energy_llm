@@ -2,8 +2,8 @@
 
 The YAML is the complete scientific specification of a run: model and exact
 hub revision, dtype, prompt (single system instruction, no few-shot),
-generation cap, calibration target and grid, beta sensitivity multipliers,
-probe layers and seed. beta* itself is not in the YAML: ``calibrate`` writes
+generation cap, calibration target and grid, extraction beta grid and top-k
+sizes, probe layers and seed. beta* itself is not in the YAML: ``calibrate`` writes
 it to ``<output_dir>/calibration/beta_star.json`` and ``extract`` reads it.
 """
 
@@ -53,18 +53,28 @@ class CalibrationConfig:
     num_grid: int = 81
 
     def beta_grid(self) -> list[float]:
-        n = self.num_grid
-        step = (self.log10_beta_max - self.log10_beta_min) / (n - 1)
-        return [10.0 ** (self.log10_beta_min + i * step) for i in range(n)]
+        return log_grid(self.log10_beta_min, self.log10_beta_max, self.num_grid)
+
+
+def log_grid(log10_min: float, log10_max: float, num: int) -> list[float]:
+    step = (log10_max - log10_min) / (num - 1)
+    return [10.0 ** (log10_min + i * step) for i in range(num)]
 
 
 @dataclass
 class ExtractionConfig:
-    beta_multipliers: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
-    jaccard_top_k: int = 64
+    # absolute log-spaced betas (s is a cosine, so identical across models);
+    # beta* is always appended: betas(beta*)[-1] == beta*
+    beta_grid_log10: dict = field(default_factory=lambda: {"min": 0.0, "max": 4.0, "num": 9})
+    topk_mass_k: int = 10
+    topk_ids_k: int = 100
     hidden_layers: str | list[int] = "all"
     samples_per_shard: int = 1000
     max_attempts: int = 3
+
+    def betas(self, beta_star: float) -> list[float]:
+        g = self.beta_grid_log10
+        return log_grid(g["min"], g["max"], g["num"]) + [float(beta_star)]
 
 
 @dataclass
@@ -158,10 +168,13 @@ class RunConfig:
         if c.num_grid < 2 or c.log10_beta_max <= c.log10_beta_min:
             raise ConfigError("calibration grid is empty")
         e = self.extraction
-        if 1.0 not in e.beta_multipliers or any(m <= 0 for m in e.beta_multipliers):
-            raise ConfigError("extraction.beta_multipliers must be positive and include 1.0")
-        if e.jaccard_top_k < 1:
-            raise ConfigError("extraction.jaccard_top_k must be >= 1")
+        g = e.beta_grid_log10
+        if not isinstance(g, dict) or set(g) != {"min", "max", "num"}:
+            raise ConfigError("extraction.beta_grid_log10 must have exactly the keys min, max, num")
+        if not isinstance(g["num"], int) or g["num"] < 2 or g["max"] <= g["min"]:
+            raise ConfigError("extraction.beta_grid_log10 is empty (num >= 2, max > min)")
+        if e.topk_mass_k < 1 or e.topk_ids_k < 1:
+            raise ConfigError("extraction.topk_mass_k and topk_ids_k must be >= 1")
         if e.hidden_layers != "all" and not (
             isinstance(e.hidden_layers, list) and all(isinstance(l, int) for l in e.hidden_layers)
         ):

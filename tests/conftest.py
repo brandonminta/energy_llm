@@ -132,7 +132,7 @@ def make_cfg(out_dir: Path, arch: str = "qwen2", **extraction):
         "generation": {"max_new_tokens": 8},
         "calibration": {"target_norm_entropy": 0.55, "log10_beta_min": -1.0,
                         "log10_beta_max": 4.0, "num_grid": 51},
-        "extraction": {"jaccard_top_k": 8, "samples_per_shard": 3, "max_attempts": 3,
+        "extraction": {"topk_mass_k": 4, "topk_ids_k": 8, "samples_per_shard": 3, "max_attempts": 3,
                        } | extraction,
     }
     return RunConfig.from_dict(raw)

@@ -79,12 +79,24 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
     with h5py.File(d / "traces.h5") as f:
         assert set(f.keys()) == {it.id for it in items}
         assert f.attrs["beta_star"] == rec["beta_star"]
+        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["beta_star"])
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
     assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
     g = m["gamma_diagnostic"]
     assert g["k"] == 5 and len(g["fraction"]) == bundle.dims.n_layers
     assert all(0.0 <= f <= 1.0 for f in g["fraction"])
     assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
+
+
+def test_merge_refuses_items_with_different_betas(calibrated):
+    from energy_llm.pipeline.extract import item_path
+
+    cfg, bundle, ev, _ = calibrated
+    items, _ = _run_all(cfg, bundle, ev, "b")
+    with h5py.File(item_path(shard_path(cfg.extraction_dir("b"), 1), items[3].id), "r+") as f:
+        f.attrs["betas"] = f.attrs["betas"] * 2
+    with pytest.raises(RuntimeError, match="betas"):
+        run_merge(cfg, items, ev, "b")
 
 
 def _flaky(fail_ids, times):
@@ -131,11 +143,13 @@ def test_exhausted_ids_end_the_shard_and_are_reported(calibrated):
     assert bad not in set(ans["id"])
 
 
-def test_changed_config_refuses_to_resume(calibrated):
+@pytest.mark.parametrize("key, value", [
+    ("topk_ids_k", 4), ("beta_grid_log10", {"min": 0.0, "max": 3.0, "num": 7})])
+def test_changed_config_refuses_to_resume(calibrated, key, value):
     cfg, bundle, ev, _ = calibrated
     items = read_items(ev)
     run_extract(cfg, bundle, items, ev, "c", 0, stop_after=1)
-    cfg.extraction.jaccard_top_k = 4
+    setattr(cfg.extraction, key, value)
     with pytest.raises(RuntimeError, match="differs"):
         run_extract(cfg, bundle, items, ev, "c", 0)
 

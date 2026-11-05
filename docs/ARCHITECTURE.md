@@ -284,10 +284,15 @@ reduction over tokens is done in the module (aggregation is analysis).
   generated token).
 - **response positions** = `response_positions` (generated tokens, stop
   tokens excluded); the role mask (`3 response`) marks them.
-- β: only β\* (`ItemResult.betas == [β*]`). The config keys
-  `extraction.beta_multipliers` and `extraction.jaccard_top_k` are validated
-  but **unused** since step 0 of the v0.2 plan (they fed the removed features
-  table); step 3 replaces them.
+- β: `betas = ExtractionConfig.betas(β*)` = the absolute log grid
+  `10^min … 10^max` with `num` points (`extraction.beta_grid_log10`,
+  default `{min: 0, max: 4, num: 9}`: half-decade steps, identical across
+  models because `s` is a cosine) **plus β\* appended last**, so
+  `n_beta = num + 1` and `betas[-1] == β*`. `compute_item(…, betas, …)`
+  stores `betas` (`ItemResult.betas`, item attr) and today computes the
+  traces at `betas[-1] = β*` only; the grid enters the traces in step 4.
+  `extraction.topk_mass_k` (10) and `topk_ids_k` (100) are validated but
+  not yet used (step 4).
 
 Not computed anywhere: the un-normalised entropy `H`, per-token
 divergences, pooled prompt-span references, any aggregate across layers or
@@ -391,7 +396,7 @@ Layout of `<output_dir>/extract/<name>/` while running:
 shards/shard_KKKKK/
   shard.json        identity: shard_index, num_shards, ids, input_sha256, config_sha256,
                     beta_star, bank_fingerprint  — a resume under a different value refuses
-  items/<sha1(id)>.h5   every output of one id (attrs id, betas = [beta*];
+  items/<sha1(id)>.h5   every output of one id (attrs id, betas = grid + [beta*];
                     datasets answer_json, baselines_json, energy, norm_entropy,
                     margin, role_mask, hidden_prompt_last, hidden_response_last)
   completed.jsonl   {id, key, time} appended only AFTER the item file is fsynced and renamed
@@ -438,7 +443,7 @@ input order and writes, each atomically, into `<output_dir>/extract/<name>/`:
 |---|---|
 | `answers.parquet` | one row per id: the answer record of 5.8 |
 | `baselines.parquet` | one row per id |
-| `traces.h5` | `/<id>/{energy, norm_entropy, margin} [L, T]` (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `layout` |
+| `traces.h5` | `/<id>/{energy, norm_entropy, margin} [L, T]` (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `betas` (float64, last = β\*; `merge` raises if two items disagree), `layout` |
 | `hidden.h5` | `/<id>/{prompt_last, response_last} [L_h, D] float16` (gzip); attrs `layers`, `layout` |
 | `bank.h5` | byte copy of `calibration/bank.h5` |
 | `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
@@ -512,8 +517,9 @@ calibration:
   log10_beta_max: 4.0                # > min
   num_grid: 81                       # >= 2
 extraction:
-  beta_multipliers: [0.5, 1.0, 2.0]  # positive, must include 1.0 — UNUSED since v0.2 step 0
-  jaccard_top_k: 64                  # >= 1 — UNUSED since v0.2 step 0
+  beta_grid_log10: {min: 0.0, max: 4.0, num: 9}   # exactly these keys; num >= 2, max > min; beta* appended
+  topk_mass_k: 10                    # >= 1
+  topk_ids_k: 100                    # >= 1
   hidden_layers: all                 # 'all' or a list of layer indices (validated against L at run time)
   samples_per_shard: 1000            # >= 1
   max_attempts: 3                    # >= 1 (also used by calibrate)
@@ -574,8 +580,9 @@ must override.
 | `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
 | `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
 | `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample; shapes/bounds; energy trace vs scipy; `betas == [β*]`; NaN raises |
+| `test_config.py` | YAML round trip keeps values and hash; `betas` = absolute grid + β\* last; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`) rejected |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
-| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config refuses to resume; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
+| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
 | `test_invariance.py` | permuting memories changes nothing; β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
 | `test_reference.py` | production traces == `dev/reference.py` within the derived tolerances at three β\*; empty response; negative control (no γ) fails |
 | `test_verify.py` | all twelve checks PASS on the tiny models; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (one prompt row, one table row per layer) |
@@ -629,10 +636,10 @@ The departures below were approved on 2026-10-26.
    failed, and the CLI exits 1.
 5. **Throughput suggestion hard-codes 7200 s** (`merge.status_report`)
    while the walltime is a variable in `hpc/env.sh` (`TIME_EXTRACT`).
-6. **`merge` does not read `betas` from the items**: `traces.h5` takes
-   `beta_star` from `beta_star.json` (equal to every item's `betas` by the
-   shard identity, but not asserted), and `n_layers` for `hidden.h5` attrs
-   comes from `bank.h5` rather than from the items.
+6. ~~`merge` takes `betas` from the last item read without asserting
+   they are equal~~ — **closed in v0.2 step 3**: `merge` raises if two
+   items carry different `betas`. Still a fact: `n_layers` for `hidden.h5`
+   attrs comes from `bank.h5` rather than from the items.
 7. **`verify` re-derives the stop-token set** from `generation_config` +
    tokenizer instead of using `bundle.stop_token_ids` (intentional
    independence, but it duplicates `core.model.stop_token_ids`).
@@ -648,9 +655,6 @@ The departures below were approved on 2026-10-26.
     stored; `D_ff` is in `bank.h5` attrs and `manifest.json`.
 12. **`hidden_layers`** affects only `hidden.h5`; traces are always
     computed for every layer.
-13. **`extraction.beta_multipliers` and `extraction.jaccard_top_k` are
-    unused** since v0.2 step 0 but still validated and part of
-    `RunConfig.sha256()`; step 3 replaces them.
 
 ### 13.3 Documentation (v0.2 step 0)
 

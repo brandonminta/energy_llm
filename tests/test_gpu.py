@@ -21,7 +21,7 @@ def _run(device):
     hooks = ResidualHooks(bundle.model)
     tr = forward_item(bundle, hooks, build_prompt(tok, SYSTEM, "who wrote hamlet", None))
     hooks.remove()
-    return tr, compute_item(bundle, bank, tr, "g", 6.0, list(range(bundle.dims.n_layers)))
+    return tr, compute_item(bundle, bank, tr, "g", [6.0], list(range(bundle.dims.n_layers)))
 
 
 def test_gpu_matches_cpu_and_reports_peak_memory():

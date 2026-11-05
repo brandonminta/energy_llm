@@ -264,6 +264,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     reference = load_reference()
     beta_rec = load_beta_star(cfg, items)
     beta_star = float(beta_rec["beta_star"])
+    betas = cfg.extraction.betas(beta_star)
     L = bundle.dims.n_layers
     ref_layers = ref_layers if ref_layers is not None else sorted({0, L // 2, L - 1})
     hidden_layers = cfg.hidden_layer_indices(L)
@@ -285,7 +286,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            prod = compute_item(bundle, bank, trace, it.id, beta_star, hidden_layers)
+            prod = compute_item(bundle, bank, trace, it.id, betas, hidden_layers)
 
             # reference (float64, naive)
             if qi < ref_n:
@@ -343,7 +344,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
             # invariance under permutation of the memories
             if qi == 0:
-                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, beta_star, hidden_layers)
+                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, betas, hidden_layers)
                 perm_err = max(_nan_aware_max_diff(getattr(pres, k_), getattr(prod, k_))[0]
                                for k_ in ("energy", "norm_entropy", "margin"))
                 acc["perm"].append(perm_err)

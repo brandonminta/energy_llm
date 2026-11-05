@@ -136,7 +136,7 @@ def test_empty_response_is_a_valid_sample(pair):
     _set_stops(bundle, set(bundle.stop_token_ids) | {first})   # the model stops at once
     tr = _trace(bundle)
     assert tr.empty_response and tr.gen_ids == [first] and not tr.truncated
-    res = compute_item(bundle, bank, tr, "e", 5.0, list(range(bundle.dims.n_layers)))
+    res = compute_item(bundle, bank, tr, "e", [5.0], list(range(bundle.dims.n_layers)))
     assert res.answer["empty_response"] and res.answer["n_response_tokens"] == 0
     assert res.answer["response"] == ""
     assert np.isfinite(res.energy).all() and np.isfinite(res.norm_entropy).all()
@@ -153,7 +153,7 @@ def item(pair):
     bank = build_bank(bundle.model, bundle.dims)
     tr = _trace(bundle)
     beta = 7.5
-    res = compute_item(bundle, bank, tr, "x1", beta, list(range(bundle.dims.n_layers)))
+    res = compute_item(bundle, bank, tr, "x1", [1.0, beta], list(range(bundle.dims.n_layers)))
     return bundle, bank, tr, beta, res
 
 
@@ -179,9 +179,9 @@ def test_energy_trace_matches_scipy(item):
     np.testing.assert_allclose(res.energy[l], ref, rtol=1e-5)
 
 
-def test_betas_record_beta_star(item):
+def test_betas_record_the_grid_with_beta_star_last(item):
     *_, beta, res = item
-    assert res.betas == [beta]
+    assert res.betas == [1.0, beta]
 
 
 def test_non_finite_values_raise(qwen_pair, monkeypatch):
@@ -190,4 +190,4 @@ def test_non_finite_values_raise(qwen_pair, monkeypatch):
     tr = _trace(bundle)
     monkeypatch.setattr(capture.metrics, "energy", lambda s, b: torch.full(s.shape[:-1], float("nan")))
     with pytest.raises(NonFiniteError):
-        compute_item(bundle, bank, tr, "x", 5.0, [0])
+        compute_item(bundle, bank, tr, "x", [5.0], [0])

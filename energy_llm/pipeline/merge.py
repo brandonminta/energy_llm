@@ -106,6 +106,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             if "gamma_top_k" in f.attrs else None
 
     answers, baselines = [], []
+    betas = None
     with atomic_path(ext_dir / "traces.h5") as t_tmp, atomic_path(ext_dir / "hidden.h5") as h_tmp:
         with h5py.File(t_tmp, "w") as tf, h5py.File(h_tmp, "w") as hf:
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
@@ -118,6 +119,11 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                                   "non-stop response token: [layers, D] float16")
             for item_id in order:
                 rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
+                if betas is None:
+                    betas = rec["betas"]
+                elif not np.array_equal(rec["betas"], betas):
+                    raise RuntimeError(f"item {item_id} was computed with betas {rec['betas'].tolist()}, "
+                                       f"others with {betas.tolist()}")
                 answers.append(rec["answer"])
                 baselines.append(rec["baselines"])
                 g = tf.create_group(item_id)
@@ -129,6 +135,8 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                                  compression="gzip", compression_opts=4)
                 g.create_dataset("response_last", data=rec["hidden_response_last"],
                                  compression="gzip", compression_opts=4)
+            if betas is not None:
+                tf.attrs["betas"] = np.asarray(betas, dtype=np.float64)   # last = beta*
 
     _write_parquet(pd.DataFrame(answers), ext_dir / "answers.parquet")
     _write_parquet(pd.DataFrame(baselines), ext_dir / "baselines.parquet")

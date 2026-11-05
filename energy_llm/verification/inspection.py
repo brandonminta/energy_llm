@@ -2,9 +2,9 @@
 
 Reads only the merged outputs of an extraction directory (no model). Prints
 the position table (position, token id, token text when the tokenizer is in
-the local cache, role, phase) and, per layer, E, H_bar and margin of each
-phase at beta*, recomputed from traces.h5 and cross-checked against
-features.parquet.
+the local cache, role, phase) and, per layer, E, H_bar and margin at beta*
+from traces.h5 at the last prompt token, averaged over the response, and at
+the first response token.
 """
 
 from __future__ import annotations
@@ -59,27 +59,15 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
         text = repr(tok.decode([int(t)])) if tok is not None else ""
         out.append(f"{i:>5} {int(t):>9}  {ROLE_NAMES[int(roles[i])]:<12} {phase:<9} {text}")
 
-    feats = pd.read_parquet(run_dir / "features.parquet")
-    f = feats[(feats["id"] == item_id) & (feats["beta_multiplier"] == 1.0)].set_index(["layer", "variant"])
-    out += ["", "per layer at beta* (prompt | response mean | response first);  "
-                "'*' = traces.h5 and features.parquet disagree",
-            f"{'layer':>5}  {'E':^32}  {'H_bar':^26}  {'margin':^26}"]
+    out += ["", "per layer at beta* (prompt | response mean | response first)",
+            f"{'layer':>5}  {'E':^31}  {'H_bar':^31}  {'margin':^31}"]
     nan = float("nan")
-    worst = 0.0
     for l in range(energy.shape[0]):
         row = [f"{l:>5}"]
-        for name, tr, col in (("E", energy, "energy"), ("H", entropy, "norm_entropy"),
-                              ("m", margin, "margin")):
+        for tr in (energy, entropy, margin):
             p0 = tr[l, n_p - 1]
             rm = tr[l, resp].mean() if resp else nan
             rf = tr[l, resp[0]] if resp else nan
-            fm = f.loc[(l, "mean"), f"{col}_resp"]
-            fp = f.loc[(l, "mean"), f"{col}_prompt"]
-            ff = f.loc[(l, "first"), f"{col}_resp"]
-            d = np.nanmax(np.abs(np.array([p0 - fp, rm - fm, rf - ff], dtype=float)), initial=0.0)
-            worst = max(worst, d)
-            flag = "*" if d > 1e-4 * max(1.0, abs(p0)) else " "
-            row.append(f"{p0:>9.5f} | {rm:>9.5f} | {rf:>9.5f}{flag}")
+            row.append(f"{p0:>9.5f} | {rm:>9.5f} | {rf:>9.5f}")
         out.append("  ".join(row))
-    out.append(f"max |traces - features| = {worst:.2e}")
     return "\n".join(out)

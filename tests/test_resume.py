@@ -15,7 +15,7 @@ from energy_llm.pipeline.extract import plan_shards, run_extract, shard_path, sh
 from energy_llm.pipeline.merge import run_merge, status_report
 from energy_llm.storage import item_key, read_items, read_jsonl
 
-PARQUETS = ("answers.parquet", "features.parquet", "baselines.parquet")
+PARQUETS = ("answers.parquet", "baselines.parquet")
 
 
 def _run_all(cfg, bundle, ev, name, **kw):
@@ -76,14 +76,9 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
     ans = pd.read_parquet(d / "answers.parquet")
     assert list(ans["id"]) == [it.id for it in items]
     assert "gold" not in ans.to_json() and "category" not in ans.columns
-    feats = pd.read_parquet(d / "features.parquet")
-    L = bundle.dims.n_layers
-    assert len(feats) == len(items) * L * 3 * 2
-    assert set(feats["variant"]) == {"mean", "first"}
-    np.testing.assert_allclose(sorted(feats["beta"].unique()),
-                               [rec["beta_star"] * k for k in (0.5, 1.0, 2.0)])
     with h5py.File(d / "traces.h5") as f:
         assert set(f.keys()) == {it.id for it in items}
+        assert f.attrs["beta_star"] == rec["beta_star"]
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
     assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
     assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
@@ -223,13 +218,11 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
     d = cfg.extraction_dir("empty")
     ans = pd.read_parquet(d / "answers.parquet").set_index("id")
     assert ans.loc[items[0].id, "empty_response"] and ans.loc[items[0].id, "n_response_tokens"] == 0
-    feats = pd.read_parquet(d / "features.parquet")
-    f0 = feats[feats["id"] == items[0].id]
-    assert f0["empty_response"].all()
-    assert f0["energy_resp"].isna().all() and f0["js"].isna().all()
-    assert f0["energy_prompt"].notna().all() and f0["margin_prompt"].notna().all()
-    others = feats[~feats["empty_response"]]
-    assert others.drop(columns=["empty_response"]).notna().all().all()
+    base = pd.read_parquet(d / "baselines.parquet").set_index("id")
+    assert np.isnan(base.loc[items[0].id, "mean_logprob"])
+    with h5py.File(d / "traces.h5") as f, h5py.File(d / "hidden.h5") as h:
+        assert np.isfinite(f[items[0].id]["energy"][()]).all()
+        assert np.isnan(h[items[0].id]["response_last"][()]).all()
 
 
 def test_smoke_summary(calibrated, capsys):

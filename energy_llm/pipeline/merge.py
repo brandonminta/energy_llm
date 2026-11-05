@@ -4,7 +4,6 @@
 atomically, into ``<output_dir>/extract/<name>/``:
 
     answers.parquet    id, prompt, response, token ids, lengths, truncation, ...
-    features.parquet   long format: id, layer, beta, beta_multiplier, variant, features
     baselines.parquet  mean/min token log-probability, mean token entropy
     traces.h5          /<id>/{energy, norm_entropy, margin} [L, T], /<id>/role_mask [T]
     hidden.h5          /<id>/{prompt_last, response_last} [layers, D] float16
@@ -22,7 +21,6 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.capture import FEATURES, VARIANTS
 from energy_llm.core.prompting import ROLE_NAMES
 from energy_llm.pipeline.extract import (
     ShardState, item_path, plan_shards, read_item, shard_path, shard_state,
@@ -79,27 +77,6 @@ def status_report(cfg: RunConfig, items: list[Item], name: str, input_path: str 
     return report
 
 
-def _features_long(ids: list[str], empty: list[bool], feats: list[np.ndarray],
-                   betas: np.ndarray, mult: np.ndarray):
-    import pandas as pd
-
-    L, nb, nv, nf = feats[0].shape
-    li, bi, vi = np.meshgrid(np.arange(L), np.arange(nb), np.arange(nv), indexing="ij")
-    li, bi, vi = li.ravel(), bi.ravel(), vi.ravel()
-    n = len(li)
-    frames = []
-    for item_id, is_empty, arr in zip(ids, empty, feats):
-        df = pd.DataFrame(arr.reshape(n, nf), columns=list(FEATURES))
-        df.insert(0, "empty_response", bool(is_empty))
-        df.insert(0, "variant", np.asarray(VARIANTS)[vi])
-        df.insert(0, "beta_multiplier", mult[bi])
-        df.insert(0, "beta", betas[bi])
-        df.insert(0, "layer", li.astype(np.int16))
-        df.insert(0, "id", item_id)
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True)
-
-
 def _write_parquet(df, path: Path) -> None:
     with atomic_path(path) as tmp:
         df.to_parquet(tmp, index=False, engine="pyarrow")
@@ -121,8 +98,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
     shard_of = {i: st.index for st in states for i in st.ids}
     order = [it.id for it in items if it.id in completed]
 
-    answers, baselines, feats = [], [], []
-    betas = mult = None
+    answers, baselines = [], []
     with atomic_path(ext_dir / "traces.h5") as t_tmp, atomic_path(ext_dir / "hidden.h5") as h_tmp:
         with h5py.File(t_tmp, "w") as tf, h5py.File(h_tmp, "w") as hf:
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
@@ -137,8 +113,6 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                 rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
                 answers.append(rec["answer"])
                 baselines.append(rec["baselines"])
-                feats.append(rec["features"])
-                betas, mult = rec["betas"], rec["beta_multipliers"]
                 g = tf.create_group(item_id)
                 for k in ("energy", "norm_entropy", "margin"):
                     g.create_dataset(k, data=rec[k], compression="gzip", compression_opts=4)
@@ -151,10 +125,6 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
 
     _write_parquet(pd.DataFrame(answers), ext_dir / "answers.parquet")
     _write_parquet(pd.DataFrame(baselines), ext_dir / "baselines.parquet")
-    if feats:
-        empty = [a["empty_response"] for a in answers]
-        _write_parquet(_features_long(order, empty, feats, betas, mult),
-                       ext_dir / "features.parquet")
     with atomic_path(ext_dir / "bank.h5") as tmp:
         shutil.copyfile(cfg.bank_h5_path, tmp)
 
@@ -185,8 +155,6 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             "n_empty_response": sum(bool(a["empty_response"]) for a in answers),
         },
         "model_dtype": dtypes,
-        "features": list(FEATURES),
-        "variants": list(VARIANTS),
         "role_names": ROLE_NAMES,
         "code": manifest.code_version(),
         "libraries": manifest.library_versions(),

@@ -82,12 +82,10 @@ mlruns/
 # Claude Code per-project local settings (machine-specific, not for VCS)
 .claude/
 
-# Generated documents (README.pdf, docs/MAPPING.html rendered from the .md, ...)
+# Generated documents (README.pdf, docs/*.html rendered from the .md, ...)
 *.pdf
 docs/*.html
 docs/*_files/
-# ...but keep the thesis figures shipped with the docs
-!docs/*.pdf
 
 # Project-specific AI guidance (not for public consumption)
 CLAUDE.md

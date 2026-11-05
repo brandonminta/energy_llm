@@ -10,13 +10,13 @@ On a few questions it runs the production extract + merge, then checks:
                  vs the teacher-forced pass, position by position
   alignment      last prompt position emits the first generated token; response
                  positions are exactly the generated non-stop tokens
-  hidden         hidden.h5 / traces.h5 / features.parquet hold the same x and
-                 values the metrics computed
+  hidden         hidden.h5 / traces.h5 hold the same x and values the metrics
+                 computed
   permutation    permuting the bank rows (and W_g consistently) changes nothing
   limits         beta -> 0: H_bar -> 1; beta -> inf: H_bar -> 0, E -> -max(s)
   monotone       H_bar non-increasing in beta on real activations
   calibration    H_bar at beta* on the warm-up set lies in the calibration bracket
-  self           JS(p, p) = Hellinger^2(p, p) = 0
+  self           JS(p, p) = 0
   determinism    two identical runs agree (bit-exact on CPU)
 
 Every tolerance is explicit and justified next to its definition; the report
@@ -37,7 +37,7 @@ import torch
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
 from energy_llm.core.bank import Bank, build_bank
-from energy_llm.core.capture import FEATURES, VARIANTS, ResidualHooks, compute_item, forward_item, norm_entropy_curve
+from energy_llm.core.capture import ResidualHooks, compute_item, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, decoder_layers
 from energy_llm.core.prompting import ROLE_RESPONSE, build_prompt
 from energy_llm.pipeline.extract import load_beta_star
@@ -86,27 +86,16 @@ def _nan_aware_max_diff(a: np.ndarray, b: np.ndarray) -> tuple[float, bool]:
 # Reference comparison (also used by tests/test_reference.py)
 # ----------------------------------------------------------------------
 
-def reference_tolerances(delta_s: float, betas: list[float], top_k: int) -> np.ndarray:
-    """Per-(beta, feature) tolerance from the observed max score error delta_s,
-    via first-order Lipschitz bounds in the max norm:
+def reference_tolerances(delta_s: float, beta: float) -> dict[str, float]:
+    """Per-trace tolerance from the observed max score error delta_s, via
+    first-order Lipschitz bounds in the max norm:
       E      = -(1/beta) lse(beta s):  |dE| <= |ds|                 -> delta_s
       margin = top1 - top2:            |dm| <= 2|ds|                -> 2 delta_s
       H_bar: sum_i |dH/ds_i| <= beta * sum p_i |log p_i + H| <= 2 beta log D_ff,
              so |dH_bar| <= 2 beta delta_s
-      JS, Hellinger^2: |d log p_i| <= 2 beta delta_s, each changes by
-             <= 4 beta delta_s (conservative constant)
-      delta_* = difference of two such terms -> twice the tolerance
-      Jaccard top-k: one swap at the k-th boundary moves it by <= 1/k
     plus F32_FLOOR for float32 reductions."""
-    tol = np.empty((len(betas), len(FEATURES)))
-    for bi, b in enumerate(betas):
-        e, h, d = delta_s, 2 * b * delta_s, 4 * b * delta_s
-        per = {"energy_prompt": e, "energy_resp": e, "delta_energy": 2 * e,
-               "norm_entropy_prompt": h, "norm_entropy_resp": h, "delta_norm_entropy": 2 * h,
-               "js": d, "hellinger_sq": d, "jaccard_topk": 1.0 / top_k,
-               "margin_prompt": 2 * delta_s, "margin_resp": 2 * delta_s}
-        tol[bi] = [per[f] + F32_FLOOR for f in FEATURES]
-    return tol
+    return {"energy": delta_s + F32_FLOOR, "norm_entropy": 2 * beta * delta_s + F32_FLOOR,
+            "margin": 2 * delta_s + F32_FLOOR}
 
 
 def score_tolerance(d_model: int) -> float:
@@ -117,34 +106,21 @@ def score_tolerance(d_model: int) -> float:
 
 
 def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, layers: list[int],
-                           betas: list[float], beta_star: float, top_k: int) -> dict:
+                           beta_star: float) -> dict:
     eps = bundle.dims.rms_norm_eps
     ds = 0.0
     for li, l in enumerate(layers):
         s = bank.scores(l, metrics.rms_normalise(trace.residuals[l], eps)).double().cpu().numpy()
         ds = max(ds, float(np.abs(s - np.asarray(ref["scores"][l])).max()))
     tol_s = score_tolerance(bundle.dims.d_model)
-    tol_f = reference_tolerances(ds, betas, top_k)
-    pf = prod.features[layers].astype(np.float64)
-    rf = ref["features"]
-    ratio, per_feature, nan_ok = 0.0, {}, True
-    for fi, f in enumerate(FEATURES):
-        worst = 0.0
-        for bi in range(len(betas)):
-            err, same = _nan_aware_max_diff(pf[:, bi, :, fi], rf[:, bi, :, fi])
-            nan_ok &= same
-            worst = max(worst, err)
-            ratio = max(ratio, err / tol_f[bi, fi])
-        per_feature[f] = {"max_error": worst, "tolerance_at_max_beta": float(tol_f[-1, fi])}
-    trace_tol = {"energy": ds + F32_FLOOR, "norm_entropy": 2 * beta_star * ds + F32_FLOOR,
-                 "margin": 2 * ds + F32_FLOOR}
-    traces = {}
-    for k, t in trace_tol.items():
-        err = float(np.abs(getattr(prod, k)[layers].astype(np.float64) - ref[k]).max())
+    ratio, nan_ok, traces = 0.0, True, {}
+    for k, t in reference_tolerances(ds, beta_star).items():
+        err, same = _nan_aware_max_diff(getattr(prod, k)[layers], ref[k])
+        nan_ok &= same
         traces[k] = {"max_error": err, "tolerance": t}
         ratio = max(ratio, err / t)
     return {"score_error": ds, "score_tolerance": tol_s, "nan_pattern_equal": nan_ok,
-            "max_error_over_tolerance": ratio, "features": per_feature, "traces": traces,
+            "max_error_over_tolerance": ratio, "traces": traces,
             "ok": ds <= tol_s and nan_ok and ratio <= 1.0}
 
 
@@ -264,22 +240,16 @@ class PermutedBank(Bank):
 # Driver
 # ----------------------------------------------------------------------
 
-def _read_outputs(ext_dir: Path, item_id: str, n_layers: int, mult: list[float]):
-    """Rebuild the [L, n_beta, n_variant, F] array of one id from features.parquet."""
+def _read_outputs(ext_dir: Path, item_id: str):
+    """traces.h5, hidden.h5 and answers.parquet records of one id."""
     import h5py
     import pandas as pd
 
-    feats = pd.read_parquet(ext_dir / "features.parquet")
-    f = feats[feats["id"] == item_id].copy()
-    f["_b"] = f["beta_multiplier"].map({m: i for i, m in enumerate(mult)})
-    f["_v"] = f["variant"].map({v: i for i, v in enumerate(VARIANTS)})
-    f = f.sort_values(["layer", "_b", "_v"])
-    arr = f[list(FEATURES)].to_numpy().reshape(n_layers, len(mult), len(VARIANTS), len(FEATURES))
     with h5py.File(ext_dir / "traces.h5") as tf, h5py.File(ext_dir / "hidden.h5") as hf:
         tr = {k: tf[item_id][k][()] for k in ("energy", "norm_entropy", "margin", "role_mask")}
         hid = {k: hf[item_id][k][()] for k in ("prompt_last", "response_last")}
     ans = pd.read_parquet(ext_dir / "answers.parquet").set_index("id").loc[item_id]
-    return arr, tr, hid, ans
+    return tr, hid, ans
 
 
 def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 4,
@@ -294,9 +264,6 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     reference = load_reference()
     beta_rec = load_beta_star(cfg, items)
     beta_star = float(beta_rec["beta_star"])
-    mult = list(cfg.extraction.beta_multipliers)
-    betas = [beta_star * m for m in mult]
-    k = cfg.extraction.jaccard_top_k
     L = bundle.dims.n_layers
     ref_layers = ref_layers if ref_layers is not None else sorted({0, L // 2, L - 1})
     hidden_layers = cfg.hidden_layer_indices(L)
@@ -318,15 +285,14 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            prod = compute_item(bundle, bank, trace, it.id, beta_star, mult, k, hidden_layers)
+            prod = compute_item(bundle, bank, trace, it.id, beta_star, hidden_layers)
 
             # reference (float64, naive)
             if qi < ref_n:
                 ref = reference.reference_item(
                     bundle.model, {l: trace.residuals[l].float().cpu().numpy() for l in ref_layers},
-                    trace.n_prompt, trace.gen_ids, sorted(stops), betas, k, ref_layers, beta_star)
-                cmp = compare_with_reference(bundle, bank, trace, prod, ref, ref_layers, betas,
-                                             beta_star, k)
+                    trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, beta_star)
+                cmp = compare_with_reference(bundle, bank, trace, prod, ref, ref_layers, beta_star)
                 ref_details.append({"id": it.id} | {k_: v for k_, v in cmp.items() if k_ != "ok"})
                 acc["reference"].append((cmp["max_error_over_tolerance"], cmp["ok"]))
                 del ref
@@ -367,9 +333,8 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             h_err = max(_nan_aware_max_diff(prod.hidden_prompt_last, hp)[0],
                         _nan_aware_max_diff(prod.hidden_response_last, hr)[0])
             acc["hidden"].append(h_err)
-            f_arr, f_tr, f_hid, f_ans = _read_outputs(ext_dir, it.id, L, mult)
-            diffs = [_nan_aware_max_diff(f_arr, prod.features),
-                     *(_nan_aware_max_diff(f_tr[k_], getattr(prod, k_)) for k_ in ("energy", "norm_entropy", "margin")),
+            f_tr, f_hid, f_ans = _read_outputs(ext_dir, it.id)
+            diffs = [*(_nan_aware_max_diff(f_tr[k_], getattr(prod, k_)) for k_ in ("energy", "norm_entropy", "margin")),
                      _nan_aware_max_diff(f_hid["prompt_last"], prod.hidden_prompt_last),
                      _nan_aware_max_diff(f_hid["response_last"], prod.hidden_response_last)]
             acc["files"].append((max(d for d, _ in diffs), all(s_ for _, s_ in diffs)
@@ -378,10 +343,9 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
             # invariance under permutation of the memories
             if qi == 0:
-                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, beta_star, mult, k, hidden_layers)
-                perm_err = max(_nan_aware_max_diff(pres.features, prod.features)[0],
-                               *(_nan_aware_max_diff(getattr(pres, k_), getattr(prod, k_))[0]
-                                 for k_ in ("energy", "norm_entropy", "margin")))
+                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, beta_star, hidden_layers)
+                perm_err = max(_nan_aware_max_diff(getattr(pres, k_), getattr(prod, k_))[0]
+                               for k_ in ("energy", "norm_entropy", "margin"))
                 acc["perm"].append(perm_err)
 
             # limits, monotonicity, self-divergence on real scores
@@ -404,8 +368,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                 hs = torch.stack([metrics.norm_entropy(metrics.log_distribution(s[sel_pos], b)) for b in grid])
                 mono_worst = max(mono_worst, (hs[1:] - hs[:-1]).max().item())
                 lp = metrics.log_distribution(s0, beta_star)
-                self_worst = max(self_worst, metrics.js_divergence(lp, lp).item(),
-                                 metrics.hellinger_sq(lp, lp).item())
+                self_worst = max(self_worst, metrics.js_divergence(lp, lp).item())
             acc["limits"].append(lim_worst)
             acc["monotone"].append(mono_worst)
             acc["self"].append(self_worst)
@@ -438,9 +401,9 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         Check("files_vs_memory", _status(max(e for e, _ in acc["files"]) <= det_tol
                                          and all(ok for _, ok in acc["files"])),
               max(e for e, _ in acc["files"]), det_tol,
-              {"metric": "features.parquet / traces.h5 / hidden.h5 vs an in-memory recomputation"}),
+              {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation"}),
         Check("permutation", _status(max(acc["perm"]) <= F32_FLOOR), max(acc["perm"]), F32_FLOOR,
-              {"metric": "max change of every feature and trace (float32 summation order)"}),
+              {"metric": "max change of every trace (float32 summation order)"}),
         Check("limits", _status(max(acc["limits"]) <= F32_FLOOR), max(acc["limits"]), F32_FLOOR,
               {"metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
                          "|E + max s| - log(D_ff)/beta"}),

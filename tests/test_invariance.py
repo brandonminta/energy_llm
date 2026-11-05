@@ -34,13 +34,13 @@ def _scores(bundle, bank, tr, l):
 def test_permuting_memories_changes_nothing(setup):
     bundle, bank, tr = setup
     L = list(range(bundle.dims.n_layers))
-    a = compute_item(bundle, bank, tr, "x", 9.0, [0.5, 1.0, 2.0], 8, L)
+    a = compute_item(bundle, bank, tr, "x", 9.0, L)
     pbank = PermutedBank(bank, seed=3)
     assert any((p != torch.arange(len(p))).any() for p in pbank.perm)
     s, sp = _scores(bundle, bank, tr, 0), _scores(bundle, pbank, tr, 0)
     np.testing.assert_allclose(sp.numpy(), s[:, pbank.perm[0]].numpy(), atol=1e-6)
-    b = compute_item(bundle, pbank, tr, "x", 9.0, [0.5, 1.0, 2.0], 8, L)
-    for name in ("features", "energy", "norm_entropy", "margin"):
+    b = compute_item(bundle, pbank, tr, "x", 9.0, L)
+    for name in ("energy", "norm_entropy", "margin"):
         np.testing.assert_allclose(getattr(b, name), getattr(a, name), atol=1e-5, rtol=0)
 
 
@@ -75,7 +75,6 @@ def test_self_divergence_is_zero(setup):
         lp = metrics.log_distribution(_scores(bundle, bank, tr, l), 9.0)
         # logaddexp(a, a) - log 2 equals a up to one float32 rounding
         assert metrics.js_divergence(lp, lp).abs().max().item() <= 1e-7
-        assert metrics.hellinger_sq(lp, lp).abs().max().item() == 0.0
 
 
 def test_two_identical_runs_are_bit_identical_on_cpu(pair):
@@ -87,8 +86,8 @@ def test_two_identical_runs_are_bit_identical_on_cpu(pair):
         date = DATE if "date_string" in bundle.tokenizer.chat_template else None
         tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, Q, date))
         hooks.remove()
-        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", 9.0, [0.5, 1.0, 2.0], 8,
+        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", 9.0,
                                                list(range(bundle.dims.n_layers)))))
     assert outs[0][0] == outs[1][0]
-    for name in ("features", "energy", "norm_entropy", "margin", "hidden_prompt_last"):
+    for name in ("energy", "norm_entropy", "margin", "hidden_prompt_last"):
         assert np.array_equal(getattr(outs[0][1], name), getattr(outs[1][1], name), equal_nan=True)

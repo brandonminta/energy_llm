@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import pytest
 import torch
@@ -7,9 +5,7 @@ from scipy.special import logsumexp
 
 from energy_llm.core import capture, metrics
 from energy_llm.core.bank import build_bank
-from energy_llm.core.capture import (
-    FEATURES, RESPONSE_FEATURES, NonFiniteError, ResidualHooks, compute_item, forward_item,
-)
+from energy_llm.core.capture import NonFiniteError, ResidualHooks, compute_item, forward_item
 from energy_llm.core.prompting import (
     ROLE_INSTRUCTION, ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, PromptError,
     build_prompt, check_template,
@@ -140,16 +136,9 @@ def test_empty_response_is_a_valid_sample(pair):
     _set_stops(bundle, set(bundle.stop_token_ids) | {first})   # the model stops at once
     tr = _trace(bundle)
     assert tr.empty_response and tr.gen_ids == [first] and not tr.truncated
-    res = compute_item(bundle, bank, tr, "e", 5.0, [0.5, 1.0, 2.0], 8,
-                       list(range(bundle.dims.n_layers)))
+    res = compute_item(bundle, bank, tr, "e", 5.0, list(range(bundle.dims.n_layers)))
     assert res.answer["empty_response"] and res.answer["n_response_tokens"] == 0
     assert res.answer["response"] == ""
-    for i, name in enumerate(FEATURES):
-        col = res.features[..., i]
-        if name in RESPONSE_FEATURES:
-            assert np.isnan(col).all(), name
-        else:
-            assert np.isfinite(col).all(), name
     assert np.isfinite(res.energy).all() and np.isfinite(res.norm_entropy).all()
     assert np.isnan(res.hidden_response_last).all()
     assert np.isfinite(res.hidden_prompt_last).all()
@@ -164,8 +153,7 @@ def item(pair):
     bank = build_bank(bundle.model, bundle.dims)
     tr = _trace(bundle)
     beta = 7.5
-    res = compute_item(bundle, bank, tr, "x1", beta, [0.5, 1.0, 2.0], 8,
-                       list(range(bundle.dims.n_layers)))
+    res = compute_item(bundle, bank, tr, "x1", beta, list(range(bundle.dims.n_layers)))
     return bundle, bank, tr, beta, res
 
 
@@ -173,40 +161,14 @@ def test_item_shapes_and_bounds(item):
     bundle, _, tr, _, res = item
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     T = tr.n_prompt + len(tr.gen_ids)
-    assert res.features.shape == (L, 3, 2, len(FEATURES))
-    assert res.features.dtype == np.float32
     for name in ("energy", "norm_entropy", "margin"):
         assert getattr(res, name).shape == (L, T)
     assert res.role_mask.shape == (T,) and res.role_mask.dtype == np.int8
     assert res.hidden_prompt_last.shape == (L, D) and res.hidden_prompt_last.dtype == np.float16
-    f = {k: res.features[..., i] for i, k in enumerate(FEATURES)}
-    assert np.all((f["js"] >= 0) & (f["js"] <= math.log(2)))
-    assert np.all((f["hellinger_sq"] >= 0) & (f["hellinger_sq"] <= 1 + 1e-6))
-    assert np.all((f["jaccard_topk"] >= 0) & (f["jaccard_topk"] <= 1))
-    for k in ("norm_entropy_prompt", "norm_entropy_resp"):
-        assert np.all((f[k] >= -1e-6) & (f[k] <= 1 + 1e-6))
-    np.testing.assert_allclose(f["delta_energy"], f["energy_resp"] - f["energy_prompt"], atol=1e-5)
     assert np.all(res.norm_entropy >= -1e-6) and np.all(res.norm_entropy <= 1 + 1e-6)
     assert 0.0 <= res.answer["xhat_norm_max_rel_dev"] < 0.05  # tiny residuals: eps is visible
     assert res.answer["n_response_tokens"] == len(tr.response_positions)
     assert "gold" not in str(res.answer)
-
-
-def test_phases_and_variants_match_traces(item):
-    bundle, bank, tr, beta, res = item
-    f = {k: res.features[:, 1, :, i] for i, k in enumerate(FEATURES)}  # multiplier 1.0
-    pi, R = tr.n_prompt - 1, tr.response_positions
-    np.testing.assert_allclose(f["energy_prompt"][:, 0], res.energy[:, pi], rtol=1e-5)
-    np.testing.assert_allclose(f["energy_resp"][:, 0], res.energy[:, R].mean(1), rtol=1e-5)
-    np.testing.assert_allclose(f["energy_resp"][:, 1], res.energy[:, R[0]], rtol=1e-5)
-    np.testing.assert_allclose(f["norm_entropy_resp"][:, 0], res.norm_entropy[:, R].mean(1), rtol=1e-5)
-    np.testing.assert_allclose(f["margin_resp"][:, 1], res.margin[:, R[0]], rtol=1e-6)
-    # JS of the mean distribution, not mean of per-token JS
-    l = 0
-    _, s = capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps)
-    lp = torch.log_softmax(beta * s, dim=-1)
-    js = metrics.js_divergence(torch.log(lp[R].exp().mean(0)), lp[pi]).item()
-    assert f["js"][l, 0] == pytest.approx(js, rel=1e-5)
 
 
 def test_energy_trace_matches_scipy(item):
@@ -217,9 +179,9 @@ def test_energy_trace_matches_scipy(item):
     np.testing.assert_allclose(res.energy[l], ref, rtol=1e-5)
 
 
-def test_betas_scale_beta_star(item):
+def test_betas_record_beta_star(item):
     *_, beta, res = item
-    assert res.betas == [beta * 0.5, beta, beta * 2.0]
+    assert res.betas == [beta]
 
 
 def test_non_finite_values_raise(qwen_pair, monkeypatch):
@@ -228,4 +190,4 @@ def test_non_finite_values_raise(qwen_pair, monkeypatch):
     tr = _trace(bundle)
     monkeypatch.setattr(capture.metrics, "energy", lambda s, b: torch.full(s.shape[:-1], float("nan")))
     with pytest.raises(NonFiniteError):
-        compute_item(bundle, bank, tr, "x", 5.0, [1.0], 8, [0])
+        compute_item(bundle, bank, tr, "x", 5.0, [0])

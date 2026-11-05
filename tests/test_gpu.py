@@ -21,8 +21,7 @@ def _run(device):
     hooks = ResidualHooks(bundle.model)
     tr = forward_item(bundle, hooks, build_prompt(tok, SYSTEM, "who wrote hamlet", None))
     hooks.remove()
-    return tr, compute_item(bundle, bank, tr, "g", 6.0, [0.5, 1.0, 2.0], 8,
-                            list(range(bundle.dims.n_layers)))
+    return tr, compute_item(bundle, bank, tr, "g", 6.0, list(range(bundle.dims.n_layers)))
 
 
 def test_gpu_matches_cpu_and_reports_peak_memory():
@@ -36,5 +35,4 @@ def test_gpu_matches_cpu_and_reports_peak_memory():
     tr_c, res_c = _run("cpu")
     if tr_g.gen_ids != tr_c.gen_ids:
         pytest.skip("greedy tokens differ between devices (near-tie)")
-    np.testing.assert_allclose(res_g.features, res_c.features, rtol=1e-3, atol=1e-4)
     np.testing.assert_allclose(res_g.energy, res_c.energy, rtol=1e-3, atol=1e-4)

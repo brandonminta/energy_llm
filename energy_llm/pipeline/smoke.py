@@ -10,8 +10,11 @@ import copy
 import datetime
 import json
 
+import numpy as np
+
 from energy_llm.config import RunConfig
 from energy_llm.core.model import ModelBundle
+from energy_llm.core.prompting import ROLE_RESPONSE
 from energy_llm.pipeline.extract import run_extract, shard_path
 from energy_llm.pipeline.merge import run_merge
 from energy_llm.pipeline.signals import GracefulStop
@@ -38,6 +41,7 @@ def run_single_process(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], pre
 def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 20,
               stopper: GracefulStop | None = None, model_load_s: float | None = None,
               name: str | None = None) -> dict:
+    import h5py
     import pandas as pd
 
     sel = items[:n]
@@ -64,9 +68,15 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
     if ans is not None:
         n_gen = int(ans["n_generated_tokens"].sum())
         n_mis = int(ans["tf_mismatch_count"].sum())
-        feats = pd.read_parquet(ext_dir / "features.parquet")
-        at_star = feats[(feats["beta_multiplier"] == 1.0) & (feats["variant"] == "mean")]
-        per_layer = at_star.groupby("layer")[["norm_entropy_prompt", "norm_entropy_resp"]].mean()
+        # H_bar at beta* per layer: last prompt token, and the mean over each
+        # id's response positions (empty responses skipped); then mean over ids
+        h_prompt, h_resp = [], []
+        with h5py.File(ext_dir / "traces.h5") as f:
+            for item_id, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
+                h, resp = f[item_id]["norm_entropy"][()], f[item_id]["role_mask"][()] == ROLE_RESPONSE
+                h_prompt.append(h[:, n_p - 1])
+                if resp.any():
+                    h_resp.append(h[:, resp].mean(axis=1))
         summary |= {
             "tf_token_match_pct": 100.0 * (1 - n_mis / n_gen) if n_gen else None,
             "tf_exact_answers_pct": 100.0 * float((ans["tf_mismatch_count"] == 0).mean()),
@@ -75,9 +85,8 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
             "n_truncated": int(ans["truncated"].sum()),
             "mean_response_tokens": float(ans["n_response_tokens"].mean()),
             "mean_norm_entropy_per_layer": {
-                "prompt": per_layer["norm_entropy_prompt"].round(4).tolist(),
-                "response": per_layer["norm_entropy_resp"].round(4).tolist(),
-            },
+                k: np.round(np.mean(v, axis=0), 4).tolist() if v else []
+                for k, v in (("prompt", h_prompt), ("response", h_resp))},
         }
     write_json_atomic(ext_dir / "smoke_report.json", summary)
     return summary

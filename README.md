@@ -3,8 +3,8 @@
 Extracts Modern-Hopfield retrieval metrics from the SwiGLU gate of
 Qwen2.5-3B-Instruct and Llama-3.2-3B-Instruct, per question and per layer, for
 a hallucination-detection study. The module **ends at the metrics**: no
-labelling, judges, probes or statistics (those live in `downstream/`, outside
-the package). It is dataset-agnostic: the input is a JSONL of
+labelling, judges, probes or statistics (those live in the analysis
+repository; the legacy E1–E3 code is in git at tag `thesis-e1e3`). It is dataset-agnostic: the input is a JSONL of
 `{"id", "question"}` records; every other field is ignored and never
 propagated. All outputs are indexed by `id`.
 
@@ -12,9 +12,9 @@ Three documents describe it:
 
 | document | read it for |
 |---|---|
-| this README | setup, how to run on SLURM, what the output files are |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | what the code **actually does**, module by module, file by file, formula by formula — plus an audit of its inconsistencies and of where it departs from the thesis |
-| [`docs/MAPPING.md`](docs/MAPPING.md) | the extraction specification → code mapping, item by item, with the approved departures from the thesis `.tex` and the verification tolerances |
+| this README | setup, how to run on SLURM, what the output files are, verification on the cluster |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | what the code **actually does**, module by module, file by file, formula by formula, with the verification tolerances — plus an audit of its inconsistencies and of where it departs from the thesis |
+| [`docs/overview.md`](docs/overview.md) | why: the science the module serves |
 
 ## What is computed (short version)
 
@@ -23,18 +23,15 @@ Per layer, from the residual `x` at the input of `post_attention_layernorm`
 `s = bank·x̂/√D` (cosines). The bank is never materialised: only γ and `‖W̃_i‖`
 are kept and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
 to float32 at a time. Then `p = softmax(β*s)`, `E = -(1/β*)·logsumexp(β*s)`,
-`H̄ = H(p)/log D_ff`, margin = top1 − top2. Phases: the last prompt token and
-the response tokens (every stop token excluded). Features per layer, β ∈
-{β*/2, β*, 2β*} and variant (`mean` over response positions, or `first`
-response position): `energy_prompt, energy_resp, delta_energy,
-norm_entropy_prompt, norm_entropy_resp, delta_norm_entropy, js,
-hellinger_sq, jaccard_topk, margin_prompt, margin_resp`. JS, Hellinger² and
-Jaccard compare the **mean** response distribution with the prompt one and
-are computed from log-probabilities (float32 underflow at large β).
+`H̄ = H(p)/log D_ff`, margin = top1 − top2, stored **per token** for every
+position (prompt and response) and every layer in `traces.h5`; the role mask
+separates prompt and response (every stop token excluded from the
+response). There is no features table: aggregation over tokens is analysis.
 
 **Empty responses** (the model emits a stop token first) are valid samples,
-not failures: `empty_response = true`, prompt-phase features computed,
-response-phase features NaN by design, counted as completed.
+not failures: `empty_response = true`, traces computed, response-only
+values (baselines, `hidden.h5:response_last`) NaN by design, counted as
+completed.
 
 Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
@@ -50,7 +47,7 @@ energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
     model.py             loading at a pinned revision, bf16 check, clean greedy config
     prompting.py         chat template, single system instruction, role mask
     bank.py              gamma + row norms of W_g * gamma (bank never materialised), bank.h5
-    metrics.py           float32 primitives (E, H_bar, margin, JS, Hellinger^2, Jaccard)
+    metrics.py           float32 primitives (E, H_bar, margin, JS)
     capture.py           greedy + teacher forcing + hooks + all metrics per question
   pipeline/              how it runs (everything under <output_dir>)
     signals.py           SIGUSR1/SIGTERM -> finish the current id, exit 75
@@ -63,12 +60,11 @@ energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
     inspection.py        position/phase table of one id
 configs/                 qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
 hpc/                     env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
-                         merge, smoke, verify), missing_shards.sh, RUNBOOK.md
+                         merge, smoke, verify), missing_shards.sh
 tests/                   CPU-only, tiny random Qwen2 + Llama models
 dev/                     verification only, never for the paper: dev questions, warm-up,
                          naive float64 reference implementation (reference.py)
-docs/                    ARCHITECTURE.md, MAPPING.md, thesis .tex (unchanged)
-downstream/              NOT part of the module: labelling, probes, stats, notebooks
+docs/                    ARCHITECTURE.md, overview.md, CHANGES_v0.2.md (change log)
 ```
 
 ## Setup
@@ -76,7 +72,7 @@ downstream/              NOT part of the module: labelling, probes, stats, noteb
 ```bash
 micromamba activate hopfield-llm          # cluster env name (hpc/env.sh: MAMBA_ENV); local dev: energy-lab
 pip install -r requirements.txt && pip install -e ".[dev]"
-pytest                                    # CPU only, ~45 s, 106 tests
+pytest                                    # CPU only, ~45 s
 ```
 
 `requirements.txt` is the single pinned dependency set. transformers ≥ 4.56
@@ -181,10 +177,10 @@ resident at a time.
 
 ## Verification (before fixing datasets or parameters)
 
-The cluster sequence is in [`hpc/RUNBOOK.md`](hpc/RUNBOOK.md): environment,
-real tokenizers, calibrate on `dev/dev_warmup.jsonl`, verify, smoke, manual
-inspection, requeue test. The β\* from the dev warm-up set is for
-verification only; the definitive calibration comes once datasets are fixed.
+Goal: confirm on the real models that the extraction measures exactly what
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5 describes, **before**
+fixing datasets or parameters. The sequence on the cluster is below
+("Verification on the cluster").
 
 ```bash
 python -m energy_llm verify  --config C --input dev/dev_questions.jsonl [--n 4] \
@@ -199,10 +195,153 @@ observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`).
 The checks (`reference`, `gate`, `tf_vs_cache`, `alignment`, `hidden`,
 `files_vs_memory`, `permutation`, `limits`, `monotone`, `self_divergence`,
 `determinism`, `calibration`) and their tolerances are tabulated in
-[`docs/MAPPING.md`](docs/MAPPING.md). `inspect` reads a finished extraction
-(no model) and prints each position (token, role, prompt/response phase)
-and, per layer, E, H̄ and margin of each phase at β\*, cross-checked against
-`features.parquet`.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §9. `inspect` reads a
+finished extraction (no model) and prints each position (token, role,
+prompt/response phase) and, per layer, E, H̄ and margin at β\* for the last
+prompt token, the response mean and the first response token.
+
+### Verification on the cluster
+
+> **The β\* obtained here from `dev/dev_warmup.jsonl` is for verification
+> only.** It must not be used for any reported result. The definitive
+> calibration is run once the datasets are fixed, on its own warm-up set and
+> into a fresh `output_dir`. Nothing derived from `dev/` goes in the paper.
+
+Run everything from the repo root. One-time setup for the session:
+
+```bash
+export SCRATCH_ROOT=/path/to/your/scratch      # required
+source hpc/env.sh && activate_env
+pip install -r requirements.txt && pip install -e ".[dev]"
+hpc/prefetch_models.sh configs/qwen25_3b.yaml configs/llama32_3b.yaml   # login node; export HF_TOKEN first (Llama)
+```
+
+Verification runs write under `$SCRATCH_ROOT/energy_llm/runs/<model>/`. To
+keep them apart from the definitive runs, point the configs at a separate
+root for this session, e.g. `export SCRATCH_ROOT=$SCRATCH_ROOT/verification`
+(prefetch first, or copy the HF cache, since `HF_HOME` follows `SCRATCH_ROOT`).
+
+
+#### 1. Environment: CUDA available and compatible
+
+```bash
+srun --partition="$PARTITION_GPU" --gres="$GRES" --cpus-per-task=2 --mem=16G --time=00:10:00 \
+  python -c "import torch, transformers; print(torch.__version__, 'cuda', torch.version.cuda, \
+  'avail', torch.cuda.is_available(), torch.cuda.get_device_name(0), 'tf', transformers.__version__); \
+  a=torch.randn(512,512,device='cuda',dtype=torch.bfloat16); print('bf16 matmul ok', (a@a).float().norm().item())"
+srun --partition="$PARTITION_GPU" --gres="$GRES" --time=00:05:00 nvidia-smi
+```
+
+Check: `avail True`, the GPU is the expected A100, `transformers 5.0.0`, and
+the driver's "CUDA Version" in `nvidia-smi` is >= `torch.version.cuda`
+(12.1 for torch 2.5.1+cu121). If not, install a torch wheel matching the
+driver before going on.
+
+#### 2. Chat templates on the real tokenizers (both models)
+
+```bash
+QWEN=$(python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen2.5-3B-Instruct', revision='aa8e72537993ba99e69dfaafa59ed015b17504d1', local_files_only=True))")
+LLAMA=$(python -c "from huggingface_hub import snapshot_download as s; print(s('meta-llama/Llama-3.2-3B-Instruct', revision='0cb88a4f764b7a12671c53f0838cd831a0843b95', local_files_only=True))")
+ENERGY_LLM_TOKENIZER_DIRS="$QWEN:$LLAMA" pytest tests/test_real_tokenizer.py -v
+```
+
+Check: 2 passed (not skipped). It asserts the token ids equal the official
+`apply_chat_template`, no default Qwen system prompt, and the role mask
+isolates exactly the instruction and the question.
+
+#### 3. Calibrate on the dev warm-up set (each model)
+
+```bash
+hpc/submit.sh calibrate configs/qwen25_3b.yaml dev/dev_warmup.jsonl
+hpc/submit.sh calibrate configs/llama32_3b.yaml dev/dev_warmup.jsonl
+cat $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/calibration/beta_star.json | head -20
+```
+
+Check: the job ends without `not bracketed`; `failed_ids` is empty;
+`mean_norm_entropy_curve` decreases from ~1 to ~0 across the grid and β\* is
+not at a grid edge. (Verification-only β\*, see the note above.)
+
+#### 4. Verify (each model): everything PASS
+
+```bash
+hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4
+hpc/submit.sh verify configs/llama32_3b.yaml dev/dev_questions.jsonl 4
+cat logs/verify_<job>.out
+```
+
+Check: `=> ALL PASS` and exit code 0 (`sacct -j <job> -o State,ExitCode`).
+The table lists each check with its max observed error and tolerance; the
+full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
+
+| check | what it proves | what to look at |
+|---|---|---|
+| `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w̃‖·√D·s` | error ≤ 4·u_bf16; `no_gamma_control_min_error` ≫ tolerance |
+| `reference` | production == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1) |
+| `tf_vs_cache` | teacher-forced x == x during cached generation | tolerance 5e-2 is **provisional** for bf16: note the observed max |
+| `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
+| `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
+| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket |
+
+If `tf_vs_cache` fails only on its bf16 tolerance while tokens are equal,
+report the observed value before changing anything.
+
+#### 5. Smoke test on the dev questions (each model)
+
+```bash
+hpc/submit.sh smoke configs/qwen25_3b.yaml dev/dev_questions.jsonl 24
+hpc/submit.sh smoke configs/llama32_3b.yaml dev/dev_questions.jsonl 24
+cat logs/smoke_<job>.out
+```
+
+Check:
+- `model dtype bfloat16`;
+- `TF == greedy 100.00 % of tokens, 100.0 % of answers` (anything less: report the ids from `smoke_report.json`);
+- `max | ||x_hat||/sqrt(D) - 1 |` negligible (≲ 1e-3);
+- mean H̄ per layer at β\*: not saturated (not ≈ 0 or ≈ 1 in most layers);
+- peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
+- empty / truncated counts: plausible for short factual answers.
+
+#### 6. Manual alignment review: 3 questions per model
+
+```bash
+RUN=$(ls -d $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/extract/smoke-* | tail -1)
+for ID in dev-known-01 dev-obscure-03 dev-misc-01; do
+  python -m energy_llm inspect --run "$RUN" --id "$ID"; done
+# same with runs/llama32_3b
+```
+
+Check by eye: `instruction` rows are exactly the system sentence, `question`
+rows exactly the question, chat-template tokens are `template`; exactly one
+`prompt` phase row, on the last prompt token (the assistant header); the
+`response` rows are the answer tokens and the final `<|im_end|>` /
+`<|eot_id|>` is `template`, not response; the per-layer table has one row
+per layer with finite prompt values.
+
+#### 7. Requeue test with a very short walltime
+
+```bash
+TIME_EXTRACT=00:06:00 SIGNAL_LEAD_S=240 hpc/submit.sh extract configs/qwen25_3b.yaml dev/dev_questions.jsonl requeue-test
+squeue -u $USER                       # watch the task go RUNNING -> PENDING (requeued) -> RUNNING
+grep -E "python exit|requeue|restart" logs/extract_<array>_0.out
+python -m energy_llm status --config configs/qwen25_3b.yaml --input dev/dev_questions.jsonl --name requeue-test
+```
+
+USR1 arrives 4 min after start (6 min walltime − 240 s). Check in the log:
+`python exit=75 signal=USR1`, `work left: scontrol requeue …`, a second run
+with `restart=1` that skips the completed ids, then exit 0; the chained merge
+job runs and `status` shows no missing shards. Confirm also that the merge
+waited for the requeued task (`sacct -j <merge> -o Start` after the second run).
+
+If the shard finishes before USR1 (fast GPU), send the warning by hand while
+it is processing: `scancel --batch --signal=USR1 <array>_0`.
+
+Caveat: if the walltime is shorter than model load + `SIGNAL_LEAD_S`, the
+warning arrives before any question is processed, every run exits 75 without
+progress and the task is requeued until `MAX_REQUEUES` (5), then left
+unfinished — never use such a walltime for real runs.
+
+Then try the MIG profile once (`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …`)
+if it is wanted, and record its peak memory and seconds/question.
 
 ## Outputs (`$SCRATCH_ROOT/energy_llm/runs/<model>/extract/<name>/`)
 
@@ -210,7 +349,6 @@ and, per layer, E, H̄ and margin of each phase at β\*, cross-checked against
 |---|---|
 | `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses), exhausted ids |
 | `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob and entropy, TF mismatches |
-| `features.parquet` | long format: `id, layer, beta, beta_multiplier, variant, empty_response` + 11 features |
 | `traces.h5` | `/<id>/{energy, norm_entropy, margin}` `[L, T]` at β*, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response) |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy (response tokens) |
 | `hidden.h5` | `/<id>/{prompt_last, response_last}` `[layers, D]` float16 |
@@ -220,6 +358,11 @@ Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECT
 
 ## History
 
+- **v0.2, step 0**: the features table (the long per-layer parquet, variants
+  `mean`/`first`, Hellinger², top-k Jaccard) removed — aggregation over
+  tokens is analysis; the per-token traces replace it (extended in step 4); `downstream/` and the thesis `.tex` removed
+  (tag `thesis-e1e3`); the spec-mapping document folded into
+  `docs/ARCHITECTURE.md`, the cluster runbook into this README.
 - **2026-10-27**: package split into `core/` (what is computed), `pipeline/`
   (how it runs) and `verification/`; duplicated helpers merged (failure log,
   CUDA release, item paths, shard-run reading); behaviour unchanged (same

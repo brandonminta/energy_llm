@@ -79,7 +79,7 @@ def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
 # Per-id item files
 # ----------------------------------------------------------------------
 
-def write_item(sdir: Path, res: ItemResult, multipliers: list[float]) -> None:
+def write_item(sdir: Path, res: ItemResult) -> None:
     import h5py
 
     with atomic_path(item_path(sdir, res.item_id)) as tmp:
@@ -89,8 +89,6 @@ def write_item(sdir: Path, res: ItemResult, multipliers: list[float]) -> None:
             f.create_dataset("answer_json", data=json.dumps(res.answer, ensure_ascii=False))
             f.create_dataset("baselines_json", data=json.dumps(res.baselines))
             f.attrs["betas"] = np.asarray(res.betas, dtype=np.float64)
-            f.attrs["beta_multipliers"] = np.asarray(multipliers, dtype=np.float64)
-            f.create_dataset("features", data=res.features)
             for name in ("energy", "norm_entropy", "margin", "role_mask",
                          "hidden_prompt_last", "hidden_response_last"):
                 f.create_dataset(name, data=getattr(res, name))
@@ -107,7 +105,6 @@ def read_item(path: Path) -> dict:
         out["answer"] = json.loads(f["answer_json"][()].decode("utf-8"))
         out["baselines"] = json.loads(f["baselines_json"][()].decode("utf-8"))
         out["betas"] = np.asarray(f.attrs["betas"])
-        out["beta_multipliers"] = np.asarray(f.attrs["beta_multipliers"])
     return out
 
 
@@ -198,7 +195,6 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                 read_bank_fingerprint(cfg.bank_h5_path) != fingerprint:
             raise RuntimeError("model weights differ from the calibrated bank")
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
-        mult = list(cfg.extraction.beta_multipliers)
         hooks = ResidualHooks(bundle.model)
         t_items = time.time()
         try:
@@ -209,10 +205,9 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                     prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question,
                                           cfg.prompt.date_string)
                     trace = forward_item(bundle, hooks, prompt)
-                    res = compute(bundle, bank, trace, it.id, beta_star, mult,
-                                  cfg.extraction.jaccard_top_k, layers_h)
+                    res = compute(bundle, bank, trace, it.id, beta_star, layers_h)
                     del trace
-                    write_item(sdir, res, mult)
+                    write_item(sdir, res)
                     n_done += 1
                 except Exception as exc:
                     attempt = st.attempts.get(it.id, 0) + 1

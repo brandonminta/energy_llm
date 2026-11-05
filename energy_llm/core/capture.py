@@ -8,16 +8,13 @@ residual hooks, and every per-layer metric.
    logits must reproduce the greedy tokens; any mismatch is recorded.
 3. A forward pre-hook on every ``post_attention_layernorm`` reads the
    residual x at its INPUT. x_hat, scores and all metrics are float32.
-4. Phases, per layer (layers never mixed):
-   - prompt   = last prompt position (the state that emits the first answer token)
-   - response = positions whose input token is a generated non-stop token
-   An empty response (the first generated token is a stop token) is a valid
-   sample: prompt-phase features are computed, response-phase ones are NaN
-   by design, and ``empty_response`` is set.
-   E and H_bar are averaged over response positions; JS, Hellinger^2 and
-   top-k Jaccard compare the AVERAGED response distribution with the prompt
-   one. Variant ``first`` uses the first response position instead of the
-   mean. All of it at every beta in beta* x multipliers (scores reused).
+4. Per layer (layers never mixed), per-token traces over every position
+   (prompt and response; the role mask separates them downstream). No
+   aggregation over tokens: that is analysis, not extraction.
+   Response positions = generated non-stop tokens. An empty response (the
+   first generated token is a stop token) is a valid sample: traces are
+   computed, response-only quantities are NaN by design, and
+   ``empty_response`` is set.
 """
 
 from __future__ import annotations
@@ -33,18 +30,6 @@ from energy_llm.core.bank import Bank
 from energy_llm.core.model import ModelBundle, decoder_layers
 from energy_llm.core.prompting import ROLE_RESPONSE, ROLE_TEMPLATE, Prompt
 
-FEATURES = (
-    "energy_prompt", "energy_resp", "delta_energy",
-    "norm_entropy_prompt", "norm_entropy_resp", "delta_norm_entropy",
-    "js", "hellinger_sq", "jaccard_topk",
-    "margin_prompt", "margin_resp",
-)
-VARIANTS = ("mean", "first")
-# Features that depend on the response phase: NaN by design for an empty response.
-RESPONSE_FEATURES = frozenset({
-    "energy_resp", "delta_energy", "norm_entropy_resp", "delta_norm_entropy",
-    "js", "hellinger_sq", "jaccard_topk", "margin_resp",
-})
 FP16_MAX = float(np.finfo(np.float16).max)
 
 
@@ -172,7 +157,6 @@ class ItemResult:
     item_id: str
     answer: dict
     baselines: dict
-    features: np.ndarray        # [L, n_beta, n_variant, n_feature] float32
     betas: list[float]
     energy: np.ndarray          # [L, T] float32 at beta*
     norm_entropy: np.ndarray    # [L, T] float32 at beta*
@@ -187,41 +171,12 @@ def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
     return x_hat, bank.scores(l, x_hat)
 
 
-def _phase_features(s_sel: torch.Tensor, m_sel: torch.Tensor, beta: float, k: int,
-                    variant: str) -> list[torch.Tensor]:
-    """s_sel: [1 + n_resp, D_ff] (row 0 = prompt); m_sel: margins of those rows."""
-    logp = metrics.log_distribution(s_sel, beta)
-    e = metrics.energy(s_sel, beta)
-    h = metrics.norm_entropy(logp)
-    if s_sel.shape[0] == 1:   # empty response: response phase undefined
-        nan = torch.full((), float("nan"), device=s_sel.device)
-        return [e[0], nan, nan, h[0], nan, nan, nan, nan, nan, m_sel[0], nan]
-    if variant == "mean":
-        e_r, h_r, m_r = e[1:].mean(), h[1:].mean(), m_sel[1:].mean()
-        lp_r = metrics.log_mean_distribution(logp[1:])
-    else:
-        e_r, h_r, m_r, lp_r = e[1], h[1], m_sel[1], logp[1]
-    lp_0 = logp[0]
-    return [
-        e[0], e_r, e_r - e[0],
-        h[0], h_r, h_r - h[0],
-        metrics.js_divergence(lp_r, lp_0), metrics.hellinger_sq(lp_r, lp_0),
-        metrics.jaccard_topk(lp_r, lp_0, k),
-        m_sel[0], m_r,
-    ]
-
-
 @torch.inference_mode()
 def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: str,
-                 beta_star: float, multipliers: list[float], top_k: int,
-                 hidden_layers: list[int]) -> ItemResult:
+                 beta_star: float, hidden_layers: list[int]) -> ItemResult:
     dims = bundle.dims
-    betas = [beta_star * m for m in multipliers]
-    sel = [trace.n_prompt - 1] + trace.response_positions
-    sel_idx = torch.tensor(sel, device=bank.device)
     L, T = dims.n_layers, trace.n_prompt + len(trace.gen_ids)
 
-    feats = torch.empty(L, len(betas), len(VARIANTS), len(FEATURES))
     energy_tr = torch.empty(L, T)
     entropy_tr = torch.empty(L, T)
     margin_tr = torch.empty(L, T)
@@ -230,15 +185,9 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         x_hat, s = _layer_scores(bank, trace.residuals[l], l, dims.rms_norm_eps)
         dev = (x_hat.norm(dim=-1) / math.sqrt(dims.d_model) - 1.0).abs().max().item()
         max_dev = max(max_dev, dev)
-        m_all = metrics.margin(s)
-        s_sel, m_sel = s[sel_idx], m_all[sel_idx]
-        for bi, beta in enumerate(betas):
-            for vi, variant in enumerate(VARIANTS):
-                feats[l, bi, vi] = torch.stack(
-                    _phase_features(s_sel, m_sel, beta, top_k, variant)).cpu()
         energy_tr[l] = metrics.energy(s, beta_star).cpu()
         entropy_tr[l] = metrics.norm_entropy(metrics.log_distribution(s, beta_star)).cpu()
-        margin_tr[l] = m_all.cpu()
+        margin_tr[l] = metrics.margin(s).cpu()
         del x_hat, s
 
     empty = trace.empty_response
@@ -254,13 +203,10 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         raise NonFiniteError("residual exceeds the float16 range")
 
     out = {
-        "features": feats.numpy(), "energy": energy_tr.numpy(),
-        "norm_entropy": entropy_tr.numpy(), "margin": margin_tr.numpy(),
+        "energy": energy_tr.numpy(), "norm_entropy": entropy_tr.numpy(),
+        "margin": margin_tr.numpy(),
     }
     for name, arr in out.items():
-        if name == "features" and empty:
-            prompt_cols = [i for i, f in enumerate(FEATURES) if f not in RESPONSE_FEATURES]
-            arr = arr[..., prompt_cols]
         if not np.isfinite(arr).all():
             raise NonFiniteError(f"non-finite values in {name}")
 
@@ -296,7 +242,7 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "empty_response": empty,
     }
     return ItemResult(
-        item_id=item_id, answer=answer, baselines=baselines, betas=betas,
+        item_id=item_id, answer=answer, baselines=baselines, betas=[beta_star],
         role_mask=np.asarray(trace.roles, dtype=np.int8),
         hidden_prompt_last=hidden_p.astype(np.float16),
         hidden_response_last=hidden_r.astype(np.float16), **out,

@@ -4,7 +4,7 @@
 atomically, into ``<output_dir>/extract/<name>/``:
 
     answers.parquet    id, prompt, response, token ids, lengths, truncation, ...
-    baselines.parquet  mean/min token log-probability, mean token entropy
+    baselines.parquet  mean/min token log-probability, mean token entropy, mean_neg_logit
     traces.h5          /<id>/{energy, norm_entropy, topk_mass, mean_score, var_score,
                               js/<ref>, dkl/<ref>} [L, T, n_beta], {margin, xhat_top1_frac}
                        [L, T], topk_ids [L, T, k], role_mask [T]
@@ -24,11 +24,14 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
+from energy_llm.core.capture import REFERENCES
 from energy_llm.core.prompting import ROLE_NAMES
 from energy_llm.pipeline.extract import (
     ShardState, item_path, plan_shards, read_item, shard_path, shard_state,
 )
-from energy_llm.storage import Item, atomic_path, load_json, read_jsonl, sha256_file, write_json_atomic
+from energy_llm.storage import (
+    Item, atomic_path, load_json, read_jsonl, sha256_file, write_array, write_json_atomic,
+)
 
 
 def collect_states(cfg: RunConfig, items: list[Item], name: str,
@@ -109,38 +112,51 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             if "gamma_top_k" in f.attrs else None
 
     answers, baselines = [], []
-    betas = None
+    constants = None                       # (betas, topk_mass_k, topk_ids_k): equal for every item
+    max_xhat_top1 = dict.fromkeys(REFERENCES)
     with atomic_path(ext_dir / "traces.h5") as t_tmp, atomic_path(ext_dir / "hidden.h5") as h_tmp:
         with h5py.File(t_tmp, "w") as tf, h5py.File(h_tmp, "w") as hf:
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
             tf.attrs["role_names"] = [ROLE_NAMES[k] for k in sorted(ROLE_NAMES)]
             tf.attrs["beta_star"] = float(beta_rec["beta_star"])
+            tf.attrs["reference_names"] = list(REFERENCES)
             tf.attrs["layout"] = ("per token: energy, norm_entropy, topk_mass, mean_score, var_score, "
-                                  "js/<ref>, dkl/<ref>: [L, T, n_beta] float16; margin, "
-                                  "xhat_top1_frac: [L, T] float16; topk_ids: [L, T, k] int32; "
-                                  "role_mask: [T]")
+                                  "js/<ref>, dkl/<ref>: [L, T, n_beta] float16 (betas, beta* last); "
+                                  "margin, xhat_top1_frac: [L, T] float16; topk_ids: [L, T, "
+                                  "topk_ids_k] int32; role_mask: [T]; gzip 4, chunks [1, ...]; "
+                                  "group attr reference_positions [3] in reference_names order, "
+                                  "-1 = none (empty response)")
             hf.attrs["layers"] = np.asarray(cfg.hidden_layer_indices(n_layers))
             hf.attrs["layout"] = ("residual at the input of post_attention_layernorm at "
                                   "question_last, prompt_last, response_first, response_last "
                                   "(NaN when the response is empty): [layers, D] float16")
             for item_id in order:
                 rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
-                if betas is None:
-                    betas = rec["betas"]
-                elif not np.array_equal(rec["betas"], betas):
-                    raise RuntimeError(f"item {item_id} was computed with betas {rec['betas'].tolist()}, "
-                                       f"others with {betas.tolist()}")
+                c = (rec["betas"].tolist(), rec["topk_mass_k"], rec["topk_ids_k"])
+                if constants is None:
+                    constants = c
+                elif c != constants:
+                    raise RuntimeError(f"item {item_id} was computed with (betas, topk_mass_k, "
+                                       f"topk_ids_k) = {c}, others with {constants}")
                 answers.append(rec["answer"])
                 baselines.append(rec["baselines"])
+                refs = rec["reference_positions"]
+                for r, pos in refs.items():
+                    if pos is not None:
+                        v = float(rec["traces"]["xhat_top1_frac"][:, pos].max())
+                        max_xhat_top1[r] = v if max_xhat_top1[r] is None else max(max_xhat_top1[r], v)
                 g = tf.create_group(item_id)
+                g.attrs["reference_positions"] = np.asarray(
+                    [-1 if refs[r] is None else refs[r] for r in REFERENCES], dtype=np.int64)
                 for k, arr in rec["traces"].items():
-                    g.create_dataset(k, data=arr, compression="gzip", compression_opts=4)
-                g.create_dataset("role_mask", data=rec["role_mask"])
+                    write_array(g, k, arr)
+                write_array(g, "role_mask", rec["role_mask"])
                 g = hf.create_group(item_id)
                 for k, arr in rec["hidden"].items():
-                    g.create_dataset(k, data=arr, compression="gzip", compression_opts=4)
-            if betas is not None:
-                tf.attrs["betas"] = np.asarray(betas, dtype=np.float64)   # last = beta*
+                    write_array(g, k, arr)
+            if constants is not None:
+                tf.attrs["betas"] = np.asarray(constants[0], dtype=np.float64)   # last = beta*
+                tf.attrs["topk_mass_k"], tf.attrs["topk_ids_k"] = constants[1], constants[2]
 
     _write_parquet(pd.DataFrame(answers), ext_dir / "answers.parquet")
     _write_parquet(pd.DataFrame(baselines), ext_dir / "baselines.parquet")
@@ -172,6 +188,11 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             "tf_mismatch_ids": [a["id"] for a in answers if a["tf_mismatch_count"]],
             "n_truncated": sum(bool(a["truncated"]) for a in answers),
             "n_empty_response": sum(bool(a["empty_response"]) for a in answers),
+            # max over ids and layers of max_j x_hat_j^2 / D at each reference position
+            "max_xhat_top1_frac": max_xhat_top1,
+            "gamma_top_fraction_max": None if gamma_diag is None else {
+                "k": gamma_diag["k"], "value": max(gamma_diag["fraction"]),
+                "layer": int(np.argmax(gamma_diag["fraction"]))},
         },
         "gamma_diagnostic": gamma_diag,
         "model_dtype": dtypes,

@@ -352,10 +352,10 @@ if it is wanted, and record its peak memory and seconds/question.
 
 | File | Content |
 |---|---|
-| `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses), γ diagnostic, exhausted ids |
-| `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob and entropy, TF mismatches |
-| `traces.h5` | `/<id>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` `[L, T, n_beta]` float16 (β\* last), `/<id>/{margin, xhat_top1_frac}` `[L, T]` float16, `/<id>/topk_ids` `[L, T, 100]` int32, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); attrs `betas` |
-| `baselines.parquet` | mean / min token log-probability, mean token entropy (response tokens) |
+| `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
+| `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches, `xhat_norm_max_rel_dev` |
+| `traces.h5` | `/<id>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` `[L, T, n_beta]` float16 (β\* last), `/<id>/{margin, xhat_top1_frac}` `[L, T]` float16, `/<id>/topk_ids` `[L, T, 100]` int32, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions`; attrs `betas`, `topk_mass_k`, `topk_ids_k`, `reference_names`; gzip, one chunk per layer |
+| `baselines.parquet` | mean / min token log-probability, mean token entropy, `mean_neg_logit` (response tokens; NaN when empty) |
 | `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 |
 | `bank.h5` | γ and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
 

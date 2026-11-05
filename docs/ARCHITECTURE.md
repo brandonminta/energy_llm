@@ -51,7 +51,7 @@ array jobs that survive walltime kills and preemption without supervision.
 energy_llm/                 the installed package (CLI: energy-llm, python -m energy_llm)
   cli.py                    argparse entry point; one cmd_* per sub-command
   config.py                 RunConfig: the YAML schema, validation, hashes
-  storage.py                atomic writes, JSONL logs, failure log, hashing, input items
+  storage.py                atomic writes, HDF5 array layout, JSONL logs, failure log, hashing, input items
   manifest.py               provenance: git commit, library versions, hardware, seeds
   core/                     WHAT is computed (no output directory involved)
     model.py                loading at a pinned revision, dims from the checkpoint, clean greedy config
@@ -328,12 +328,15 @@ reduction over tokens is done in the module (aggregation is analysis).
   `[L_h, D]`; `response_first` and `response_last` are NaN for an empty
   response. A value beyond the float16 range raises `NonFiniteError`.
 - **Baselines** over response tokens, from the decoding logits:
-  `mean_logprob`, `min_logprob`, `mean_token_entropy`, `n_response_tokens`,
-  `empty_response`.
+  `mean_logprob`, `min_logprob`, `mean_token_entropy`, `mean_neg_logit`
+  (minus the mean logit of the chosen tokens: one-pass Semantic-Energy
+  baseline), `n_response_tokens`, `empty_response`; NaN when empty.
 - **Answer record**: prompt text, decoded response (response tokens only,
   special tokens skipped), prompt and generated token ids, counts,
-  `empty_response`, `truncated`, `stop_token_id`, per-token log-probs and
-  entropies, TF mismatch count and positions, `xhat_norm_max_rel_dev`.
+  `empty_response`, `truncated`, `stop_token_id`, per-token log-probs,
+  logits of the chosen token (`token_logits`, float32, the same decoding
+  logits as the log-probs) and entropies, TF mismatch count and positions,
+  `xhat_norm_max_rel_dev`.
 
 ### 5.9 Empty responses and failures
 
@@ -420,9 +423,10 @@ shards/shard_KKKKK/
   shard.json        identity: shard_index, num_shards, ids, input_sha256, config_sha256,
                     beta_star, bank_fingerprint  — a resume under a different value refuses
   items/<sha1(id)>.h5   every output of one id (attrs id, betas = grid + [beta*],
-                    reference_positions [3] in REFERENCES order, -1 for None;
-                    datasets answer_json, baselines_json, role_mask,
-                    traces/<name> (float16; topk_ids int32), hidden/<position> float16)
+                    topk_mass_k, topk_ids_k, reference_positions [3] in REFERENCES
+                    order, -1 for None; datasets answer_json, baselines_json, role_mask,
+                    traces/<name> (float16; topk_ids int32), hidden/<position> float16;
+                    arrays gzip 4, chunked one layer at a time: storage.write_array)
   completed.jsonl   {id, key, time} appended only AFTER the item file is fsynced and renamed
   failed.jsonl      one record per failed attempt
   runs.jsonl        one record per process run: counts, timings, model dtype,
@@ -467,10 +471,10 @@ input order and writes, each atomically, into `<output_dir>/extract/<name>/`:
 |---|---|
 | `answers.parquet` | one row per id: the answer record of 5.8 |
 | `baselines.parquet` | one row per id |
-| `traces.h5` | `/<id>/<dataset>` for every trace of 5.8 (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `betas` (float64, last = β\*; `merge` raises if two items disagree), `layout` |
-| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last} [L_h, D] float16` (gzip); attrs `layers`, `layout` |
+| `traces.h5` | `/<id>/<dataset>` for every trace of 5.8, `/<id>/role_mask [T]`, gzip 4, chunks `[1, T, …]` (one layer reads alone); group attr `reference_positions [3]` (−1 = none); file attrs `role_codes`, `role_names`, `reference_names`, `beta_star`, `betas` (float64, last = β\*), `topk_mass_k`, `topk_ids_k`, `layout`. `merge` raises if two items disagree on `(betas, topk_mass_k, topk_ids_k)` |
+| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last} [L_h, D] float16` (gzip, chunks `[1, D]`); attrs `layers`, `layout` |
 | `bank.h5` | byte copy of `calibration/bank.h5` |
-| `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
+| `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`, `max_xhat_top1_frac` per reference position over ids and layers, `gamma_top_fraction_max` = largest top-k γ fraction and its layer), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
 
 `status_report` (CLI `status`) uses the same shard states and `runs.jsonl`
 records: per-shard counts, `missing_shards`, `exhausted_ids`, and a
@@ -602,13 +606,13 @@ must override.
 
 | file | proves |
 |---|---|
-| `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped) |
+| `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped); item file round trip (float16 / int32, attrs, gzip, chunks `[1, T, n_beta]`) |
 | `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
 | `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
-| `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas; `topk_ids` sorted and unique; `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast); `betas` recorded; NaN raises |
+| `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; `token_logits` == chosen-token logits of an explicit forward; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas; `topk_ids` sorted and unique; `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast); `betas` recorded; NaN raises |
 | `test_config.py` | YAML round trip keeps values and hash; `betas` = absolute grid + β\* last; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`) rejected |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
-| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
+| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; merge of two shards (attrs, per-id reference positions, chunks, `max_xhat_top1_frac`, `mean_neg_logit`, γ summary); `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
 | `test_invariance.py` | permuting memories changes nothing (`topk_ids` map through the permutation); β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
 | `test_reference.py` | production traces == `dev/reference.py` within the derived tolerances at three β\*; empty response; negative control (no γ) fails |
 | `test_verify.py` | all twelve checks PASS on the tiny models; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (one prompt row, one table row per layer) |

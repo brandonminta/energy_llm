@@ -2,8 +2,9 @@
 residual hooks, and every per-layer metric.
 
 1. The chat-templated prompt is greedy-decoded (clean config, batch 1).
-   Generated token ids, per-token log-probability and predictive entropy
-   (float32, from the decoding logits) and a truncation flag are kept.
+   Generated token ids, per-token log-probability, logit of the chosen token
+   and predictive entropy (float32, from the decoding logits) and a
+   truncation flag are kept.
 2. One forward pass over prompt ++ generated tokens. The argmax of its
    logits must reproduce the greedy tokens; any mismatch is recorded.
 3. A forward pre-hook on every ``post_attention_layernorm`` reads the
@@ -80,6 +81,7 @@ class ForwardTrace:
     prompt: Prompt
     gen_ids: list[int]
     token_logprobs: np.ndarray        # [T_g] float32
+    token_logits: np.ndarray          # [T_g] float32, logit of the chosen token
     token_entropies: np.ndarray       # [T_g] float32, nats
     truncated: bool
     stop_token_id: int | None
@@ -128,9 +130,11 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     logits = torch.stack(out.logits, dim=0)[:, 0, :].float()   # [T_g, V]
     del out
     logp = torch.log_softmax(logits, dim=-1)
-    chosen = logp.gather(1, torch.tensor(gen, device=logp.device)[:, None])[:, 0]
+    gen_idx = torch.tensor(gen, device=logp.device)[:, None]
+    chosen = logp.gather(1, gen_idx)[:, 0]
     ent = -(logp.exp() * logp).nan_to_num(0.0).sum(dim=-1)
     token_logprobs = chosen.cpu().numpy().astype(np.float32)
+    token_logits = logits.gather(1, gen_idx)[:, 0].cpu().numpy().astype(np.float32)
     token_entropies = ent.cpu().numpy().astype(np.float32)
     del logits, logp
 
@@ -153,7 +157,7 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     residuals, hooks.x = hooks.x, {}
 
     return ForwardTrace(
-        prompt=prompt, gen_ids=gen, token_logprobs=token_logprobs,
+        prompt=prompt, gen_ids=gen, token_logprobs=token_logprobs, token_logits=token_logits,
         token_entropies=token_entropies, truncated=truncated, stop_token_id=stop_id,
         response_positions=resp_pos, tf_mismatch_positions=mismatches,
         residuals=residuals,
@@ -170,6 +174,8 @@ class ItemResult:
     answer: dict
     baselines: dict
     betas: list[float]                      # grid + [beta*]
+    topk_mass_k: int
+    topk_ids_k: int
     reference_positions: dict[str, int | None]
     # name -> [L, T, n_beta] float32 (energy, norm_entropy, topk_mass, mean_score,
     # var_score, js/<ref>, dkl/<ref>), [L, T] float32 (margin, xhat_top1_frac),
@@ -262,6 +268,7 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "truncated": bool(trace.truncated),
         "stop_token_id": trace.stop_token_id,
         "token_logprobs": trace.token_logprobs.tolist(),
+        "token_logits": trace.token_logits.tolist(),
         "token_entropies": trace.token_entropies.tolist(),
         "tf_mismatch_count": len(trace.tf_mismatch_positions),
         "tf_mismatch_positions": list(trace.tf_mismatch_positions),
@@ -274,12 +281,14 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "mean_logprob": float(lp.mean()) if not empty else nan,
         "min_logprob": float(lp.min()) if not empty else nan,
         "mean_token_entropy": float(trace.token_entropies[resp_j].mean()) if not empty else nan,
+        # one-pass Semantic-Energy baseline: minus the mean chosen-token logit
+        "mean_neg_logit": float(-trace.token_logits[resp_j].mean()) if not empty else nan,
         "n_response_tokens": len(resp_j),
         "empty_response": empty,
     }
     return ItemResult(
         item_id=item_id, answer=answer, baselines=baselines, betas=list(betas),
-        reference_positions=refs, traces=traces,
+        topk_mass_k=topk_mass_k, topk_ids_k=topk_ids_k, reference_positions=refs, traces=traces,
         role_mask=np.asarray(trace.roles, dtype=np.int8),
         hidden={k: v.astype(np.float16) for k, v in hidden.items()},
     )

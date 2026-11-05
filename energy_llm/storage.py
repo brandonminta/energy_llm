@@ -1,4 +1,4 @@
-"""Atomic file writes, JSONL logs, hashing and input reading.
+"""Atomic file writes, HDF5 array layout, JSONL logs, hashing and input reading.
 
 Every artefact is written to a ``.tmp`` sibling, fsynced, and renamed into
 place, then the directory is fsynced, so a SIGKILL at any point leaves either
@@ -113,6 +113,13 @@ def append_failure(path: str | Path, item_id: str, attempt: int, max_attempts: i
         "error": repr(exc), "traceback": traceback.format_exc(),
         "time": time.time(), "host": socket.gethostname(),
     })
+
+
+def write_array(group, name: str, arr) -> None:
+    """One array into an open h5py group: gzip 4, chunked one layer (first
+    axis) at a time, e.g. [1, T, n_beta], so a single layer reads alone."""
+    chunks = (1,) + tuple(arr.shape[1:]) if arr.ndim >= 2 else None
+    group.create_dataset(name, data=arr, chunks=chunks, compression="gzip", compression_opts=4)
 
 
 def sha256_file(path: str | Path) -> str:

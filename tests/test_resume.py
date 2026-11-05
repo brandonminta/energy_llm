@@ -93,6 +93,43 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
     assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
 
 
+def test_merge_of_two_shards(calibrated):
+    from energy_llm.core.capture import REFERENCES
+
+    cfg, bundle, ev, rec = calibrated
+    items = read_items(ev)
+    for k in (0, 2):
+        run_extract(cfg, bundle, items, ev, "two", k)
+    m = run_merge(cfg, items, ev, "two", allow_incomplete=True)
+    ids = [it.id for it in items[:3] + items[6:]]
+    assert m["counts"]["completed"] == 4 and m["incomplete_shards"] == [1]
+    d = cfg.extraction_dir("two")
+    ans = pd.read_parquet(d / "answers.parquet").set_index("id")
+    base = pd.read_parquet(d / "baselines.parquet").set_index("id")
+    assert list(ans.index) == ids
+    with h5py.File(d / "traces.h5") as f:
+        assert list(f) == sorted(ids)
+        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["beta_star"])
+        assert (f.attrs["topk_mass_k"], f.attrs["topk_ids_k"]) == (4, 8)
+        assert list(f.attrs["reference_names"]) == list(REFERENCES)
+        worst = dict.fromkeys(REFERENCES, 0.0)
+        for i in ids:
+            g, a = f[i], ans.loc[i]
+            pos = g.attrs["reference_positions"].tolist()
+            assert pos[1] == a["n_prompt_tokens"] - 1
+            assert pos[2] == (-1 if a["empty_response"] else a["n_prompt_tokens"])
+            assert g["energy"].chunks == (1, g["energy"].shape[1], 10)
+            for r, p in zip(REFERENCES, pos):
+                if p >= 0:
+                    worst[r] = max(worst[r], float(g["xhat_top1_frac"][:, p].max()))
+            resp = np.asarray(a["token_logits"])[:a["n_response_tokens"]]
+            if len(resp):
+                assert base.loc[i, "mean_neg_logit"] == pytest.approx(-resp.mean(), rel=1e-6)
+    assert m["checks"]["max_xhat_top1_frac"] == pytest.approx(worst)
+    g = m["checks"]["gamma_top_fraction_max"]
+    assert g["k"] == 5 and g["value"] == max(m["gamma_diagnostic"]["fraction"])
+
+
 def test_merge_refuses_items_with_different_betas(calibrated):
     from energy_llm.pipeline.extract import item_path
 

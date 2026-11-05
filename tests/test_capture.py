@@ -86,6 +86,18 @@ def test_teacher_forcing_reproduces_greedy(pair, seed):
     assert checked == 4
 
 
+def test_token_logits_are_the_decoding_logits_of_the_chosen_tokens(qwen_pair):
+    bundle = make_bundle(*qwen_pair, max_new_tokens=6)
+    tr = _trace(bundle)
+    ids = torch.tensor([tr.prompt.input_ids + tr.gen_ids])
+    with torch.no_grad():
+        logits = bundle.model(input_ids=ids).logits[0, tr.n_prompt - 1: -1].float()
+    want = logits.gather(1, torch.tensor(tr.gen_ids)[:, None])[:, 0].numpy()
+    assert tr.token_logits.dtype == np.float32
+    np.testing.assert_allclose(tr.token_logits, want, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(tr.token_logprobs, want - torch.logsumexp(logits, -1).numpy(), atol=1e-4)
+
+
 def test_residual_hook_reads_norm_input(qwen_pair):
     bundle = make_bundle(*qwen_pair)
     tr = _trace(bundle)

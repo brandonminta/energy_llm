@@ -38,7 +38,7 @@ from energy_llm.pipeline.signals import GracefulStop
 from energy_llm.storage import (
     Item, append_failure, append_jsonl, atomic_path, item_key, load_json,
     normalise_question, read_failures, read_jsonl, sha256_file, sha256_text,
-    write_json_atomic,
+    write_array, write_json_atomic,
 )
 
 log = logging.getLogger("energy_llm.pipeline.extract")
@@ -81,14 +81,17 @@ def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
 
 def write_item(sdir: Path, res: ItemResult) -> None:
     """One HDF5 file per id: traces/<name> (floats as float16, topk_ids int32),
-    hidden/<position> float16, role_mask; attrs betas and reference_positions
-    (in ``REFERENCES`` order, -1 for None)."""
+    hidden/<position> float16, role_mask (``storage.write_array``: gzip 4,
+    one chunk per layer); attrs betas, topk_mass_k, topk_ids_k and
+    reference_positions (in ``REFERENCES`` order, -1 for None)."""
     import h5py
 
     with atomic_path(item_path(sdir, res.item_id)) as tmp:
         with h5py.File(tmp, "w") as f:
             f.attrs["id"] = res.item_id
             f.attrs["betas"] = np.asarray(res.betas, dtype=np.float64)
+            f.attrs["topk_mass_k"] = res.topk_mass_k
+            f.attrs["topk_ids_k"] = res.topk_ids_k
             f.attrs["reference_positions"] = np.asarray(
                 [-1 if res.reference_positions[r] is None else res.reference_positions[r]
                  for r in REFERENCES], dtype=np.int64)
@@ -96,11 +99,10 @@ def write_item(sdir: Path, res: ItemResult) -> None:
             f.create_dataset("answer_json", data=json.dumps(res.answer, ensure_ascii=False))
             f.create_dataset("baselines_json", data=json.dumps(res.baselines))
             for name, arr in res.traces.items():
-                f.create_dataset(f"traces/{name}",
-                                 data=arr if arr.dtype == np.int32 else arr.astype(np.float16))
+                write_array(f, f"traces/{name}", arr if arr.dtype == np.int32 else arr.astype(np.float16))
             for name, arr in res.hidden.items():
-                f.create_dataset(f"hidden/{name}", data=arr)
-            f.create_dataset("role_mask", data=res.role_mask)
+                write_array(f, f"hidden/{name}", arr)
+            write_array(f, "role_mask", res.role_mask)
     append_jsonl(sdir / "completed.jsonl",
                  {"id": res.item_id, "key": item_key(res.item_id), "time": time.time()})
 
@@ -119,6 +121,8 @@ def read_item(path: Path) -> dict:
         return {
             "id": str(f.attrs["id"]),
             "betas": np.asarray(f.attrs["betas"]),
+            "topk_mass_k": int(f.attrs["topk_mass_k"]),
+            "topk_ids_k": int(f.attrs["topk_ids_k"]),
             "reference_positions": {r: None if p < 0 else int(p) for r, p in zip(REFERENCES, pos)},
             "answer": json.loads(f["answer_json"][()].decode("utf-8")),
             "baselines": json.loads(f["baselines_json"][()].decode("utf-8")),

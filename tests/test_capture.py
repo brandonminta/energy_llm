@@ -136,16 +136,26 @@ def test_empty_response_is_a_valid_sample(pair):
     _set_stops(bundle, set(bundle.stop_token_ids) | {first})   # the model stops at once
     tr = _trace(bundle)
     assert tr.empty_response and tr.gen_ids == [first] and not tr.truncated
-    res = compute_item(bundle, bank, tr, "e", [5.0], list(range(bundle.dims.n_layers)))
+    assert tr.reference_positions["response_first"] is None
+    res = compute_item(bundle, bank, tr, "e", [1.0, 5.0], list(range(bundle.dims.n_layers)), 4, 8)
     assert res.answer["empty_response"] and res.answer["n_response_tokens"] == 0
     assert res.answer["response"] == ""
-    assert np.isfinite(res.energy).all() and np.isfinite(res.norm_entropy).all()
-    assert np.isnan(res.hidden_response_last).all()
-    assert np.isfinite(res.hidden_prompt_last).all()
+    for name, arr in res.traces.items():
+        if name.endswith("/response_first"):
+            assert np.isnan(arr).all(), name
+        else:
+            assert np.isfinite(arr).all(), name
+    for name in ("response_first", "response_last"):
+        assert np.isnan(res.hidden[name]).all()
+    for name in ("question_last", "prompt_last"):
+        assert np.isfinite(res.hidden[name]).all()
     assert res.baselines["empty_response"] and np.isnan(res.baselines["mean_logprob"])
 
 
 # ------------------------------------------------------------ item metrics
+
+K_MASS, K_IDS = 4, 8
+
 
 @pytest.fixture()
 def item(pair):
@@ -153,35 +163,111 @@ def item(pair):
     bank = build_bank(bundle.model, bundle.dims)
     tr = _trace(bundle)
     beta = 7.5
-    res = compute_item(bundle, bank, tr, "x1", [1.0, beta], list(range(bundle.dims.n_layers)))
+    res = compute_item(bundle, bank, tr, "x1", [1.0, 30.0, beta], list(range(bundle.dims.n_layers)),
+                       K_MASS, K_IDS)
     return bundle, bank, tr, beta, res
+
+
+def _scores(bundle, bank, tr, l):
+    return capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps)
 
 
 def test_item_shapes_and_bounds(item):
     bundle, _, tr, _, res = item
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     T = tr.n_prompt + len(tr.gen_ids)
-    for name in ("energy", "norm_entropy", "margin"):
-        assert getattr(res, name).shape == (L, T)
+    per_beta = {"energy", "norm_entropy", "topk_mass", "mean_score", "var_score"} | {
+        f"{d}/{r}" for d in ("js", "dkl") for r in capture.REFERENCES}
+    assert set(res.traces) == per_beta | {"margin", "xhat_top1_frac", "topk_ids"}
+    for name in per_beta:
+        assert res.traces[name].shape == (L, T, 3) and res.traces[name].dtype == np.float32, name
+    for name in ("margin", "xhat_top1_frac"):
+        assert res.traces[name].shape == (L, T)
+    assert res.traces["topk_ids"].shape == (L, T, K_IDS) and res.traces["topk_ids"].dtype == np.int32
     assert res.role_mask.shape == (T,) and res.role_mask.dtype == np.int8
-    assert res.hidden_prompt_last.shape == (L, D) and res.hidden_prompt_last.dtype == np.float16
-    assert np.all(res.norm_entropy >= -1e-6) and np.all(res.norm_entropy <= 1 + 1e-6)
+    assert set(res.hidden) == {"question_last", "prompt_last", "response_first", "response_last"}
+    for h in res.hidden.values():
+        assert h.shape == (L, D) and h.dtype == np.float16
+    t = res.traces
+    assert np.all((t["norm_entropy"] >= -1e-6) & (t["norm_entropy"] <= 1 + 1e-6))
+    assert np.all((t["topk_mass"] > 0) & (t["topk_mass"] <= 1 + 1e-6))
+    assert np.all(t["var_score"] >= 0)
+    assert np.all((t["xhat_top1_frac"] >= 1 / D - 1e-6) & (t["xhat_top1_frac"] <= 1 + 1e-6))
+    for r in capture.REFERENCES:
+        assert np.all((t[f"js/{r}"] >= 0) & (t[f"js/{r}"] <= np.log(2)))
     assert 0.0 <= res.answer["xhat_norm_max_rel_dev"] < 0.05  # tiny residuals: eps is visible
     assert res.answer["n_response_tokens"] == len(tr.response_positions)
     assert "gold" not in str(res.answer)
 
 
-def test_energy_trace_matches_scipy(item):
+def test_reference_positions(item):
+    _, _, tr, _, res = item
+    refs = res.reference_positions
+    q = [i for i, r in enumerate(tr.roles) if r == ROLE_QUESTION]
+    assert refs == {"question_last": q[-1], "prompt_last": tr.n_prompt - 1,
+                    "response_first": tr.response_positions[0]}
+    assert refs["question_last"] < refs["prompt_last"] < refs["response_first"]
+
+
+def test_reference_requires_a_question_token(qwen_pair):
+    tr = _trace(make_bundle(*qwen_pair))
+    tr.prompt.roles = [ROLE_TEMPLATE] * tr.n_prompt
+    with pytest.raises(PromptError, match="question"):
+        tr.reference_positions
+
+
+def test_own_reference_rows_are_zero(item):
+    *_, res = item
+    for r, pos in res.reference_positions.items():
+        assert np.abs(res.traces[f"js/{r}"][:, pos]).max() <= 1e-7      # one rounding in logaddexp
+        assert np.abs(res.traces[f"dkl/{r}"][:, pos]).max() == 0.0
+
+
+def test_divergences_match_explicit_formula(item):
+    bundle, bank, tr, _, res = item
+    l, bi, beta = 1, 1, 30.0
+    _, s = _scores(bundle, bank, tr, l)
+    lp = torch.log_softmax(beta * s.double(), dim=-1)
+    for r, pos in res.reference_positions.items():
+        p, q = lp.exp(), lp[pos].exp()
+        kl_pq = (p * (lp - lp[pos])).sum(-1)
+        kl_qp = (q * (lp[pos] - lp)).sum(-1)
+        np.testing.assert_allclose(res.traces[f"dkl/{r}"][l, :, bi], (kl_pq - kl_qp).numpy(), atol=1e-4)
+        m = 0.5 * (p + q)
+        js = 0.5 * (p * (p / m).log()).sum(-1) + 0.5 * (q * (q / m).log()).sum(-1)
+        np.testing.assert_allclose(res.traces[f"js/{r}"][l, :, bi], js.numpy(), atol=1e-5)
+
+
+def test_topk_ids_sorted_and_unique(item):
+    bundle, bank, tr, _, res = item
+    for l in range(bundle.dims.n_layers):
+        _, s = _scores(bundle, bank, tr, l)
+        for t, row in enumerate(res.traces["topk_ids"][l]):
+            assert len(set(row.tolist())) == K_IDS
+            vals = s[t, torch.as_tensor(row, dtype=torch.long)]
+            assert (vals[:-1] >= vals[1:]).all()
+            assert vals[-1] >= torch.topk(s[t], K_IDS + 1).values[-1]
+
+
+def test_energy_at_beta_star_equals_single_beta_trace(item):
+    """The last beta column is the former single-beta trace at beta*; stored as
+    float16 it stays within one float16 rounding."""
     bundle, bank, tr, beta, res = item
+    for l in range(bundle.dims.n_layers):
+        _, s = _scores(bundle, bank, tr, l)
+        single = metrics.energy(s, beta).numpy()
+        assert np.array_equal(res.traces["energy"][l, :, -1], single)
+        np.testing.assert_allclose(res.traces["energy"][l, :, -1].astype(np.float16), single,
+                                   rtol=2.0 ** -11, atol=0)
     l = bundle.dims.n_layers - 1
-    _, s = capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps)
+    _, s = _scores(bundle, bank, tr, l)
     ref = -logsumexp(beta * s.double().numpy(), axis=-1) / beta
-    np.testing.assert_allclose(res.energy[l], ref, rtol=1e-5)
+    np.testing.assert_allclose(res.traces["energy"][l, :, -1], ref, rtol=1e-5)
 
 
 def test_betas_record_the_grid_with_beta_star_last(item):
     *_, beta, res = item
-    assert res.betas == [1.0, beta]
+    assert res.betas == [1.0, 30.0, beta]
 
 
 def test_non_finite_values_raise(qwen_pair, monkeypatch):
@@ -190,4 +276,4 @@ def test_non_finite_values_raise(qwen_pair, monkeypatch):
     tr = _trace(bundle)
     monkeypatch.setattr(capture.metrics, "energy", lambda s, b: torch.full(s.shape[:-1], float("nan")))
     with pytest.raises(NonFiniteError):
-        compute_item(bundle, bank, tr, "x", [5.0], [0])
+        compute_item(bundle, bank, tr, "x", [5.0], [0], K_MASS, K_IDS)

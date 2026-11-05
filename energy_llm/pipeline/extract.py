@@ -31,7 +31,7 @@ import torch
 from energy_llm import manifest
 from energy_llm.config import RunConfig
 from energy_llm.core.bank import build_bank, read_bank_fingerprint
-from energy_llm.core.capture import ItemResult, ResidualHooks, compute_item, forward_item
+from energy_llm.core.capture import REFERENCES, ItemResult, ResidualHooks, compute_item, forward_item
 from energy_llm.core.model import ModelBundle, release_cuda
 from energy_llm.core.prompting import build_prompt, check_template
 from energy_llm.pipeline.signals import GracefulStop
@@ -80,18 +80,27 @@ def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
 # ----------------------------------------------------------------------
 
 def write_item(sdir: Path, res: ItemResult) -> None:
+    """One HDF5 file per id: traces/<name> (floats as float16, topk_ids int32),
+    hidden/<position> float16, role_mask; attrs betas and reference_positions
+    (in ``REFERENCES`` order, -1 for None)."""
     import h5py
 
     with atomic_path(item_path(sdir, res.item_id)) as tmp:
         with h5py.File(tmp, "w") as f:
             f.attrs["id"] = res.item_id
+            f.attrs["betas"] = np.asarray(res.betas, dtype=np.float64)
+            f.attrs["reference_positions"] = np.asarray(
+                [-1 if res.reference_positions[r] is None else res.reference_positions[r]
+                 for r in REFERENCES], dtype=np.int64)
             # datasets, not attributes: HDF5 attributes are limited to 64 KB
             f.create_dataset("answer_json", data=json.dumps(res.answer, ensure_ascii=False))
             f.create_dataset("baselines_json", data=json.dumps(res.baselines))
-            f.attrs["betas"] = np.asarray(res.betas, dtype=np.float64)
-            for name in ("energy", "norm_entropy", "margin", "role_mask",
-                         "hidden_prompt_last", "hidden_response_last"):
-                f.create_dataset(name, data=getattr(res, name))
+            for name, arr in res.traces.items():
+                f.create_dataset(f"traces/{name}",
+                                 data=arr if arr.dtype == np.int32 else arr.astype(np.float16))
+            for name, arr in res.hidden.items():
+                f.create_dataset(f"hidden/{name}", data=arr)
+            f.create_dataset("role_mask", data=res.role_mask)
     append_jsonl(sdir / "completed.jsonl",
                  {"id": res.item_id, "key": item_key(res.item_id), "time": time.time()})
 
@@ -99,13 +108,24 @@ def write_item(sdir: Path, res: ItemResult) -> None:
 def read_item(path: Path) -> dict:
     import h5py
 
+    def group(g) -> dict:
+        out = {}
+        g.visititems(lambda name, obj: out.__setitem__(name, obj[()])
+                     if isinstance(obj, h5py.Dataset) else None)
+        return out
+
     with h5py.File(path, "r") as f:
-        out = {k: f[k][()] for k in f.keys() if not k.endswith("_json")}
-        out["id"] = str(f.attrs["id"])
-        out["answer"] = json.loads(f["answer_json"][()].decode("utf-8"))
-        out["baselines"] = json.loads(f["baselines_json"][()].decode("utf-8"))
-        out["betas"] = np.asarray(f.attrs["betas"])
-    return out
+        pos = f.attrs["reference_positions"]
+        return {
+            "id": str(f.attrs["id"]),
+            "betas": np.asarray(f.attrs["betas"]),
+            "reference_positions": {r: None if p < 0 else int(p) for r, p in zip(REFERENCES, pos)},
+            "answer": json.loads(f["answer_json"][()].decode("utf-8")),
+            "baselines": json.loads(f["baselines_json"][()].decode("utf-8")),
+            "traces": group(f["traces"]),
+            "hidden": group(f["hidden"]),
+            "role_mask": f["role_mask"][()],
+        }
 
 
 @dataclass
@@ -206,7 +226,8 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                     prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question,
                                           cfg.prompt.date_string)
                     trace = forward_item(bundle, hooks, prompt)
-                    res = compute(bundle, bank, trace, it.id, betas, layers_h)
+                    res = compute(bundle, bank, trace, it.id, betas, layers_h,
+                                  cfg.extraction.topk_mass_k, cfg.extraction.topk_ids_k)
                     del trace
                     write_item(sdir, res)
                     n_done += 1

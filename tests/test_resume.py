@@ -80,6 +80,11 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
         assert set(f.keys()) == {it.id for it in items}
         assert f.attrs["beta_star"] == rec["beta_star"]
         assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["beta_star"])
+        g = f[items[0].id]
+        assert g["energy"].shape[-1] == 10 and g["energy"].dtype == np.float16
+        assert g["topk_ids"].dtype == np.int32 and g["js/question_last"].dtype == np.float16
+    with h5py.File(d / "hidden.h5") as f:
+        assert set(f[items[0].id]) == {"question_last", "prompt_last", "response_first", "response_last"}
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
     assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
     g = m["gamma_diagnostic"]
@@ -240,6 +245,8 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
     with h5py.File(d / "traces.h5") as f, h5py.File(d / "hidden.h5") as h:
         assert np.isfinite(f[items[0].id]["energy"][()]).all()
         assert np.isnan(h[items[0].id]["response_last"][()]).all()
+        assert np.isnan(f[items[0].id]["dkl/response_first"][()]).all()
+        assert np.isfinite(f[items[0].id]["dkl/prompt_last"][()]).all()
 
 
 def test_smoke_summary(calibrated, capsys):

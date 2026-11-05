@@ -127,7 +127,7 @@ For one item `{id, question}` inside `extract` (the same sequence runs in
 | 2 | `core.prompting.build_prompt` | official chat template on `[system, user]`, `add_generation_prompt=True`; tokenised with `add_special_tokens=False`; role per token from the offset mapping |
 | 3 | `core.capture.forward_item` | `model.generate` with the clean greedy config (hooks disabled) → `gen_ids`, per-token log-prob and entropy from the decoding logits (float32), `truncated`, `stop_token_id`, `response_positions` |
 | 4 | same | one teacher-forced forward pass over `prompt ++ gen_ids` with `use_cache=False`, hooks **enabled** → residual `x` per layer `[T, D]` (model dtype); argmax of its logits compared with `gen_ids` → `tf_mismatch_positions` |
-| 5 | `core.capture.compute_item` | per layer: `x̂`, scores `s` `[T, D_ff]`, per-token traces at β\*, hidden states, `answer` and `baselines` dicts, finiteness checks |
+| 5 | `core.capture.compute_item` | per layer: `x̂`, scores `s` `[T, D_ff]`, per-token traces at every β of the grid (β\* last) with divergences to three reference positions, hidden states, `answer` and `baselines` dicts, finiteness checks |
 | 6 | `pipeline.extract.write_item` | one HDF5 file per id (tmp + fsync + rename), then one line in `completed.jsonl` |
 | 7 | `pipeline.merge.run_merge` | later, on CPU: every item file in input order → parquet + HDF5 + `manifest.json` |
 
@@ -274,41 +274,59 @@ outputs, and `verify`, with the per-token traces of step 4.
 Squared Hellinger, top-k Jaccard and the mean-distribution helper were
 removed with the features table (v0.2, step 0).
 
-### 5.7 Positions and β (`core/capture.py: compute_item`)
+### 5.7 Positions, references and β (`core/capture.py: compute_item`)
 
 Per layer (layers are never mixed), the scores `s [T, D_ff]` of **every**
 position are computed once and every quantity is stored per position: no
 reduction over tokens is done in the module (aggregation is analysis).
 
-- **last prompt position** = `n_prompt - 1` (the state that emits the first
-  generated token).
 - **response positions** = `response_positions` (generated tokens, stop
   tokens excluded); the role mask (`3 response`) marks them.
+- **reference positions** (`ForwardTrace.reference_positions`, names in
+  `capture.REFERENCES`):
+  `question_last` = last prompt position with role `question`
+  (`PromptError` if there is none); `prompt_last` = `n_prompt - 1` (the
+  state that emits the first generated token); `response_first` = the first
+  response position, `None` for an empty response. Stop tokens never carry
+  the question role.
 - β: `betas = ExtractionConfig.betas(β*)` = the absolute log grid
   `10^min … 10^max` with `num` points (`extraction.beta_grid_log10`,
   default `{min: 0, max: 4, num: 9}`: half-decade steps, identical across
   models because `s` is a cosine) **plus β\* appended last**, so
-  `n_beta = num + 1` and `betas[-1] == β*`. `compute_item(…, betas, …)`
-  stores `betas` (`ItemResult.betas`, item attr) and today computes the
-  traces at `betas[-1] = β*` only; the grid enters the traces in step 4.
-  `extraction.topk_mass_k` (10) and `topk_ids_k` (100) are validated but
-  not yet used (step 4).
-
-Not computed anywhere: the un-normalised entropy `H`, per-token
-divergences, pooled prompt-span references, any aggregate across layers or
-tokens.
+  `n_beta = num + 1` and `betas[-1] == β*`. The grid is looped inside the
+  layer (one `log_softmax` of `[T, D_ff]` per β).
 
 ### 5.8 Traces, hidden states, baselines
 
-- **Traces** at β\* only, over *all* `T = n_prompt + n_generated` positions
-  (template, instruction, question, response and stop tokens alike):
-  `energy [L, T]`, `norm_entropy [L, T]`, `margin [L, T]`, plus
+- **Traces** (`ItemResult.traces`, float32 in memory; float16 in the files
+  except `topk_ids`), over *all* `T = n_prompt + n_generated` positions
+  (template, instruction, question, response and stop tokens alike), with
+  `p_t = softmax(β s_t)`:
+
+  | dataset | shape | definition |
+  |---|---|---|
+  | `energy` | `[L, T, n_beta]` | `E` |
+  | `norm_entropy` | `[L, T, n_beta]` | `H̄` |
+  | `topk_mass` | `[L, T, n_beta]` | mass of the `extraction.topk_mass_k` largest `p` |
+  | `mean_score`, `var_score` | `[L, T, n_beta]` | `Σ p s`, `Σ p (s - mean)²` |
+  | `margin` | `[L, T]` | top1 − top2 of `s` |
+  | `xhat_top1_frac` | `[L, T]` | `max_j x̂_j² / D` |
+  | `topk_ids` | `[L, T, k_ids]` int32 | indices of the `extraction.topk_ids_k` largest `s` (= largest `p` at any β), descending |
+  | `js/<ref>` | `[L, T, n_beta]` | `JS(p_t, p_ref)` |
+  | `dkl/<ref>` | `[L, T, n_beta]` | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+
+  `<ref>` ∈ {`question_last`, `prompt_last`, `response_first`}. At a
+  reference position its own `dkl` row is exactly 0 and its own `js` row is
+  0 up to one float32 rounding (≤ 1e-7, from `logaddexp`). Plus
   `role_mask [T] int8`.
-- **Hidden states**: for the layers in `extraction.hidden_layers` (`all` →
-  every layer), the residual `x` (same tensor the metrics read, *not* the
-  layer output) at the last prompt position (`prompt_last`) and at the last
-  response position (`response_last`), cast to float16 `[L_h, D]`. A value
-  beyond the float16 range raises `NonFiniteError`.
+- Not computed anywhere: the un-normalised entropy `H`, pooled
+  prompt-span references, any aggregate across layers or tokens.
+- **Hidden states** (`ItemResult.hidden`): for the layers in
+  `extraction.hidden_layers` (`all` → every layer), the residual `x` (same
+  tensor the metrics read, *not* the layer output) at the three reference
+  positions and at the last response position (`response_last`), float16
+  `[L_h, D]`; `response_first` and `response_last` are NaN for an empty
+  response. A value beyond the float16 range raises `NonFiniteError`.
 - **Baselines** over response tokens, from the decoding logits:
   `mean_logprob`, `min_logprob`, `mean_token_entropy`, `n_response_tokens`,
   `empty_response`.
@@ -323,9 +341,12 @@ tokens.
   (`response_positions == []`). It is a **valid, completed sample**, not a
   failure: greedy retries would reproduce it, and dropping it would bias the
   comparison between datasets. Traces are computed for every position (the
-  stop token included); the response baselines and `hidden:response_last`
-  are NaN by design; `empty_response=True` everywhere. The finiteness check
-  covers the traces only; any other non-finite value is a real failure.
+  stop token included); `js/response_first`, `dkl/response_first`, the
+  response baselines and `hidden:response_first/response_last` are NaN by
+  design; `empty_response=True` everywhere. The finiteness check covers
+  every trace except exactly those `*/response_first` datasets of an empty
+  response, and also rejects a trace beyond the float16 range; any other
+  non-finite value is a real failure.
 - **Failure** = any exception in prompt/forward/compute/write (OOM, a
   `PromptError`, a `NonFiniteError` for an unexpected NaN/inf, a residual
   outside float16, `RuntimeError("generation returned no tokens")`). It is
@@ -336,6 +357,8 @@ tokens.
 
 ### 5.10 Numerics
 
+- Storage: traces are written as float16 (relative precision 2⁻¹¹ ≈ 5e-4;
+  subnormals below 6e-5), `topk_ids` as int32, residuals as float16.
 - Model forward passes: model dtype (bfloat16 in production; float32 in
   tests). Everything after the hook — `x̂`, scores, softmax, metrics,
   decoding log-probs — is float32 on the model's device.
@@ -396,9 +419,10 @@ Layout of `<output_dir>/extract/<name>/` while running:
 shards/shard_KKKKK/
   shard.json        identity: shard_index, num_shards, ids, input_sha256, config_sha256,
                     beta_star, bank_fingerprint  — a resume under a different value refuses
-  items/<sha1(id)>.h5   every output of one id (attrs id, betas = grid + [beta*];
-                    datasets answer_json, baselines_json, energy, norm_entropy,
-                    margin, role_mask, hidden_prompt_last, hidden_response_last)
+  items/<sha1(id)>.h5   every output of one id (attrs id, betas = grid + [beta*],
+                    reference_positions [3] in REFERENCES order, -1 for None;
+                    datasets answer_json, baselines_json, role_mask,
+                    traces/<name> (float16; topk_ids int32), hidden/<position> float16)
   completed.jsonl   {id, key, time} appended only AFTER the item file is fsynced and renamed
   failed.jsonl      one record per failed attempt
   runs.jsonl        one record per process run: counts, timings, model dtype,
@@ -443,8 +467,8 @@ input order and writes, each atomically, into `<output_dir>/extract/<name>/`:
 |---|---|
 | `answers.parquet` | one row per id: the answer record of 5.8 |
 | `baselines.parquet` | one row per id |
-| `traces.h5` | `/<id>/{energy, norm_entropy, margin} [L, T]` (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `betas` (float64, last = β\*; `merge` raises if two items disagree), `layout` |
-| `hidden.h5` | `/<id>/{prompt_last, response_last} [L_h, D] float16` (gzip); attrs `layers`, `layout` |
+| `traces.h5` | `/<id>/<dataset>` for every trace of 5.8 (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `betas` (float64, last = β\*; `merge` raises if two items disagree), `layout` |
+| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last} [L_h, D] float16` (gzip); attrs `layers`, `layout` |
 | `bank.h5` | byte copy of `calibration/bank.h5` |
 | `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
 
@@ -461,8 +485,8 @@ median s per item` (a 2 h target inside the 3 h walltime).
   and `run_merge(allow_incomplete=True)` in the same process; `run_smoke`
   then summarises: counts, dtype, β\*, TF==greedy % of tokens and of
   answers, max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
-  truncated counts, and per layer the mean over ids of `H̄` at β\* read from
-  `traces.h5` (prompt = last prompt token | response = each id's mean over
+  truncated counts, and per layer the mean over ids of `H̄` at β\* (last
+  β column) read from `traces.h5` (prompt = last prompt token | response = each id's mean over
   its response positions, empty responses skipped). Output name
   `smoke-<UTC time>`, report `smoke_report.json`. CLI exit 1 if any id
   failed or a signal stopped it.
@@ -474,22 +498,24 @@ median s per item` (a 2 h target inside the 3 h walltime).
 - **inspect** (`verification/inspection.py`): no model; reads
   `manifest.json`, `answers.parquet` and `traces.h5` of a finished run and
   prints every position (token id, decoded token if the tokenizer is in the
-  local cache, role, phase) and per layer `E | H̄ | margin` at β\* for the
+  local cache, role, phase) and per layer `E | H̄ | margin` at β\* (last β
+  column) for the
   last prompt token, the response mean and the first response token.
 
 Verification checks (none is part of the production path):
 
 | check | implementation | tolerance and justification |
 |---|---|---|
-| `reference`: production == independent float64 reference | `dev/reference.py` (explicit loops, no `energy_llm` imports); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); traces by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2β\*δ; +1e-5 float32 reduction floor (`reference_tolerances`); NaN patterns equal |
+| `reference`: production == independent float64 reference | `dev/reference.py` (explicit loops, no `energy_llm` imports); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); `energy`, `norm_entropy` at β\* (last column) and `margin` by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2β\*δ; +1e-5 float32 reduction floor (`reference_tolerances`); NaN patterns equal. The other traces are compared from step 6 |
 | `gate`: read point + γ integration | `verify.check_gate` | `g` vs `‖w̃‖√D·s`: 4·u of the model dtype (three roundings in the model path), floor 1e-5; the no-γ control must exceed 10× |
 | `tf_vs_cache`: TF residuals == cached generation, per position | `verify.check_tf_vs_cache` | fp32 1e-4; bf16 5e-2 **provisional, empirical** (tokens must agree) |
 | `alignment`: last prompt position emits the first token; response = generated non-stop tokens | `verify.run_verify` | exact (booleans) |
-| `hidden`, `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | exact on CPU, 1e-5 on GPU |
-| `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | 1e-5 (float32 summation order) |
+| `hidden`: residuals at the four positions, derived independently (roles, stop tokens) | `verify.run_verify` | exact |
+| `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | in float16 ulps: 0 on CPU, ≤ 1 on GPU (a float32 difference of a recomputation can flip the last float16 bit); `topk_ids` exact on CPU, row Jaccard ≥ 0.98 on GPU |
+| `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | `|Δ| / max(1, |value|)` ≤ 1e-5 (float32 summation order is relative to the magnitude; `dkl` reaches hundreds at β ~ 10⁴); `topk_ids` from step 6 |
 | `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰; JS(p,p) ≤ 1e-7 (one rounding in logaddexp) |
 | `calibration`: H̄(β\*) on the warm-up set | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values |
-| `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, 1e-5 on GPU |
+| `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, ≤ 1 float16 ulp on GPU |
 
 The cluster sequence (environment, real tokenizers, dev calibration,
 verify, smoke, inspect, requeue test) is in the README, "Verification on
@@ -579,11 +605,11 @@ must override.
 | `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped) |
 | `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
 | `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
-| `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample; shapes/bounds; energy trace vs scipy; `betas == [β*]`; NaN raises |
+| `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas; `topk_ids` sorted and unique; `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast); `betas` recorded; NaN raises |
 | `test_config.py` | YAML round trip keeps values and hash; `betas` = absolute grid + β\* last; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`) rejected |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
 | `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
-| `test_invariance.py` | permuting memories changes nothing; β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
+| `test_invariance.py` | permuting memories changes nothing (`topk_ids` map through the permutation); β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
 | `test_reference.py` | production traces == `dev/reference.py` within the derived tolerances at three β\*; empty response; negative control (no γ) fails |
 | `test_verify.py` | all twelve checks PASS on the tiny models; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (one prompt row, one table row per layer) |
 | `test_gpu.py` | (skipped without CUDA) GPU == CPU within float32, peak memory recorded |
@@ -606,7 +632,7 @@ The departures below were approved on 2026-10-26.
 | bank rows | `A = W_gᵀ` rows, unit-normalised by `‖w_i‖` | `W̃ = W_g·diag(γ)`, normalised by `‖w̃_i‖` (never materialised) |
 | scores | `s_i = m̂_i · r = ‖r‖ cos θ_i` (query norm retained, no `1/√D`) | `s_i = (W̃_i·x̂)/(‖W̃_i‖√D)` ≈ cos θ_i ∈ [-1, 1] (query norm removed) |
 | energy | `-(1/β) lse(β s) + ½‖q‖² (+ c₀)` | `-(1/β) lse(β s)` only |
-| JS, Hellinger | mean over generated tokens of the per-token divergence to the reference | not stored (removed with the features table); Hellinger removed |
+| JS, Hellinger | mean over generated tokens of the per-token divergence to the reference | per-token `js` and signed `dkl` to three references (`question_last`, `prompt_last`, `response_first`) at every β; no mean over tokens (analysis); Hellinger removed |
 | response positions | all `T_g` generated tokens | generated tokens **excluding stop tokens** |
 | calibration positions | prefill reference position only, warm-up from the training split | last prompt token **+ response tokens**, warm-up JSONL disjoint from evaluation |
 | β grid / no bracket | approximately log grid; **clamp** to the closest endpoint and log it | `10^0…10^4`, 81 points; **fail** |
@@ -615,7 +641,7 @@ The departures below were approved on 2026-10-26.
 | decoding | greedy | greedy with a **clean** generation config (Qwen's hub `repetition_penalty=1.05` removed); TF argmax checked |
 | precision / loading | bf16 on A100; 4-bit NF4 for local dev; bank cast to float32 on CPU; `banks.pt` | bf16 enforced; no quantisation path; bank never materialised, γ + row norms in `bank.h5` |
 | scope | banks → features → probe → stats in one package | extraction only; probe/stats in the analysis repository (legacy E1–E3 code at tag `thesis-e1e3`) |
-| extras not in the `.tex` | — | margin, per-token traces, `hidden.h5`, token-level baselines, empty-response convention |
+| extras not in the `.tex` | — | margin, `topk_mass`, `mean_score`, `var_score`, `xhat_top1_frac`, `topk_ids`, `dkl`, absolute β grid, three references, `hidden.h5`, token-level baselines, empty-response convention |
 
 ### 13.2 Code vs code (internal)
 

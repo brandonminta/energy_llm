@@ -9,12 +9,15 @@ residual hooks, and every per-layer metric.
 3. A forward pre-hook on every ``post_attention_layernorm`` reads the
    residual x at its INPUT. x_hat, scores and all metrics are float32.
 4. Per layer (layers never mixed), per-token traces over every position
-   (prompt and response; the role mask separates them downstream). No
-   aggregation over tokens: that is analysis, not extraction.
+   (prompt and response; the role mask separates them downstream) at every
+   beta of the grid (beta* last). No aggregation over tokens: that is
+   analysis, not extraction. Divergences compare each position with three
+   reference positions: question_last (last question token), prompt_last
+   (last prompt token) and response_first (first response token).
    Response positions = generated non-stop tokens. An empty response (the
    first generated token is a stop token) is a valid sample: traces are
-   computed, response-only quantities are NaN by design, and
-   ``empty_response`` is set.
+   computed, the response_first divergences and residuals are NaN by
+   design, and ``empty_response`` is set.
 """
 
 from __future__ import annotations
@@ -28,9 +31,10 @@ import torch
 from energy_llm.core import metrics
 from energy_llm.core.bank import Bank
 from energy_llm.core.model import ModelBundle, decoder_layers
-from energy_llm.core.prompting import ROLE_RESPONSE, ROLE_TEMPLATE, Prompt
+from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, Prompt, PromptError
 
 FP16_MAX = float(np.finfo(np.float16).max)
+REFERENCES = ("question_last", "prompt_last", "response_first")
 
 
 class NonFiniteError(RuntimeError):
@@ -90,6 +94,14 @@ class ForwardTrace:
     @property
     def empty_response(self) -> bool:
         return not self.response_positions
+
+    @property
+    def reference_positions(self) -> dict[str, int | None]:
+        q = [i for i, r in enumerate(self.prompt.roles) if r == ROLE_QUESTION]
+        if not q:
+            raise PromptError("no question token in the prompt")
+        return {"question_last": q[-1], "prompt_last": self.n_prompt - 1,
+                "response_first": self.response_positions[0] if self.response_positions else None}
 
     @property
     def roles(self) -> list[int]:
@@ -157,13 +169,14 @@ class ItemResult:
     item_id: str
     answer: dict
     baselines: dict
-    betas: list[float]
-    energy: np.ndarray          # [L, T] float32 at beta*
-    norm_entropy: np.ndarray    # [L, T] float32 at beta*
-    margin: np.ndarray          # [L, T] float32
-    role_mask: np.ndarray       # [T] int8
-    hidden_prompt_last: np.ndarray    # [L_h, D] float16
-    hidden_response_last: np.ndarray  # [L_h, D] float16
+    betas: list[float]                      # grid + [beta*]
+    reference_positions: dict[str, int | None]
+    # name -> [L, T, n_beta] float32 (energy, norm_entropy, topk_mass, mean_score,
+    # var_score, js/<ref>, dkl/<ref>), [L, T] float32 (margin, xhat_top1_frac),
+    # [L, T, k_ids] int32 (topk_ids). Item files store the floats as float16.
+    traces: dict[str, np.ndarray]
+    role_mask: np.ndarray                   # [T] int8
+    hidden: dict[str, np.ndarray]           # position name -> [L_h, D] float16
 
 
 def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
@@ -173,44 +186,65 @@ def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
 
 @torch.inference_mode()
 def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: str,
-                 betas: list[float], hidden_layers: list[int]) -> ItemResult:
-    """``betas``: the extraction grid with beta* last (``ExtractionConfig.betas``)."""
+                 betas: list[float], hidden_layers: list[int], topk_mass_k: int,
+                 topk_ids_k: int) -> ItemResult:
+    """``betas``: the extraction grid with beta* last (``ExtractionConfig.betas``).
+    One s [T, D_ff] per layer; the grid is looped inside the layer."""
     dims = bundle.dims
-    beta_star = betas[-1]
-    L, T = dims.n_layers, trace.n_prompt + len(trace.gen_ids)
+    L, T, nb = dims.n_layers, trace.n_prompt + len(trace.gen_ids), len(betas)
+    refs = trace.reference_positions
+    nan = float("nan")
 
-    energy_tr = torch.empty(L, T)
-    entropy_tr = torch.empty(L, T)
-    margin_tr = torch.empty(L, T)
+    per_beta = ["energy", "norm_entropy", "topk_mass", "mean_score", "var_score"] + \
+        [f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES]
+    dev = bank.device
+    tr = {k: torch.full((L, T, nb), nan, device=dev) for k in per_beta}
+    tr["margin"] = torch.empty(L, T, device=dev)
+    tr["xhat_top1_frac"] = torch.empty(L, T, device=dev)
+    tr["topk_ids"] = torch.empty(L, T, topk_ids_k, dtype=torch.int32, device=dev)
     max_dev = 0.0
     for l in range(L):
         x_hat, s = _layer_scores(bank, trace.residuals[l], l, dims.rms_norm_eps)
-        dev = (x_hat.norm(dim=-1) / math.sqrt(dims.d_model) - 1.0).abs().max().item()
-        max_dev = max(max_dev, dev)
-        energy_tr[l] = metrics.energy(s, beta_star).cpu()
-        entropy_tr[l] = metrics.norm_entropy(metrics.log_distribution(s, beta_star)).cpu()
-        margin_tr[l] = metrics.margin(s).cpu()
+        max_dev = max(max_dev, (x_hat.norm(dim=-1) / math.sqrt(dims.d_model) - 1.0).abs().max().item())
+        tr["margin"][l] = metrics.margin(s)
+        tr["xhat_top1_frac"][l] = metrics.xhat_top1_frac(x_hat)
+        # the ranking of p is the ranking of s at any beta > 0
+        tr["topk_ids"][l] = metrics.topk_indices(s, topk_ids_k)
+        for bi, beta in enumerate(betas):
+            logp = metrics.log_distribution(s, beta)
+            tr["energy"][l, :, bi] = metrics.energy(s, beta)
+            tr["norm_entropy"][l, :, bi] = metrics.norm_entropy(logp)
+            tr["topk_mass"][l, :, bi] = metrics.topk_mass(logp, topk_mass_k)
+            tr["mean_score"][l, :, bi] = metrics.mean_score(logp, s)
+            tr["var_score"][l, :, bi] = metrics.var_score(logp, s)
+            for r, pos in refs.items():
+                if pos is None:      # empty response: response_first undefined (NaN)
+                    continue
+                lq = logp[pos]
+                tr[f"js/{r}"][l, :, bi] = metrics.js_divergence(logp, lq)
+                tr[f"dkl/{r}"][l, :, bi] = (metrics.kl_divergence(logp, lq)
+                                            - metrics.kl_divergence(lq, logp))
+            del logp
         del x_hat, s
 
     empty = trace.empty_response
-    hp, hr = [], []
-    for l in hidden_layers:
-        x = trace.residuals[l].float()
-        hp.append(x[trace.n_prompt - 1].cpu())
-        hr.append(x[trace.response_positions[-1]].cpu() if not empty
-                  else torch.full((dims.d_model,), float("nan")))
-    hidden_p = torch.stack(hp).numpy()
-    hidden_r = torch.stack(hr).numpy()
-    if np.nanmax(np.abs(np.concatenate([hidden_p, hidden_r]))) > FP16_MAX:
+    hidden_pos = refs | {"response_last": trace.response_positions[-1] if not empty else None}
+    hidden = {}
+    for name, pos in hidden_pos.items():
+        rows = [trace.residuals[l][pos].float().cpu() if pos is not None
+                else torch.full((dims.d_model,), nan) for l in hidden_layers]
+        hidden[name] = torch.stack(rows).numpy()
+    if np.nanmax(np.abs(np.concatenate(list(hidden.values())))) > FP16_MAX:
         raise NonFiniteError("residual exceeds the float16 range")
 
-    out = {
-        "energy": energy_tr.numpy(), "norm_entropy": entropy_tr.numpy(),
-        "margin": margin_tr.numpy(),
-    }
-    for name, arr in out.items():
+    traces = {k: v.cpu().numpy() for k, v in tr.items()}
+    for name, arr in traces.items():
+        if empty and name.endswith("/response_first"):
+            continue          # NaN by design
         if not np.isfinite(arr).all():
             raise NonFiniteError(f"non-finite values in {name}")
+        if arr.dtype == np.float32 and np.abs(arr).max() > FP16_MAX:
+            raise NonFiniteError(f"{name} exceeds the float16 range")
 
     gen = trace.gen_ids
     resp_j = [p - trace.n_prompt for p in trace.response_positions]   # indices into gen
@@ -245,9 +279,9 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
     }
     return ItemResult(
         item_id=item_id, answer=answer, baselines=baselines, betas=list(betas),
+        reference_positions=refs, traces=traces,
         role_mask=np.asarray(trace.roles, dtype=np.int8),
-        hidden_prompt_last=hidden_p.astype(np.float16),
-        hidden_response_last=hidden_r.astype(np.float16), **out,
+        hidden={k: v.astype(np.float16) for k, v in hidden.items()},
     )
 
 

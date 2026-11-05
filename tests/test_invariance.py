@@ -34,14 +34,17 @@ def _scores(bundle, bank, tr, l):
 def test_permuting_memories_changes_nothing(setup):
     bundle, bank, tr = setup
     L = list(range(bundle.dims.n_layers))
-    a = compute_item(bundle, bank, tr, "x", [9.0], L)
+    a = compute_item(bundle, bank, tr, "x", [2.0, 9.0], L, 4, 8)
     pbank = PermutedBank(bank, seed=3)
     assert any((p != torch.arange(len(p))).any() for p in pbank.perm)
     s, sp = _scores(bundle, bank, tr, 0), _scores(bundle, pbank, tr, 0)
     np.testing.assert_allclose(sp.numpy(), s[:, pbank.perm[0]].numpy(), atol=1e-6)
-    b = compute_item(bundle, pbank, tr, "x", [9.0], L)
-    for name in ("energy", "norm_entropy", "margin"):
-        np.testing.assert_allclose(getattr(b, name), getattr(a, name), atol=1e-5, rtol=0)
+    b = compute_item(bundle, pbank, tr, "x", [2.0, 9.0], L, 4, 8)
+    for name, arr in a.traces.items():
+        if name == "topk_ids":     # memory indices move with the permutation
+            np.testing.assert_array_equal(pbank.perm[0][b.traces[name][0]].numpy(), arr[0])
+        else:
+            np.testing.assert_allclose(b.traces[name], arr, atol=1e-5, rtol=0, err_msg=name)
 
 
 def test_beta_limits(setup):
@@ -86,8 +89,11 @@ def test_two_identical_runs_are_bit_identical_on_cpu(pair):
         date = DATE if "date_string" in bundle.tokenizer.chat_template else None
         tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, Q, date))
         hooks.remove()
-        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", [9.0],
-                                               list(range(bundle.dims.n_layers)))))
+        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", [2.0, 9.0],
+                                               list(range(bundle.dims.n_layers)), 4, 8)))
     assert outs[0][0] == outs[1][0]
-    for name in ("energy", "norm_entropy", "margin", "hidden_prompt_last"):
-        assert np.array_equal(getattr(outs[0][1], name), getattr(outs[1][1], name), equal_nan=True)
+    a, b = outs[0][1], outs[1][1]
+    for name in a.traces:
+        assert np.array_equal(a.traces[name], b.traces[name], equal_nan=True), name
+    for name in a.hidden:
+        assert np.array_equal(a.hidden[name], b.hidden[name], equal_nan=True), name

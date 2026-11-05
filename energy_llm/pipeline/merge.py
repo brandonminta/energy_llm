@@ -5,8 +5,11 @@ atomically, into ``<output_dir>/extract/<name>/``:
 
     answers.parquet    id, prompt, response, token ids, lengths, truncation, ...
     baselines.parquet  mean/min token log-probability, mean token entropy
-    traces.h5          /<id>/{energy, norm_entropy, margin} [L, T], /<id>/role_mask [T]
-    hidden.h5          /<id>/{prompt_last, response_last} [layers, D] float16
+    traces.h5          /<id>/{energy, norm_entropy, topk_mass, mean_score, var_score,
+                              js/<ref>, dkl/<ref>} [L, T, n_beta], {margin, xhat_top1_frac}
+                       [L, T], topk_ids [L, T, k], role_mask [T]
+    hidden.h5          /<id>/{question_last, prompt_last, response_first, response_last}
+                       [layers, D] float16
     bank.h5            gamma and W_tilde row norms per layer (copied from calibration)
     manifest.json      written last
 """
@@ -112,11 +115,14 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
             tf.attrs["role_names"] = [ROLE_NAMES[k] for k in sorted(ROLE_NAMES)]
             tf.attrs["beta_star"] = float(beta_rec["beta_star"])
-            tf.attrs["layout"] = "energy/norm_entropy at beta*, margin: [L, T]; role_mask: [T]"
+            tf.attrs["layout"] = ("per token: energy, norm_entropy, topk_mass, mean_score, var_score, "
+                                  "js/<ref>, dkl/<ref>: [L, T, n_beta] float16; margin, "
+                                  "xhat_top1_frac: [L, T] float16; topk_ids: [L, T, k] int32; "
+                                  "role_mask: [T]")
             hf.attrs["layers"] = np.asarray(cfg.hidden_layer_indices(n_layers))
-            hf.attrs["layout"] = ("residual at the input of post_attention_layernorm; "
-                                  "prompt_last = last prompt token, response_last = last "
-                                  "non-stop response token: [layers, D] float16")
+            hf.attrs["layout"] = ("residual at the input of post_attention_layernorm at "
+                                  "question_last, prompt_last, response_first, response_last "
+                                  "(NaN when the response is empty): [layers, D] float16")
             for item_id in order:
                 rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
                 if betas is None:
@@ -127,14 +133,12 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                 answers.append(rec["answer"])
                 baselines.append(rec["baselines"])
                 g = tf.create_group(item_id)
-                for k in ("energy", "norm_entropy", "margin"):
-                    g.create_dataset(k, data=rec[k], compression="gzip", compression_opts=4)
+                for k, arr in rec["traces"].items():
+                    g.create_dataset(k, data=arr, compression="gzip", compression_opts=4)
                 g.create_dataset("role_mask", data=rec["role_mask"])
                 g = hf.create_group(item_id)
-                g.create_dataset("prompt_last", data=rec["hidden_prompt_last"],
-                                 compression="gzip", compression_opts=4)
-                g.create_dataset("response_last", data=rec["hidden_response_last"],
-                                 compression="gzip", compression_opts=4)
+                for k, arr in rec["hidden"].items():
+                    g.create_dataset(k, data=arr, compression="gzip", compression_opts=4)
             if betas is not None:
                 tf.attrs["betas"] = np.asarray(betas, dtype=np.float64)   # last = beta*
 

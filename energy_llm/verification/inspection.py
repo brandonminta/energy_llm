@@ -39,7 +39,8 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
     a = ans.loc[item_id]
     with h5py.File(run_dir / "traces.h5") as f:
         g = f[item_id]
-        energy, entropy, margin = g["energy"][()], g["norm_entropy"][()], g["margin"][()]
+        # beta* is the last beta
+        energy, entropy, margin = g["energy"][..., -1], g["norm_entropy"][..., -1], g["margin"][()]
         roles = g["role_mask"][()]
     ids = list(a["prompt_token_ids"]) + list(a["generated_token_ids"])
     n_p = int(a["n_prompt_tokens"])

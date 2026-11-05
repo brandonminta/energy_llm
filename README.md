@@ -22,16 +22,21 @@ Per layer, from the residual `x` at the input of `post_attention_layernorm`
 (float32): `x̂ = x/√(mean(x²)+eps)`, bank = unit rows of `W̃ = W_g·γ`,
 `s = bank·x̂/√D` (cosines). The bank is never materialised: only γ and `‖W̃_i‖`
 are kept and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
-to float32 at a time. Then `p = softmax(β*s)`, `E = -(1/β*)·logsumexp(β*s)`,
-`H̄ = H(p)/log D_ff`, margin = top1 − top2, stored **per token** for every
-position (prompt and response) and every layer in `traces.h5`; the role mask
-separates prompt and response (every stop token excluded from the
-response). There is no features table: aggregation over tokens is analysis.
+to float32 at a time. Then, for every β of an absolute log grid
+(10⁰…10⁴, 9 points) plus β\* last, `p = softmax(βs)`, `E = -(1/β)·logsumexp(βs)`,
+`H̄ = H(p)/log D_ff`, top-k mass, mean and variance of `s` under `p`, and the
+JS and signed KL (`KL(p_t‖p_ref) − KL(p_ref‖p_t)`) to three reference
+positions (last question token, last prompt token, first response token);
+β-free: margin = top1 − top2, `max_j x̂_j²/D`, top-100 memory indices. All of
+it **per token** for every position (prompt and response) and every layer in
+`traces.h5`; the role mask separates prompt and response (every stop token
+excluded from the response). There is no features table: aggregation over
+tokens is analysis.
 
 **Empty responses** (the model emits a stop token first) are valid samples,
 not failures: `empty_response = true`, traces computed, response-only
-values (baselines, `hidden.h5:response_last`) NaN by design, counted as
-completed.
+values (`*/response_first` divergences, baselines, `hidden.h5:response_*`)
+NaN by design, counted as completed.
 
 Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
@@ -349,9 +354,9 @@ if it is wanted, and record its peak memory and seconds/question.
 |---|---|
 | `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses), γ diagnostic, exhausted ids |
 | `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob and entropy, TF mismatches |
-| `traces.h5` | `/<id>/{energy, norm_entropy, margin}` `[L, T]` at β*, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response) |
+| `traces.h5` | `/<id>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` `[L, T, n_beta]` float16 (β\* last), `/<id>/{margin, xhat_top1_frac}` `[L, T]` float16, `/<id>/topk_ids` `[L, T, 100]` int32, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); attrs `betas` |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy (response tokens) |
-| `hidden.h5` | `/<id>/{prompt_last, response_last}` `[layers, D]` float16 |
+| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 |
 | `bank.h5` | γ and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
 
 Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.

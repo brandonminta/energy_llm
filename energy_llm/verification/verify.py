@@ -39,7 +39,7 @@ from energy_llm.core import metrics
 from energy_llm.core.bank import Bank, build_bank
 from energy_llm.core.capture import ResidualHooks, compute_item, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, decoder_layers
-from energy_llm.core.prompting import ROLE_RESPONSE, build_prompt
+from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, build_prompt
 from energy_llm.pipeline.extract import load_beta_star
 from energy_llm.storage import Item, read_items, sha256_file, write_json_atomic
 
@@ -82,6 +82,26 @@ def _nan_aware_max_diff(a: np.ndarray, b: np.ndarray) -> tuple[float, bool]:
     return (float(np.abs(a[m] - b[m]).max()) if m.any() else 0.0), same_nan
 
 
+def _f16_ulp_diff(a: np.ndarray, b: np.ndarray) -> tuple[float, bool]:
+    """Max |a-b| in float16 ulps of b over entries finite in both, and whether
+    NaNs coincide. Stored traces and residuals are float16: a recomputation
+    that differs by float32 rounding (GPU) can flip the last float16 bit."""
+    a, b = np.asarray(a, dtype=np.float16), np.asarray(b, dtype=np.float16)
+    same_nan = bool(np.array_equal(np.isnan(a), np.isnan(b)))
+    m = ~(np.isnan(a) | np.isnan(b))
+    if not m.any():
+        return 0.0, same_nan
+    a64, b64 = a[m].astype(np.float64), b[m].astype(np.float64)
+    return float((np.abs(a64 - b64) / np.spacing(np.abs(b[m])).astype(np.float64)).max()), same_nan
+
+
+def _topk_jaccard(a: np.ndarray, b: np.ndarray) -> float:
+    """Min over rows of |A ∩ B| / |A ∪ B| for index arrays [..., k]."""
+    a, b = a.reshape(-1, a.shape[-1]), b.reshape(-1, b.shape[-1])
+    return min((len(set(x) & set(y)) / len(set(x) | set(y)) for x, y in zip(a.tolist(), b.tolist())),
+               default=1.0)
+
+
 # ----------------------------------------------------------------------
 # Reference comparison (also used by tests/test_reference.py)
 # ----------------------------------------------------------------------
@@ -115,7 +135,8 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, la
     tol_s = score_tolerance(bundle.dims.d_model)
     ratio, nan_ok, traces = 0.0, True, {}
     for k, t in reference_tolerances(ds, beta_star).items():
-        err, same = _nan_aware_max_diff(getattr(prod, k)[layers], ref[k])
+        p = prod.traces[k][layers]
+        err, same = _nan_aware_max_diff(p if p.ndim == 2 else p[..., -1], ref[k])   # beta* is last
         nan_ok &= same
         traces[k] = {"max_error": err, "tolerance": t}
         ratio = max(ratio, err / t)
@@ -245,9 +266,14 @@ def _read_outputs(ext_dir: Path, item_id: str):
     import h5py
     import pandas as pd
 
+    def group(g) -> dict:
+        out = {}
+        g.visititems(lambda name, obj: out.__setitem__(name, obj[()])
+                     if isinstance(obj, h5py.Dataset) else None)
+        return out
+
     with h5py.File(ext_dir / "traces.h5") as tf, h5py.File(ext_dir / "hidden.h5") as hf:
-        tr = {k: tf[item_id][k][()] for k in ("energy", "norm_entropy", "margin", "role_mask")}
-        hid = {k: hf[item_id][k][()] for k in ("prompt_last", "response_last")}
+        tr, hid = group(tf[item_id]), group(hf[item_id])
     ans = pd.read_parquet(ext_dir / "answers.parquet").set_index("id").loc[item_id]
     return tr, hid, ans
 
@@ -265,12 +291,14 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     beta_rec = load_beta_star(cfg, items)
     beta_star = float(beta_rec["beta_star"])
     betas = cfg.extraction.betas(beta_star)
+    k_mass, k_ids = cfg.extraction.topk_mass_k, cfg.extraction.topk_ids_k
     L = bundle.dims.n_layers
     ref_layers = ref_layers if ref_layers is not None else sorted({0, L // 2, L - 1})
     hidden_layers = cfg.hidden_layer_indices(L)
     sel = items[:n]
     on_cpu = bundle.device.type == "cpu"
-    det_tol = 0.0 if on_cpu else 1e-5
+    det_tol = 0.0 if on_cpu else 1.0          # float16 ulps: bit-exact on CPU
+    ids_min_jaccard = 1.0 if on_cpu else 0.98   # GPU: near-ties at the k-th score
 
     run_cfg, ext_dir, _, merged = run_single_process(cfg, bundle, sel, "verify", name)
     bank = build_bank(bundle.model, bundle.dims)
@@ -286,7 +314,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            prod = compute_item(bundle, bank, trace, it.id, betas, hidden_layers)
+            prod = compute_item(bundle, bank, trace, it.id, betas, hidden_layers, k_mass, k_ids)
 
             # reference (float64, naive)
             if qi < ref_n:
@@ -327,26 +355,39 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             acc["align"].append((all(align.values()), align, logit_diff))
 
             # (d) hidden = the x the metrics read; files = in-memory values
-            last = trace.response_positions[-1] if trace.response_positions else None
-            hp = torch.stack([trace.residuals[l][n_p - 1].float().cpu() for l in hidden_layers]).half().numpy()
-            hr = (torch.stack([trace.residuals[l][last].float().cpu() for l in hidden_layers]).half().numpy()
-                  if last is not None else np.full_like(hp, np.nan))
-            h_err = max(_nan_aware_max_diff(prod.hidden_prompt_last, hp)[0],
-                        _nan_aware_max_diff(prod.hidden_response_last, hr)[0])
+            # positions derived independently: roles of the prompt, indep_resp
+            q_pos = [i for i, r in enumerate(roles[:n_p]) if r == ROLE_QUESTION]
+            positions = {"question_last": q_pos[-1], "prompt_last": n_p - 1,
+                         "response_first": indep_resp[0] if indep_resp else None,
+                         "response_last": indep_resp[-1] if indep_resp else None}
+            h_err = 0.0
+            for name, pos in positions.items():
+                x = (torch.stack([trace.residuals[l][pos].float().cpu() for l in hidden_layers]).half().numpy()
+                     if pos is not None else np.full_like(prod.hidden["prompt_last"], np.nan))
+                h_err = max(h_err, _nan_aware_max_diff(prod.hidden[name], x)[0])
             acc["hidden"].append(h_err)
+            # files hold float16(traces), topk_ids int32 and the float16 residuals
             f_tr, f_hid, f_ans = _read_outputs(ext_dir, it.id)
-            diffs = [*(_nan_aware_max_diff(f_tr[k_], getattr(prod, k_)) for k_ in ("energy", "norm_entropy", "margin")),
-                     _nan_aware_max_diff(f_hid["prompt_last"], prod.hidden_prompt_last),
-                     _nan_aware_max_diff(f_hid["response_last"], prod.hidden_response_last)]
+            floats = {k: v for k, v in prod.traces.items() if k != "topk_ids"}
+            diffs = [*(_f16_ulp_diff(f_tr[k_], v) for k_, v in floats.items()),
+                     *(_f16_ulp_diff(f_hid[k_], v) for k_, v in prod.hidden.items())]
             acc["files"].append((max(d for d, _ in diffs), all(s_ for _, s_ in diffs)
+                                 and _topk_jaccard(f_tr["topk_ids"], prod.traces["topk_ids"]) >= ids_min_jaccard
+                                 and set(f_tr) == set(prod.traces) | {"role_mask"}
+                                 and set(f_hid) == set(prod.hidden)
                                  and np.array_equal(f_tr["role_mask"], prod.role_mask)))
             acc["det_tokens"].append(list(f_ans["generated_token_ids"]) == trace.gen_ids)
 
             # invariance under permutation of the memories
             if qi == 0:
-                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, betas, hidden_layers)
-                perm_err = max(_nan_aware_max_diff(getattr(pres, k_), getattr(prod, k_))[0]
-                               for k_ in ("energy", "norm_entropy", "margin"))
+                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, betas, hidden_layers,
+                                    k_mass, k_ids)
+                # topk_ids are memory indices (they move with the permutation): step 6.
+                # Summation-order error is relative to the magnitude (dkl reaches
+                # hundreds at beta ~ 1e4): error measured as |a - b| / max(1, |b|)
+                perm_err = max(_nan_aware_max_diff(pres.traces[k_] / np.maximum(1.0, np.abs(v)),
+                                                   v / np.maximum(1.0, np.abs(v)))[0]
+                               for k_, v in prod.traces.items() if k_ != "topk_ids")
                 acc["perm"].append(perm_err)
 
             # limits, monotonicity, self-divergence on real scores
@@ -402,9 +443,11 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         Check("files_vs_memory", _status(max(e for e, _ in acc["files"]) <= det_tol
                                          and all(ok for _, ok in acc["files"])),
               max(e for e, _ in acc["files"]), det_tol,
-              {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation"}),
+              {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation, in float16 ulps; "
+                         "topk_ids exact on CPU, row Jaccard >= 0.98 on GPU"}),
         Check("permutation", _status(max(acc["perm"]) <= F32_FLOOR), max(acc["perm"]), F32_FLOOR,
-              {"metric": "max change of every trace (float32 summation order)"}),
+              {"metric": "max |change| / max(1, |value|) of every float trace "
+                         "(float32 summation order)"}),
         Check("limits", _status(max(acc["limits"]) <= F32_FLOOR), max(acc["limits"]), F32_FLOOR,
               {"metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
                          "|E + max s| - log(D_ff)/beta"}),
@@ -414,7 +457,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         Check("determinism", _status(all(acc["det_tokens"]) and max(e for e, _ in acc["files"]) <= det_tol),
               max(e for e, _ in acc["files"]), det_tol,
               {"tokens_equal": all(acc["det_tokens"]), "device": bundle.device.type,
-               "criterion": "bit-exact on CPU, <= 1e-5 on GPU"}),
+               "criterion": "bit-exact on CPU, <= 1 float16 ulp on GPU"}),
         _calibration_check(cfg, bundle, bank, beta_rec),
     ]
     report = {

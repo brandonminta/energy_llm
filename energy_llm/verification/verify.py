@@ -3,7 +3,8 @@ production path.
 
 On a few questions it runs the production extract + merge, then checks:
 
-  reference      production vs dev/reference.py (naive float64, explicit loops)
+  reference      every per-token trace vs dev/reference.py (naive float64,
+                 explicit loops), at every beta and reference position
   gate           real gate pre-activation g == ||w_tilde|| * sqrt(D) * s, with a
                  no-gamma negative control that must fail by a wide margin
   tf_vs_cache    residual x captured during cached token-by-token generation
@@ -13,10 +14,12 @@ On a few questions it runs the production extract + merge, then checks:
   hidden         hidden.h5 / traces.h5 hold the same x and values the metrics
                  computed
   permutation    permuting the bank rows (and W_g consistently) changes nothing
-  limits         beta -> 0: H_bar -> 1; beta -> inf: H_bar -> 0, E -> -max(s)
+                 (topk_ids compared after mapping through the permutation)
+  limits         beta -> 0: H_bar -> 1; beta -> inf: H_bar -> 0, E -> -max(s),
+                 var_score -> 0, topk_mass -> 1
   monotone       H_bar non-increasing in beta on real activations
   calibration    H_bar at beta* on the warm-up set lies in the calibration bracket
-  self           JS(p, p) = 0
+  self           JS(p, p) = KL(p || p) = 0
   determinism    two identical runs agree (bit-exact on CPU)
 
 Every tolerance is explicit and justified next to its definition; the report
@@ -37,7 +40,7 @@ import torch
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
 from energy_llm.core.bank import Bank, build_bank
-from energy_llm.core.capture import ResidualHooks, compute_item, forward_item, norm_entropy_curve
+from energy_llm.core.capture import REFERENCES, ResidualHooks, compute_item, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, decoder_layers
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, build_prompt
 from energy_llm.pipeline.extract import load_beta_star
@@ -106,16 +109,44 @@ def _topk_jaccard(a: np.ndarray, b: np.ndarray) -> float:
 # Reference comparison (also used by tests/test_reference.py)
 # ----------------------------------------------------------------------
 
-def reference_tolerances(delta_s: float, beta: float) -> dict[str, float]:
-    """Per-trace tolerance from the observed max score error delta_s, via
-    first-order Lipschitz bounds in the max norm:
-      E      = -(1/beta) lse(beta s):  |dE| <= |ds|                 -> delta_s
-      margin = top1 - top2:            |dm| <= 2|ds|                -> 2 delta_s
-      H_bar: sum_i |dH/ds_i| <= beta * sum p_i |log p_i + H| <= 2 beta log D_ff,
-             so |dH_bar| <= 2 beta delta_s
-    plus F32_FLOOR for float32 reductions."""
-    return {"energy": delta_s + F32_FLOOR, "norm_entropy": 2 * beta * delta_s + F32_FLOOR,
-            "margin": 2 * delta_s + F32_FLOOR}
+def reference_tolerances(delta_s: float, beta: float, s_range: float, k_mass: int,
+                         d_model: int) -> dict[str, float]:
+    """Per-trace tolerance at one beta from the observed max score error
+    delta_s, via first-order bounds in the max norm (|d log p_i| <= 2 beta
+    delta_s, hence |dp_i| <= 2 beta delta_s p_i and ||dp||_1 <= 2 beta delta_s):
+      E      = -(1/beta) lse(beta s):  |dE| <= delta_s
+      margin = top1 - top2:            |dm| <= 2 delta_s
+      H_bar:  sum_i |dH/ds_i| <= beta sum p_i |log p_i + H| <= 2 beta log D_ff,
+              so |dH_bar| <= 2 beta delta_s
+      mean_score = sum p s: sum dp (s - mid) + sum p ds
+              <= beta delta_s range + delta_s; used: 2 beta delta_s range + delta_s
+      var_score: sum dp (s-mu)^2 + 2 sum p (s-mu) ds <= beta delta_s range^2 + 2 delta_s range;
+              used (range <= 2): 2 beta delta_s range + 2 delta_s range
+      topk_mass: sum over the top k of |dp_i| <= 2 beta delta_s (a swap at the
+              k-th boundary exchanges near-equal p); used max(k, 2) beta delta_s
+      JS: 4 beta delta_s (conservative constant; log(p/m) is bounded by log 2)
+      dkl = KL(p||q) - KL(q||p): KL has no bounded log ratio, so
+              |dKL(p||q)| <= sum |dp| |log p - log q| + sum p |dlog p - dlog q|
+                          <= 2 beta delta_s sum p |log p - log q| + 4 beta delta_s;
+              the per-element weight A = sum p|log p - log q| + sum q|log q - log p|
+              is computed by compare_with_reference from the float64 reference
+              scores: 2 beta delta_s A + 8 beta delta_s (here only the 8 beta delta_s term)
+      xhat_top1_frac: from x_hat only, within score_tolerance
+    ``s_range`` = max_t (max s_t - min s_t). compare_with_reference adds a
+    float32 reduction floor F32_FLOOR * max(1, |value|) per element (dkl
+    reaches hundreds at beta ~ 1e4). topk_ids are compared as sets."""
+    b, d = beta, delta_s
+    tol = {"energy": d, "margin": 2 * d, "norm_entropy": 2 * b * d,
+           "mean_score": 2 * b * d * s_range + d, "var_score": 2 * b * d * s_range + 2 * d * s_range,
+           "topk_mass": max(k_mass, 2) * b * d, "xhat_top1_frac": score_tolerance(d_model)}
+    for r in REFERENCES:
+        tol[f"js/{r}"] = 4 * b * d
+        tol[f"dkl/{r}"] = 8 * b * d
+    return tol
+
+
+# topk_ids vs the reference: near-ties at the k-th score may swap one index
+TOPK_MIN_JACCARD = 0.98
 
 
 def score_tolerance(d_model: int) -> float:
@@ -126,23 +157,52 @@ def score_tolerance(d_model: int) -> float:
 
 
 def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, layers: list[int],
-                           beta_star: float) -> dict:
+                           betas: list[float], k_mass: int) -> dict:
     eps = bundle.dims.rms_norm_eps
     ds = 0.0
-    for li, l in enumerate(layers):
+    for l in layers:
         s = bank.scores(l, metrics.rms_normalise(trace.residuals[l], eps)).double().cpu().numpy()
         ds = max(ds, float(np.abs(s - np.asarray(ref["scores"][l])).max()))
+    s_range = max(float(np.ptp(np.asarray(ref["scores"][l]), axis=-1).max()) for l in layers)
     tol_s = score_tolerance(bundle.dims.d_model)
-    ratio, nan_ok, traces = 0.0, True, {}
-    for k, t in reference_tolerances(ds, beta_star).items():
-        p = prod.traces[k][layers]
-        err, same = _nan_aware_max_diff(p if p.ndim == 2 else p[..., -1], ref[k])   # beta* is last
-        nan_ok &= same
-        traces[k] = {"max_error": err, "tolerance": t}
-        ratio = max(ratio, err / t)
+    tols = [reference_tolerances(ds, b, s_range, k_mass, bundle.dims.d_model) for b in betas]
+    # dkl: add the data-dependent term 2 beta ds A (see reference_tolerances)
+    T = len(ref["scores"][layers[0]])
+    dkl_tol = {r: np.zeros((len(layers), T, len(betas))) for r in REFERENCES}
+    for li, l in enumerate(layers):
+        sc = np.asarray(ref["scores"][l], dtype=np.float64)
+        for bi, b in enumerate(betas):
+            z = b * sc
+            lp = z - (z.max(1, keepdims=True) + np.log(np.exp(z - z.max(1, keepdims=True)).sum(1, keepdims=True)))
+            p = np.exp(lp)
+            for r, pos in ref["reference_positions"].items():
+                if pos is not None:
+                    d = np.abs(lp - lp[pos])
+                    a = (p * d).sum(1) + (p[pos] * d).sum(1)
+                    dkl_tol[r][li, :, bi] = 2 * b * ds * a + tols[bi][f"dkl/{r}"]
+    ratio, nan_ok, per = 0.0, True, {}
+    for name, r in ref["traces"].items():
+        p = prod.traces[name][layers]
+        if name == "topk_ids":
+            jac = _topk_jaccard(p, r)
+            per[name] = {"min_row_jaccard": jac, "required": TOPK_MIN_JACCARD}
+            continue
+        if name.startswith("dkl/"):
+            t = dkl_tol[name[4:]]
+        else:
+            t = np.asarray([tl[name] for tl in tols]) if r.ndim == 3 else tols[-1][name]
+        nan_ok &= bool(np.array_equal(np.isnan(p), np.isnan(r)))
+        m = ~(np.isnan(p) | np.isnan(r))
+        err = np.abs(p.astype(np.float64) - r)
+        q = err / (t + F32_FLOOR * np.maximum(1.0, np.abs(r)))
+        worst = float(q[m].max()) if m.any() else 0.0
+        per[name] = {"max_error": float(err[m].max()) if m.any() else 0.0,
+                     "max_error_over_tolerance": worst}
+        ratio = max(ratio, worst)
+    ids_ok = per["topk_ids"]["min_row_jaccard"] >= TOPK_MIN_JACCARD
     return {"score_error": ds, "score_tolerance": tol_s, "nan_pattern_equal": nan_ok,
-            "max_error_over_tolerance": ratio, "traces": traces,
-            "ok": ds <= tol_s and nan_ok and ratio <= 1.0}
+            "max_error_over_tolerance": ratio, "traces": per,
+            "ok": ds <= tol_s and nan_ok and ratio <= 1.0 and ids_ok}
 
 
 # ----------------------------------------------------------------------
@@ -318,10 +378,14 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
             # reference (float64, naive)
             if qi < ref_n:
+                q_last = max(i for i, r in enumerate(trace.prompt.roles) if r == ROLE_QUESTION)
                 ref = reference.reference_item(
                     bundle.model, {l: trace.residuals[l].float().cpu().numpy() for l in ref_layers},
-                    trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, beta_star)
-                cmp = compare_with_reference(bundle, bank, trace, prod, ref, ref_layers, beta_star)
+                    trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, betas, q_last,
+                    k_mass, k_ids)
+                cmp = compare_with_reference(bundle, bank, trace, prod, ref, ref_layers, betas, k_mass)
+                cmp["reference_positions_equal"] = ref["reference_positions"] == prod.reference_positions
+                cmp["ok"] &= cmp["reference_positions_equal"]
                 ref_details.append({"id": it.id} | {k_: v for k_, v in cmp.items() if k_ != "ok"})
                 acc["reference"].append((cmp["max_error_over_tolerance"], cmp["ok"]))
                 del ref
@@ -380,15 +444,16 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
             # invariance under permutation of the memories
             if qi == 0:
-                pres = compute_item(bundle, PermutedBank(bank), trace, it.id, betas, hidden_layers,
-                                    k_mass, k_ids)
-                # topk_ids are memory indices (they move with the permutation): step 6.
+                pbank = PermutedBank(bank)
+                pres = compute_item(bundle, pbank, trace, it.id, betas, hidden_layers, k_mass, k_ids)
                 # Summation-order error is relative to the magnitude (dkl reaches
                 # hundreds at beta ~ 1e4): error measured as |a - b| / max(1, |b|)
                 perm_err = max(_nan_aware_max_diff(pres.traces[k_] / np.maximum(1.0, np.abs(v)),
                                                    v / np.maximum(1.0, np.abs(v)))[0]
                                for k_, v in prod.traces.items() if k_ != "topk_ids")
-                acc["perm"].append(perm_err)
+                # topk_ids are memory indices: permuted index j is original perm[j]
+                mapped = np.stack([pbank.perm[l].cpu().numpy()[pres.traces["topk_ids"][l]] for l in range(L)])
+                acc["perm"].append((perm_err, _topk_jaccard(mapped, prod.traces["topk_ids"])))
 
             # limits, monotonicity, self-divergence on real scores
             grid = cfg.calibration.beta_grid()
@@ -402,15 +467,19 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                 if m0 > 0:
                     b_inf = 50.0 / m0                       # e^-50 ~ 2e-22 per runner-up
                     h_inf = metrics.norm_entropy(metrics.log_distribution(s0, b_inf)).item()
+                    lp_inf = metrics.log_distribution(s0, b_inf)
                     e_gap = abs(metrics.energy(s0, b_inf).item() + s0.max().item())
                     lim_worst = max(lim_worst, 1 - h0, h_inf,
-                                    e_gap - math.log(s0.shape[0]) / b_inf)
+                                    e_gap - math.log(s0.shape[0]) / b_inf,
+                                    metrics.var_score(lp_inf, s0).item(),
+                                    1 - metrics.topk_mass(lp_inf, k_mass).item())
                 else:
                     lim_worst = max(lim_worst, 1 - h0)
                 hs = torch.stack([metrics.norm_entropy(metrics.log_distribution(s[sel_pos], b)) for b in grid])
                 mono_worst = max(mono_worst, (hs[1:] - hs[:-1]).max().item())
                 lp = metrics.log_distribution(s0, beta_star)
-                self_worst = max(self_worst, metrics.js_divergence(lp, lp).item())
+                self_worst = max(self_worst, metrics.js_divergence(lp, lp).item(),
+                                 abs(metrics.kl_divergence(lp, lp).item()))
             acc["limits"].append(lim_worst)
             acc["monotone"].append(mono_worst)
             acc["self"].append(self_worst)
@@ -445,15 +514,20 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
               max(e for e, _ in acc["files"]), det_tol,
               {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation, in float16 ulps; "
                          "topk_ids exact on CPU, row Jaccard >= 0.98 on GPU"}),
-        Check("permutation", _status(max(acc["perm"]) <= F32_FLOOR), max(acc["perm"]), F32_FLOOR,
+        Check("permutation", _status(max(e for e, _ in acc["perm"]) <= F32_FLOOR
+                                     and min(j for _, j in acc["perm"]) >= TOPK_MIN_JACCARD),
+              max(e for e, _ in acc["perm"]), F32_FLOOR,
               {"metric": "max |change| / max(1, |value|) of every float trace "
-                         "(float32 summation order)"}),
+                         "(float32 summation order)",
+               "topk_ids_min_row_jaccard": min(j for _, j in acc["perm"]),
+               "topk_ids_required": TOPK_MIN_JACCARD}),
         Check("limits", _status(max(acc["limits"]) <= F32_FLOOR), max(acc["limits"]), F32_FLOOR,
               {"metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
-                         "|E + max s| - log(D_ff)/beta"}),
+                         "|E + max s| - log(D_ff)/beta, var_score and 1 - topk_mass at beta=50/margin"}),
         Check("monotone", _status(max(acc["monotone"]) <= F32_FLOOR), max(acc["monotone"]), F32_FLOOR,
               {"metric": "max increase of H_bar between consecutive grid betas"}),
-        Check("self_divergence", _status(max(acc["self"]) <= 1e-7), max(acc["self"]), 1e-7, {}),
+        Check("self_divergence", _status(max(acc["self"]) <= 1e-7), max(acc["self"]), 1e-7,
+              {"metric": "max of JS(p, p) and |KL(p || p)|"}),
         Check("determinism", _status(all(acc["det_tokens"]) and max(e for e, _ in acc["files"]) <= det_tol),
               max(e for e, _ in acc["files"]), det_tol,
               {"tokens_equal": all(acc["det_tokens"]), "device": bundle.device.type,

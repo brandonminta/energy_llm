@@ -71,9 +71,14 @@ def test_inspect_shows_positions_and_phases(run):
     text = inspect_item(r["extraction_dir"], items[0].id, tokenizer=bundle.tokenizer)
     lines = text.splitlines()
     assert lines[0].startswith(f"id {items[0].id}")
-    rows = [l for l in lines if l.strip()[:1].isdigit() and "|" not in l]
-    phases = [l.split()[3] if len(l.split()) > 3 and l.split()[3] in ("prompt", "response") else ""
-              for l in rows]
-    assert phases.count("prompt") == 1
-    table = [l for l in lines if l.count("|") == 6]
-    assert len(table) == bundle.dims.n_layers
+    header = lines.index(next(l for l in lines if l.split()[:2] == ["pos", "token_id"]))
+    rows = lines[header + 1: lines.index("", header)]
+    where = [l.split()[3] if len(l.split()) > 3 else "" for l in rows]
+    for r in ("question_last", "prompt_last", "response_first"):
+        assert where.count(r) == 1, r
+    for name in ("energy", "norm_entropy", "margin", "var_score", "topk_mass"):
+        start = lines.index(next(l for l in lines if l.startswith(f"{name} per layer")))
+        assert lines[start + 1].split() == ["layer", "question_last", "prompt_last",
+                                            "response_first", "response_mean"]
+        assert len([l for l in lines[start + 2: start + 2 + bundle.dims.n_layers]
+                    if l.split()[0].isdigit()]) == bundle.dims.n_layers

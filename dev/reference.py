@@ -50,13 +50,14 @@ def margin(s: list[float]) -> float:
 
 
 def js(p: list[float], q: list[float]) -> float:
+    """log(a / m) written as log 2 + log a - log(a + b): m = (a + b)/2 rounds to
+    0 when a is the smallest float64 subnormal (beta ~ 1e4), a + b never does."""
     total = []
     for a, b in zip(p, q):
-        m = 0.5 * (a + b)
         if a > 0.0:
-            total.append(0.5 * a * math.log(a / m))
+            total.append(0.5 * a * (math.log(2.0) + math.log(a) - math.log(a + b)))
         if b > 0.0:
-            total.append(0.5 * b * math.log(b / m))
+            total.append(0.5 * b * (math.log(2.0) + math.log(b) - math.log(a + b)))
     return math.fsum(total)
 
 
@@ -109,22 +110,36 @@ def layer_scores(w_g: np.ndarray, gamma: np.ndarray, xs: list[list[float]]) -> t
     return scores, norms
 
 
+REFERENCES = ("question_last", "prompt_last", "response_first")   # written out independently
+
+
 def reference_item(model, residuals: dict, n_prompt: int, gen_ids: list[int],
-                   stop_ids: list[int], layers: list[int], trace_beta: float) -> dict:
-    """Everything for one question on the given layers.
+                   stop_ids: list[int], layers: list[int], betas: list[float],
+                   question_last: int, topk_mass_k: int, topk_ids_k: int) -> dict:
+    """Every per-token trace for one question on the given layers.
 
     residuals[l]: array-like [T, D] (any dtype), T = n_prompt + len(gen_ids).
-    Returns scores {l: [T][K]} and energy / norm_entropy / margin traces
-    [len(layers), T] at ``trace_beta``.
+    ``question_last``: position of the last question token (the caller reads
+    it from the role mask). Returns scores {l: [T][K]}, the reference
+    positions, and traces named as in production: [len(layers), T, n_beta]
+    for energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>,
+    dkl/<ref> (dkl = KL(p_t||p_ref) - KL(p_ref||p_t)); [len(layers), T] for
+    margin and xhat_top1_frac; topk_ids [len(layers), T, k] (as sets: ties
+    may order differently).
     """
     stops = set(int(t) for t in stop_ids)
     resp = [n_prompt + j for j, t in enumerate(gen_ids) if int(t) not in stops]
+    refs = {"question_last": question_last, "prompt_last": n_prompt - 1,
+            "response_first": resp[0] if resp else None}
     eps = float(model.config.rms_norm_eps)
-    T = n_prompt + len(gen_ids)
+    T, nl, nb = n_prompt + len(gen_ids), len(layers), len(betas)
 
-    tr_e = np.empty((len(layers), T))
-    tr_h = np.empty((len(layers), T))
-    tr_m = np.empty((len(layers), T))
+    per_beta = ["energy", "norm_entropy", "topk_mass", "mean_score", "var_score"] + \
+        [f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES]
+    out = {k: np.full((nl, T, nb), np.nan) for k in per_beta}
+    out["margin"] = np.empty((nl, T))
+    out["xhat_top1_frac"] = np.empty((nl, T))
+    out["topk_ids"] = np.empty((nl, T, topk_ids_k), dtype=np.int64)
     scores_out = {}
     for li, l in enumerate(layers):
         layer = model.model.layers[l]
@@ -135,9 +150,25 @@ def reference_item(model, residuals: dict, n_prompt: int, gen_ids: list[int],
         s, _ = layer_scores(w_g, gamma, xs)
         scores_out[l] = s
         for t in range(T):
-            p, lse = softmax_and_lse(s[t], trace_beta)
-            tr_e[li, t] = energy(lse, trace_beta)
-            tr_h[li, t] = norm_entropy(p)
-            tr_m[li, t] = margin(s[t])
-    return {"scores": scores_out, "energy": tr_e,
-            "norm_entropy": tr_h, "margin": tr_m, "response_positions": resp}
+            out["margin"][li, t] = margin(s[t])
+            out["xhat_top1_frac"][li, t] = xhat_top1_frac(xs[t])
+            out["topk_ids"][li, t] = topk_indices(s[t], topk_ids_k)
+        for bi, beta in enumerate(betas):
+            ps, logps = [], []
+            for t in range(T):
+                p, lse = softmax_and_lse(s[t], beta)
+                ps.append(p)
+                logps.append([beta * v - lse for v in s[t]])
+                out["energy"][li, t, bi] = energy(lse, beta)
+                out["norm_entropy"][li, t, bi] = norm_entropy(p)
+                out["topk_mass"][li, t, bi] = topk_mass(p, topk_mass_k)
+                out["mean_score"][li, t, bi] = mean_score(p, s[t])
+                out["var_score"][li, t, bi] = var_score(p, s[t])
+            for r, pos in refs.items():
+                if pos is None:
+                    continue
+                for t in range(T):
+                    out[f"js/{r}"][li, t, bi] = js(ps[t], ps[pos])
+                    out[f"dkl/{r}"][li, t, bi] = kl(logps[t], logps[pos]) - kl(logps[pos], logps[t])
+    return {"scores": scores_out, "reference_positions": refs, "response_positions": resp,
+            "traces": out}

@@ -300,3 +300,25 @@ def test_smoke_summary(calibrated, capsys):
     assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
     text = format_summary(s)
     assert "TF == greedy" in text and "layer   0" in text
+    assert "ablation" in text and "gamma zeroed" in text
+    L = bundle.dims.n_layers
+    assert len(s["bands"]) == 3 and s["bands"][0]["layers"][0] == 0 and s["bands"][-1]["layers"][1] == L - 1
+    # the intact branch of the ablation equals the production traces (float16 storage)
+    d = cfg.extraction_dir("smoke-test")
+    ans = pd.read_parquet(d / "answers.parquet")
+    deltas = []
+    with h5py.File(d / "traces.h5") as f:
+        for i, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
+            h, resp = f[i]["norm_entropy"][..., -1].astype(np.float64), f[i]["role_mask"][()] == 3
+            if resp.any():
+                deltas.append(h[:, resp].mean(1) - h[:, n_p - 1])
+    for b in s["bands"]:
+        lo, hi = b["layers"]
+        want = np.mean(np.asarray(deltas)[:, lo:hi + 1])
+        got = b["delta_norm_entropy_response_minus_prompt_last"]
+        assert got["intact"] == pytest.approx(want, abs=2e-3)
+        assert np.isfinite(got["top_gamma_zeroed"])
+        assert 0.0 <= b["gamma_top_fraction"] <= 1.0
+        for r in ("question_last", "prompt_last", "response_first"):
+            x = b["xhat_top1_frac"][r]
+            assert 0.0 < x["median"] <= x["max"] <= 1.0

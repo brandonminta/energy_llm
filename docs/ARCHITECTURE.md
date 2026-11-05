@@ -489,9 +489,17 @@ median s per item` (a 2 h target inside the 3 h walltime).
   and `run_merge(allow_incomplete=True)` in the same process; `run_smoke`
   then summarises: counts, dtype, β\*, TF==greedy % of tokens and of
   answers, max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
-  truncated counts, and per layer the mean over ids of `H̄` at β\* (last
+  truncated counts, per layer the mean over ids of `H̄` at β\* (last
   β column) read from `traces.h5` (prompt = last prompt token | response = each id's mean over
-  its response positions, empty responses skipped). Output name
+  its response positions, empty responses skipped), and per layer band
+  (early / middle / late thirds): median and max `xhat_top1_frac` at the
+  three reference positions; mean `var_score` at β\* over prompt tokens vs
+  response tokens; the mean γ top-5 fraction (`gamma_diagnostic`); and the
+  **ablation line** — mean over ids of `H̄(response mean) − H̄(prompt_last)`
+  at β\* with the bank intact vs with the top-5 `|γ|` dimensions zeroed (row
+  norms of the ablated `W̃` recomputed), from residuals captured afresh for
+  the smoke questions (a second `forward_item` per question; report only, no
+  production output involved). Output name
   `smoke-<UTC time>`, report `smoke_report.json`. CLI exit 1 if any id
   failed or a signal stopped it.
 - **verify** (`verification/verify.py`): runs the same single-process path
@@ -502,22 +510,23 @@ median s per item` (a 2 h target inside the 3 h walltime).
 - **inspect** (`verification/inspection.py`): no model; reads
   `manifest.json`, `answers.parquet` and `traces.h5` of a finished run and
   prints every position (token id, decoded token if the tokenizer is in the
-  local cache, role, phase) and per layer `E | H̄ | margin` at β\* (last β
-  column) for the
-  last prompt token, the response mean and the first response token.
+  local cache, role, reference position or `response`) and one table per
+  quantity — `E`, `H̄`, `margin`, `var_score`, `topk_mass` at β\* (last β
+  column) — with one row per layer and columns `question_last`,
+  `prompt_last`, `response_first`, `response_mean`.
 
 Verification checks (none is part of the production path):
 
 | check | implementation | tolerance and justification |
 |---|---|---|
-| `reference`: production == independent float64 reference | `dev/reference.py` (explicit loops, no `energy_llm` imports); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); `energy`, `norm_entropy` at β\* (last column) and `margin` by first-order Lipschitz bounds on the observed score error δ: E δ, margin 2δ, H̄ 2β\*δ; +1e-5 float32 reduction floor (`reference_tolerances`); NaN patterns equal. The other traces are compared from step 6 |
+| `reference`: every per-token trace == independent float64 reference, at every β and reference position | `dev/reference.py` (explicit loops, no `energy_llm` imports; `reference_item` returns the traces of 5.8 and the reference positions, `question_last` passed in from the role mask); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); every trace by a first-order bound on the observed score error δ at each β (`reference_tolerances`): E δ; margin 2δ; H̄ 2βδ; `mean_score` 2βδ·range(s) + δ; `var_score` 2βδ·range(s) + 2δ·range(s); `topk_mass` max(k, 2)·βδ; JS 4βδ; `dkl` 2βδ·A + 8βδ with A = Σp\|log p − log q\| + Σq\|log q − log p\| computed per element from the reference scores; `xhat_top1_frac` within the score tolerance; plus a float32 floor 1e-5·max(1, \|value\|) per element; `topk_ids` as sets, row Jaccard ≥ 0.98 (near-ties at the k-th score); NaN patterns and reference positions equal |
 | `gate`: read point + γ integration | `verify.check_gate` | `g` vs `‖w̃‖√D·s`: 4·u of the model dtype (three roundings in the model path), floor 1e-5; the no-γ control must exceed 10× |
 | `tf_vs_cache`: TF residuals == cached generation, per position | `verify.check_tf_vs_cache` | fp32 1e-4; bf16 5e-2 **provisional, empirical** (tokens must agree) |
 | `alignment`: last prompt position emits the first token; response = generated non-stop tokens | `verify.run_verify` | exact (booleans) |
 | `hidden`: residuals at the four positions, derived independently (roles, stop tokens) | `verify.run_verify` | exact |
 | `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | in float16 ulps: 0 on CPU, ≤ 1 on GPU (a float32 difference of a recomputation can flip the last float16 bit); `topk_ids` exact on CPU, row Jaccard ≥ 0.98 on GPU |
-| `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | `|Δ| / max(1, |value|)` ≤ 1e-5 (float32 summation order is relative to the magnitude; `dkl` reaches hundreds at β ~ 10⁴); `topk_ids` from step 6 |
-| `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰; JS(p,p) ≤ 1e-7 (one rounding in logaddexp) |
+| `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | `|Δ| / max(1, |value|)` ≤ 1e-5 (float32 summation order is relative to the magnitude; `dkl` reaches hundreds at β ~ 10⁴); `topk_ids` mapped through the permutation, row Jaccard ≥ 0.98 |
+| `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| ≤ 1e-7 (one rounding in logaddexp) |
 | `calibration`: H̄(β\*) on the warm-up set | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values |
 | `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, ≤ 1 float16 ulp on GPU |
 
@@ -612,10 +621,10 @@ must override.
 | `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; `token_logits` == chosen-token logits of an explicit forward; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas; `topk_ids` sorted and unique; `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast); `betas` recorded; NaN raises |
 | `test_config.py` | YAML round trip keeps values and hash; `betas` = absolute grid + β\* last; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`) rejected |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
-| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; merge of two shards (attrs, per-id reference positions, chunks, `max_xhat_top1_frac`, `mean_neg_logit`, γ summary); `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |
+| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; merge of two shards (attrs, per-id reference positions, chunks, `max_xhat_top1_frac`, `mean_neg_logit`, γ summary); `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary (three bands; the intact branch of the ablation equals the production traces) |
 | `test_invariance.py` | permuting memories changes nothing (`topk_ids` map through the permutation); β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
-| `test_reference.py` | production traces == `dev/reference.py` within the derived tolerances at three β\*; empty response; negative control (no γ) fails |
-| `test_verify.py` | all twelve checks PASS on the tiny models; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (one prompt row, one table row per layer) |
+| `test_reference.py` | every production trace == `dev/reference.py` within the derived tolerances on the grid {1, 10², 10⁴, β\*} at three β\*; reference positions equal; empty response (NaN `*/response_first`); negative control (no γ) fails |
+| `test_verify.py` | all twelve checks PASS on the tiny models; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (each reference position marked once; five per-layer tables with the four columns) |
 | `test_gpu.py` | (skipped without CUDA) GPU == CPU within float32, peak memory recorded |
 | `test_real_tokenizer.py` | (opt-in via `ENERGY_LLM_TOKENIZER_DIRS`) prompt ids equal the official template, role mask exact |
 
@@ -695,7 +704,13 @@ The departures below were approved on 2026-10-26.
 
 ### 13.4 Deliberately duplicated (left as is)
 
-- `dev/reference.py` re-implements every quantity with explicit loops.
+- `dev/reference.py` re-implements every quantity with explicit loops,
+  including its own `REFERENCES` tuple. At Qwen2.5-3B size it costs about
+  75 s per layer and question for the scores plus a few minutes for the β
+  grid and the three references in pure Python; `verify` runs it on
+  `--reference-n` questions × `--reference-layers` only.
+- `pipeline/smoke.py` builds its own ablated `Bank` for the γ ablation line
+  (report only) instead of a production flag.
 - `verification/verify.py: _Capture` is a second hook implementation; the
   alignment check recomputes response positions from scratch.
 

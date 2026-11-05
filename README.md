@@ -202,8 +202,8 @@ The checks (`reference`, `gate`, `tf_vs_cache`, `alignment`, `hidden`,
 `determinism`, `calibration`) and their tolerances are tabulated in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §9. `inspect` reads a
 finished extraction (no model) and prints each position (token, role,
-prompt/response phase) and, per layer, E, H̄ and margin at β\* for the last
-prompt token, the response mean and the first response token.
+reference position) and, per layer, E, H̄, margin, var_score and topk_mass
+at β\* at the three reference positions and averaged over the response.
 
 ### Verification on the cluster
 
@@ -281,7 +281,7 @@ full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
 | check | what it proves | what to look at |
 |---|---|---|
 | `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w̃‖·√D·s` | error ≤ 4·u_bf16; `no_gamma_control_min_error` ≫ tolerance |
-| `reference` | production == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1) |
+| `reference` | every per-token trace (all β, three references) == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1); `topk_ids` row Jaccard ≥ 0.98. The pure-Python reference over the β grid adds a few minutes per layer and question: watch the 45 min walltime |
 | `tf_vs_cache` | teacher-forced x == x during cached generation | tolerance 5e-2 is **provisional** for bf16: note the observed max |
 | `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
 | `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
@@ -304,7 +304,11 @@ Check:
 - `max | ||x_hat||/sqrt(D) - 1 |` negligible (≲ 1e-3);
 - mean H̄ per layer at β\*: not saturated (not ≈ 0 or ≈ 1 in most layers);
 - peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
-- empty / truncated counts: plausible for short factual answers.
+- empty / truncated counts: plausible for short factual answers;
+- per layer band: `xhat_top1_frac` median/max at the three references,
+  `var_score` prompt vs response, γ top-5 fraction, and the ablation line
+  (mean `H̄(response) − H̄(prompt_last)` with the top-5 γ dims zeroed vs
+  intact).
 
 #### 6. Manual alignment review: 3 questions per model
 
@@ -316,11 +320,12 @@ for ID in dev-known-01 dev-obscure-03 dev-misc-01; do
 ```
 
 Check by eye: `instruction` rows are exactly the system sentence, `question`
-rows exactly the question, chat-template tokens are `template`; exactly one
-`prompt` phase row, on the last prompt token (the assistant header); the
-`response` rows are the answer tokens and the final `<|im_end|>` /
-`<|eot_id|>` is `template`, not response; the per-layer table has one row
-per layer with finite prompt values.
+rows exactly the question, chat-template tokens are `template`;
+`question_last` marks the last question token, `prompt_last` the last
+prompt token (the assistant header) and `response_first` the first answer
+token; the other `response` rows are the answer tokens and the final
+`<|im_end|>` / `<|eot_id|>` is `template`, not response; each per-layer
+table has one row per layer with finite reference values.
 
 #### 7. Requeue test with a very short walltime
 

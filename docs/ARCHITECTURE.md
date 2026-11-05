@@ -57,7 +57,8 @@ energy_llm/                 the installed package (CLI: energy-llm, python -m en
     model.py                loading at a pinned revision, dims from the checkpoint, clean greedy config
     prompting.py            chat template, single system instruction, per-token role mask
     bank.py                 the unmaterialised bank: gamma + row norms, on-the-fly cosine scores
-    metrics.py              float32 primitives: x_hat, E, log p, H_bar, margin, JS
+    metrics.py              float32 primitives: x_hat, E, log p, H_bar, margin, mean/var score,
+                            top-k mass/indices, x_hat top-1 fraction, KL, JS
     capture.py              per question: greedy + teacher forcing + hooks + every metric
   pipeline/                 HOW it runs (everything that touches <output_dir>)
     signals.py              SIGUSR1/SIGTERM -> finish the current id, exit 75
@@ -242,6 +243,12 @@ norms). `extract` refuses to run if the live bank's fingerprint differs from
 | energy | `E = -(1/β) · logsumexp(β s)` — **no** quadratic term |
 | normalised entropy | `H̄ = -Σ p log p / log(D_ff)`, with `p = exp(log p)` and `0·log 0 := 0` |
 | margin | `top1(s) - top2(s)` on the raw scores (β-independent) |
+| mean score | `mean_score = Σ p s` |
+| score variance | `var_score = Σ p (s - mean_score)²` |
+| top-k mass | `topk_mass = exp(logsumexp of the k largest log p)` (sum of the k largest `p`, in the log domain) |
+| top-k indices | `topk_indices`: int32 indices of the k largest `log p`, descending |
+| x̂ top-1 fraction | `xhat_top1_frac = max_j x̂_j² / D` per row (1 for a one-hot residual, 1/D for a constant one) |
+| Kullback–Leibler (nats) | `KL(p‖q) = Σ p (log p - log q)`, clamped at 0 |
 | Jensen–Shannon (nats) | `log m = logaddexp(log p, log q) - log 2`; `JS = ½Σ p (log p - log m) + ½Σ q (log q - log m)`, clamped to `[0, log 2]` |
 
 Divergences take **log-probabilities**: at the β\* values that cosine
@@ -250,6 +257,9 @@ made the earlier p-domain JS stick at its log 2 clamp (fixed in commit
 `652fccc`; regression test
 `tests/test_metrics.py::test_divergences_survive_float32_underflow`).
 JS is used today only by `verify` (`self_divergence`); no output stores it.
+The six primitives above JS (v0.2 step 1) have naive float64 counterparts in
+`dev/reference.py`, compared in `tests/test_metrics.py`; they enter the
+outputs, and `verify`, with the per-token traces of step 4.
 Squared Hellinger, top-k Jaccard and the mean-distribution helper were
 removed with the features table (v0.2, step 0).
 
@@ -551,7 +561,7 @@ must override.
 |---|---|
 | `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped) |
 | `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; bf16 enforcement |
-| `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin |
+| `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
 | `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample; shapes/bounds; energy trace vs scipy; `betas == [β*]`; NaN raises |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
 | `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config refuses to resume; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary |

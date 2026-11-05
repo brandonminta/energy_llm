@@ -47,7 +47,7 @@ energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
     model.py             loading at a pinned revision, bf16 check, clean greedy config
     prompting.py         chat template, single system instruction, role mask
     bank.py              gamma + row norms of W_g * gamma (bank never materialised), bank.h5
-    metrics.py           float32 primitives (E, H_bar, margin, JS)
+    metrics.py           float32 primitives (E, H_bar, margin, mean/var score, top-k, KL, JS)
     capture.py           greedy + teacher forcing + hooks + all metrics per question
   pipeline/              how it runs (everything under <output_dir>)
     signals.py           SIGUSR1/SIGTERM -> finish the current id, exit 75

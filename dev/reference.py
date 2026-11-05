@@ -60,6 +60,35 @@ def js(p: list[float], q: list[float]) -> float:
     return math.fsum(total)
 
 
+def mean_score(p: list[float], s: list[float]) -> float:
+    return math.fsum(a * b for a, b in zip(p, s))
+
+
+def var_score(p: list[float], s: list[float]) -> float:
+    mu = mean_score(p, s)
+    return math.fsum(a * (b - mu) ** 2 for a, b in zip(p, s))
+
+
+def topk_indices(p: list[float], k: int) -> list[int]:
+    """Indices of the k largest probabilities, descending (ties: lower index first)."""
+    order = sorted(range(len(p)), key=lambda i: (-p[i], i))
+    return order[:k]
+
+
+def topk_mass(p: list[float], k: int) -> float:
+    return math.fsum(p[i] for i in topk_indices(p, k))
+
+
+def kl(logp: list[float], logq: list[float]) -> float:
+    """KL(p || q) from log-probabilities (log p_i = beta s_i - lse is exact in
+    float64 even where p_i itself underflows)."""
+    return max(0.0, math.fsum(math.exp(a) * (a - b) for a, b in zip(logp, logq)))
+
+
+def xhat_top1_frac(xh: list[float]) -> float:
+    return max(v * v for v in xh) / len(xh)
+
+
 # ---------------------------------------------------------------- per layer
 
 def layer_scores(w_g: np.ndarray, gamma: np.ndarray, xs: list[list[float]]) -> tuple[list[list[float]], list[float]]:

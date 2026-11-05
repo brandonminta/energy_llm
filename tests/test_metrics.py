@@ -92,3 +92,76 @@ def test_divergences_survive_float32_underflow():
 def test_margin():
     s = torch.tensor([0.1, 0.9, 0.4, 0.7])
     assert metrics.margin(s).item() == pytest.approx(0.2)
+
+
+def test_kl_zero_on_identical_and_dkl_antisymmetric():
+    lp = metrics.log_distribution(_dist(6)[1], 30.0)
+    lq = metrics.log_distribution(_dist(7)[1], 30.0)
+    assert metrics.kl_divergence(lp, lp).item() == 0.0
+    kl_pq, kl_qp = metrics.kl_divergence(lp, lq), metrics.kl_divergence(lq, lp)
+    assert kl_pq.item() > 0 and kl_qp.item() > 0
+    assert (kl_pq - kl_qp).item() == -(kl_qp - kl_pq).item()
+    ref = np.sum(lp.exp().double().numpy() * (lp.double().numpy() - lq.double().numpy()))
+    assert kl_pq.item() == pytest.approx(ref, rel=1e-4)
+
+
+def test_var_score_limits():
+    _, s = _dist(8)
+    lp0 = metrics.log_distribution(s, 1e-8)
+    assert metrics.mean_score(lp0, s).item() == pytest.approx(s.mean().item(), abs=1e-6)
+    assert metrics.var_score(lp0, s).item() == pytest.approx(np.var(s.double().numpy()), rel=1e-4)
+    b_inf = 50.0 / metrics.margin(s).item()
+    lp_inf = metrics.log_distribution(s, b_inf)
+    assert metrics.var_score(lp_inf, s).item() <= 1e-6
+    assert metrics.mean_score(lp_inf, s).item() == pytest.approx(s.max().item(), abs=1e-6)
+
+
+def test_topk_mass_limits():
+    _, s = _dist(9)
+    b_inf = 50.0 / metrics.margin(s).item()
+    for k in (1, 10):
+        assert metrics.topk_mass(metrics.log_distribution(s, b_inf), k).item() == pytest.approx(1.0, abs=1e-6)
+        assert metrics.topk_mass(metrics.log_distribution(s, 1e-8), k).item() == pytest.approx(k / K, rel=1e-4)
+
+
+def test_topk_indices_sorted_unique_int32():
+    lp = metrics.log_distribution(torch.randn(4, K), 20.0)
+    idx = metrics.topk_indices(lp, 100)
+    assert idx.dtype == torch.int32 and idx.shape == (4, 100)
+    for row, l in zip(idx, lp):
+        assert len(set(row.tolist())) == 100
+        vals = l[row.long()]
+        assert (vals[:-1] >= vals[1:]).all()
+        assert vals[-1] >= torch.topk(l, 101).values[-1]
+
+
+def test_xhat_top1_frac_extremes():
+    d = 64
+    one_hot = torch.zeros(d); one_hot[5] = 3.0
+    assert metrics.xhat_top1_frac(metrics.rms_normalise(one_hot, 1e-12)).item() == pytest.approx(1.0, rel=1e-6)
+    const = metrics.rms_normalise(torch.full((d,), 2.0), 1e-12)
+    assert metrics.xhat_top1_frac(const).item() == pytest.approx(1.0 / d, rel=1e-6)
+
+
+def test_primitives_match_reference():
+    from energy_llm.verification.verify import load_reference
+
+    ref = load_reference()
+    _, s = _dist(10)
+    _, s2 = _dist(11)
+    x = torch.randn(K)
+    for beta in (1.0, 40.0, 600.0):
+        lp, lq = metrics.log_distribution(s, beta), metrics.log_distribution(s2, beta)
+        sl, s2l = [float(v) for v in s.double()], [float(v) for v in s2.double()]
+        p, lse = ref.softmax_and_lse(sl, beta)
+        _, lse2 = ref.softmax_and_lse(s2l, beta)
+        logp = [beta * v - lse for v in sl]
+        logq = [beta * v - lse2 for v in s2l]
+        assert metrics.mean_score(lp, s).item() == pytest.approx(ref.mean_score(p, sl), abs=1e-5)
+        assert metrics.var_score(lp, s).item() == pytest.approx(ref.var_score(p, sl), abs=1e-5)
+        assert metrics.topk_mass(lp, 10).item() == pytest.approx(ref.topk_mass(p, 10), abs=1e-5)
+        assert metrics.topk_indices(lp, 10).tolist() == ref.topk_indices(p, 10)
+        assert metrics.kl_divergence(lp, lq).item() == pytest.approx(ref.kl(logp, logq), rel=1e-4, abs=1e-5)
+    xh = metrics.rms_normalise(x, 1e-6)
+    assert metrics.xhat_top1_frac(xh).item() == pytest.approx(
+        ref.xhat_top1_frac(ref.x_hat([float(v) for v in x.double()], 1e-6)), rel=1e-5)

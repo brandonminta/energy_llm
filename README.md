@@ -347,12 +347,12 @@ if it is wanted, and record its peak memory and seconds/question.
 
 | File | Content |
 |---|---|
-| `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses), exhausted ids |
+| `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses), γ diagnostic, exhausted ids |
 | `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob and entropy, TF mismatches |
 | `traces.h5` | `/<id>/{energy, norm_entropy, margin}` `[L, T]` at β*, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response) |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy (response tokens) |
 | `hidden.h5` | `/<id>/{prompt_last, response_last}` `[layers, D]` float16 |
-| `bank.h5` | γ and `‖W̃_i‖` per layer |
+| `bank.h5` | γ and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
 
 Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.
 

@@ -81,6 +81,9 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
         assert f.attrs["beta_star"] == rec["beta_star"]
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
     assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
+    g = m["gamma_diagnostic"]
+    assert g["k"] == 5 and len(g["fraction"]) == bundle.dims.n_layers
+    assert all(0.0 <= f <= 1.0 for f in g["fraction"])
     assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
 
 

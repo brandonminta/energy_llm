@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from energy_llm.core import metrics
-from energy_llm.core.bank import build_bank, read_bank_fingerprint, write_bank_h5
+from energy_llm.core.bank import build_bank, gamma_diagnostic, read_bank_fingerprint, write_bank_h5
 from energy_llm.core.model import model_dims
 
 
@@ -90,6 +90,26 @@ def test_bank_h5_roundtrip(tmp_path, qwen_pair):
     import h5py
     with h5py.File(tmp_path / "bank.h5") as f:
         assert f["layer_0/gamma"].shape == (32,) and f["layer_0/row_norms"].shape == (48,)
+
+
+def test_gamma_diagnostic(pair):
+    model, _ = pair
+    dims = model_dims(model)
+    bank = build_bank(model, dims)
+    d = gamma_diagnostic(bank, k=5)
+    assert d["k"] == 5 and len(d["indices"]) == len(d["fraction"]) == dims.n_layers
+    for l, layer in enumerate(model.model.layers):
+        gamma = layer.post_attention_layernorm.weight.float()
+        idx = d["indices"][l]
+        assert idx == torch.topk(gamma.abs(), 5).indices.tolist()
+        w_tilde = layer.mlp.gate_proj.weight.float() * gamma
+        explicit = (w_tilde[:, idx].pow(2).sum() / w_tilde.pow(2).sum()).item()
+        assert d["fraction"][l] == pytest.approx(explicit, rel=1e-5)
+        assert 0.0 <= d["fraction"][l] <= 1.0
+    # per-dimension fractions over all D dims sum to 1
+    full = gamma_diagnostic(bank, k=dims.d_model)
+    np.testing.assert_allclose(full["fraction"], 1.0, rtol=1e-5)
+    assert gamma_diagnostic(bank, k=5) == d                          # deterministic
 
 
 def test_bf16_required_by_default(qwen_pair):

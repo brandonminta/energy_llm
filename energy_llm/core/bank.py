@@ -14,6 +14,11 @@ converting only the current layer's W_g to float32 and freeing it right
 after. This is algebraically identical to (bank @ x_hat) / sqrt(D), and the
 model's gate pre-activation is g_i = w_i . (gamma * x_hat) = ||w_tilde_i|| *
 sqrt(D) * s_i. Everything is float32.
+
+Gamma diagnostic (report only): column j of W_tilde carries
+gamma_j^2 * ||W_g[:, j]||^2 of sum_i ||w_tilde_i||^2. Per layer, the k
+dimensions with the largest |gamma_j| and the fraction they carry tell
+whether a few residual dimensions dominate the cosine scores.
 """
 
 from __future__ import annotations
@@ -59,6 +64,22 @@ class Bank:
             h.update(g.cpu().numpy().astype(np.float32).tobytes())
             h.update(n.cpu().numpy().astype(np.float32).tobytes())
         return h.hexdigest()
+
+
+@torch.no_grad()
+def gamma_diagnostic(bank: Bank, k: int = 5) -> dict:
+    """Per layer: indices of the k largest |gamma_j| (descending) and the
+    fraction of sum_i ||w_tilde_i||^2 carried by those k columns. One layer's
+    W_g in float32 at a time, as ``scores``."""
+    indices, fraction = [], []
+    for w_g, gamma in zip(bank.gate_weights, bank.gamma):
+        w = w_g.detach().float()
+        col = w.pow(2).sum(dim=0) * gamma.pow(2)          # [D] share of each column
+        del w
+        top = torch.topk(gamma.abs(), k).indices
+        indices.append(top.cpu().tolist())
+        fraction.append((col[top].sum() / col.sum()).item())
+    return {"k": k, "indices": indices, "fraction": fraction}
 
 
 @torch.no_grad()

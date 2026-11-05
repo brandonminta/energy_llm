@@ -97,6 +97,13 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
     completed = set().union(*(st.completed for st in states))
     shard_of = {i: st.index for st in states for i in st.ids}
     order = [it.id for it in items if it.id in completed]
+    with h5py.File(cfg.bank_h5_path, "r") as f:
+        n_layers = int(f.attrs["n_layers"])
+        # absent in a bank.h5 calibrated before the diagnostic existed (v0.2 step 2)
+        gamma_diag = {"k": int(f.attrs["gamma_top_k"]),
+                      "indices": f.attrs["gamma_top_indices"].tolist(),
+                      "fraction": f.attrs["gamma_top_fraction"].tolist()} \
+            if "gamma_top_k" in f.attrs else None
 
     answers, baselines = [], []
     with atomic_path(ext_dir / "traces.h5") as t_tmp, atomic_path(ext_dir / "hidden.h5") as h_tmp:
@@ -105,7 +112,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             tf.attrs["role_names"] = [ROLE_NAMES[k] for k in sorted(ROLE_NAMES)]
             tf.attrs["beta_star"] = float(beta_rec["beta_star"])
             tf.attrs["layout"] = "energy/norm_entropy at beta*, margin: [L, T]; role_mask: [T]"
-            hf.attrs["layers"] = np.asarray(cfg.hidden_layer_indices(_n_layers(cfg)))
+            hf.attrs["layers"] = np.asarray(cfg.hidden_layer_indices(n_layers))
             hf.attrs["layout"] = ("residual at the input of post_attention_layernorm; "
                                   "prompt_last = last prompt token, response_last = last "
                                   "non-stop response token: [layers, D] float16")
@@ -154,6 +161,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             "n_truncated": sum(bool(a["truncated"]) for a in answers),
             "n_empty_response": sum(bool(a["empty_response"]) for a in answers),
         },
+        "gamma_diagnostic": gamma_diag,
         "model_dtype": dtypes,
         "role_names": ROLE_NAMES,
         "code": manifest.code_version(),
@@ -164,9 +172,3 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
     write_json_atomic(ext_dir / "manifest.json", out)
     return out
 
-
-def _n_layers(cfg: RunConfig) -> int:
-    import h5py
-
-    with h5py.File(cfg.bank_h5_path, "r") as f:
-        return int(f.attrs["n_layers"])

@@ -232,7 +232,18 @@ pre-activation satisfies `g_i = W_g,i · (γ ⊙ x̂) = ‖W̃_i‖ · √D · s
 `bank.h5` (written once by `calibrate`, copied by `merge`) stores only
 `layer_l/gamma [D]`, `layer_l/row_norms [D_ff]` and attrs (model id,
 revision, dims, eps, definition string, `fingerprint` = sha256 of all γ and
-norms). `extract` refuses to run if the live bank's fingerprint differs from
+norms, and the γ diagnostic below).
+
+**γ diagnostic** (`gamma_diagnostic(bank, k=5)`, report only): column `j`
+of `W̃` carries `γ_j²·‖W_g[:, j]‖²` of `Σ_i ‖w̃_i‖²`. Per layer it records
+the indices of the `k` largest `|γ_j|` (descending) and the fraction of
+`Σ_i ‖w̃_i‖²` those `k` columns carry, one layer's `W_g` in float32 at a
+time. Written by `calibrate` as `bank.h5` attrs `gamma_top_k`,
+`gamma_top_indices [L, k]`, `gamma_top_fraction [L]`; copied by `merge`
+into `manifest.json: gamma_diagnostic` (`null` for a `bank.h5` calibrated
+before the diagnostic existed). It changes nothing else: not `scores`, not
+the fingerprint, not any hash or the calibration context; there is no
+config key and no ablation path in production. `extract` refuses to run if the live bank's fingerprint differs from
 `beta_star.json` or `bank.h5`.
 
 ### 5.6 Per-position quantities (`core/metrics.py`, all float32 torch)
@@ -337,7 +348,7 @@ Inputs: a warm-up JSONL (must be disjoint from every evaluation set) and the
 ```
 calibration/
   state.json         {input_sha256, context, ids}   refuses a different warm-up/config in the same dir
-  bank.h5            gamma + row norms (section 5.5), written once; later runs must match its fingerprint
+  bank.h5            gamma + row norms + gamma diagnostic (section 5.5), written once; later runs must match its fingerprint
   items/<sha1(id)>.json   one H_bar curve per warm-up question (the unit of resumption)
   failed.jsonl       failed attempts (same schema as extract)
   beta_star.json     the record below, written last
@@ -430,7 +441,7 @@ input order and writes, each atomically, into `<output_dir>/extract/<name>/`:
 | `traces.h5` | `/<id>/{energy, norm_entropy, margin} [L, T]` (gzip), `/<id>/role_mask [T]`; attrs `role_codes`, `role_names`, `beta_star`, `layout` |
 | `hidden.h5` | `/<id>/{prompt_last, response_last} [L_h, D] float16` (gzip); attrs `layers`, `layout` |
 | `bank.h5` | byte copy of `calibration/bank.h5` |
-| `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
+| `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
 
 `status_report` (CLI `status`) uses the same shard states and `runs.jsonl`
 records: per-shard counts, `missing_shards`, `exhausted_ids`, and a
@@ -560,7 +571,7 @@ must override.
 | file | proves |
 |---|---|
 | `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped) |
-| `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; bf16 enforcement |
+| `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
 | `test_metrics.py` | `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
 | `test_capture.py` | explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample; shapes/bounds; energy trace vs scipy; `betas == [β*]`; NaN raises |
 | `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |

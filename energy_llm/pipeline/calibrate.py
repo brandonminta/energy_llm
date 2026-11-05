@@ -24,7 +24,7 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.bank import build_bank, read_bank_fingerprint, write_bank_h5
+from energy_llm.core.bank import build_bank, gamma_diagnostic, read_bank_fingerprint, write_bank_h5
 from energy_llm.core.capture import ResidualHooks, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, release_cuda
 from energy_llm.core.prompting import build_prompt, check_template
@@ -66,12 +66,16 @@ def ensure_bank_record(cfg: RunConfig, bank, bundle: ModelBundle) -> None:
             raise RuntimeError(f"{path} was built from different weights")
         return
     d = bundle.dims
+    diag = gamma_diagnostic(bank)
     write_bank_h5(path, bank, {
         "model_id": cfg.model.id, "revision": cfg.model.revision,
         "n_layers": d.n_layers, "d_model": d.d_model, "d_ff": d.d_ff,
         "rms_norm_eps": d.rms_norm_eps,
         "definition": "W_tilde = gate_proj.weight * post_attention_layernorm.weight "
                       "(column-wise); row_norms = ||W_tilde_i||",
+        "gamma_top_k": diag["k"],
+        "gamma_top_indices": np.asarray(diag["indices"], dtype=np.int64),   # [L, k]
+        "gamma_top_fraction": np.asarray(diag["fraction"], dtype=np.float64),  # [L]
     })
 
 

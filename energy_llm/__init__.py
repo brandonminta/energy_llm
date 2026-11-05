@@ -6,4 +6,4 @@ The module ends at the metrics: labelling, probes and statistics live in the
 analysis repository and are not part of this package.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

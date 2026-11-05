@@ -16,22 +16,36 @@ Three documents describe it:
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | what the code **actually does**, module by module, file by file, formula by formula, with the verification tolerances — plus an audit of its inconsistencies and of where it departs from the thesis |
 | [`docs/overview.md`](docs/overview.md) | why: the science the module serves |
 
-## What is computed (short version)
+## What is computed
 
 Per layer, from the residual `x` at the input of `post_attention_layernorm`
 (float32): `x̂ = x/√(mean(x²)+eps)`, bank = unit rows of `W̃ = W_g·γ`,
 `s = bank·x̂/√D` (cosines). The bank is never materialised: only γ and `‖W̃_i‖`
 are kept and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
-to float32 at a time. Then, for every β of an absolute log grid
-(10⁰…10⁴, 9 points) plus β\* last, `p = softmax(βs)`, `E = -(1/β)·logsumexp(βs)`,
-`H̄ = H(p)/log D_ff`, top-k mass, mean and variance of `s` under `p`, and the
-JS and signed KL (`KL(p_t‖p_ref) − KL(p_ref‖p_t)`) to three reference
-positions (last question token, last prompt token, first response token);
-β-free: margin = top1 − top2, `max_j x̂_j²/D`, top-100 memory indices. All of
-it **per token** for every position (prompt and response) and every layer in
-`traces.h5`; the role mask separates prompt and response (every stop token
-excluded from the response). There is no features table: aggregation over
-tokens is analysis.
+to float32 at a time. With `p_t = softmax(β s_t)` for every β of an absolute
+log grid (`extraction.beta_grid_log10`: 10⁰…10⁴, 9 points) **plus β\* last**
+(`n_beta = 10`), the module stores, for every layer `l` and every position
+`t` (prompt and response; `role_mask` separates them downstream):
+
+| dataset | shape | dtype | β | definition |
+|---|---|---|---|---|
+| `energy` | `[L, T, n_beta]` | float16 | grid | `-(1/β)·logsumexp(β s)` |
+| `norm_entropy` | `[L, T, n_beta]` | float16 | grid | `H(p)/log D_ff` |
+| `topk_mass` | `[L, T, n_beta]` | float16 | grid | mass of the 10 largest `p` |
+| `mean_score` | `[L, T, n_beta]` | float16 | grid | `Σ p s` |
+| `var_score` | `[L, T, n_beta]` | float16 | grid | `Σ p (s − mean_score)²` |
+| `margin` | `[L, T]` | float16 | – | top1 − top2 of `s` |
+| `xhat_top1_frac` | `[L, T]` | float16 | – | `max_j x̂_j² / D` |
+| `topk_ids` | `[L, T, 100]` | int32 | – | indices of the 100 largest `s`, descending |
+| `js/<ref>` | `[L, T, n_beta]` | float16 | grid | `JS(p_t, p_ref)` (nats) |
+| `dkl/<ref>` | `[L, T, n_beta]` | float16 | grid | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+
+`<ref>` ∈ {`question_last`, `prompt_last`, `response_first`} (last question
+token, last prompt token, first response token). The row at a reference
+position is 0 for its own divergences; `response_first` datasets are NaN
+for an empty response. Everything is computed in float32 and stored as
+above; divergences in the log domain. There is no features table:
+aggregation over tokens is analysis.
 
 **Empty responses** (the model emits a stop token first) are valid samples,
 not failures: `empty_response = true`, traces computed, response-only
@@ -62,7 +76,7 @@ energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
     smoke.py             extract + merge on N questions in one process, summary
   verification/          never production outputs
     verify.py            checks vs the model and dev/reference.py
-    inspection.py        position/phase table of one id
+    inspection.py        position table and per-layer reference tables of one id
 configs/                 qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
 hpc/                     env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
                          merge, smoke, verify), missing_shards.sh
@@ -77,7 +91,7 @@ docs/                    ARCHITECTURE.md, overview.md, CHANGES_v0.2.md (change l
 ```bash
 micromamba activate hopfield-llm          # cluster env name (hpc/env.sh: MAMBA_ENV); local dev: energy-lab
 pip install -r requirements.txt && pip install -e ".[dev]"
-pytest                                    # CPU only, ~45 s
+pytest                                    # CPU only, ~55 s
 ```
 
 `requirements.txt` is the single pinned dependency set. transformers ≥ 4.56
@@ -353,21 +367,48 @@ unfinished — never use such a walltime for real runs.
 Then try the MIG profile once (`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …`)
 if it is wanted, and record its peak memory and seconds/question.
 
-## Outputs (`$SCRATCH_ROOT/energy_llm/runs/<model>/extract/<name>/`)
+## Outputs: the contract one cell delivers
+
+`$SCRATCH_ROOT/energy_llm/runs/<model>/`
+
+```
+calibration/
+  beta_star.json      beta*, calibration context, warm-up hash, bracket
+  bank.h5             gamma, ||w_tilde|| per layer, gamma diagnostic, fingerprint
+extract/<name>/
+  manifest.json       config + hash, beta*, commit, library versions, hardware,
+                      peak GPU memory per shard, dtype, checks, exhausted ids
+  answers.parquet     id, prompt, response, token ids, lengths, empty_response,
+                      truncated, stop_token_id, per-token logprob/entropy/logit,
+                      TF mismatches, xhat_norm_max_rel_dev
+  baselines.parquet   mean/min logprob, mean entropy, mean_neg_logit
+  traces.h5           /<id>/{energy, norm_entropy, topk_mass, mean_score, var_score,
+                             margin, xhat_top1_frac, topk_ids, js/<ref>, dkl/<ref>,
+                             role_mask}; attrs betas, reference_positions
+  hidden.h5           /<id>/{question_last, prompt_last, response_first, response_last}
+  bank.h5             copy of calibration/bank.h5
+```
+
+Six files per extraction. The analysis repository reads `manifest.json` for
+provenance, joins everything on `id`, and never needs the model.
 
 | File | Content |
 |---|---|
 | `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
 | `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches, `xhat_norm_max_rel_dev` |
-| `traces.h5` | `/<id>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` `[L, T, n_beta]` float16 (β\* last), `/<id>/{margin, xhat_top1_frac}` `[L, T]` float16, `/<id>/topk_ids` `[L, T, 100]` int32, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions`; attrs `betas`, `topk_mass_k`, `topk_ids_k`, `reference_names`; gzip, one chunk per layer |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy, `mean_neg_logit` (response tokens; NaN when empty) |
-| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 |
+| `traces.h5` | the datasets of "What is computed" per id, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions` (−1 = none); file attrs `betas` (β\* last), `topk_mass_k`, `topk_ids_k`, `reference_names`, `role_names`; gzip 4, one chunk per layer |
+| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 (`response_*` NaN when empty) |
 | `bank.h5` | γ and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
 
 Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.
 
 ## History
 
+- **v2.1.0 (v0.2 plan, `docs/CHANGES_v0.2.md`)**: per-token traces at an
+  absolute β grid + β\*, three reference positions, `topk_mass`,
+  `mean_score`, `var_score`, signed KL, `xhat_top1_frac`, top-100 ids, γ
+  diagnostic and smoke ablation, `token_logits` / `mean_neg_logit`.
 - **v0.2, step 0**: the features table (the long per-layer parquet, variants
   `mean`/`first`, Hellinger², top-k Jaccard) removed — aggregation over
   tokens is analysis; the per-token traces replace it (extended in step 4); `downstream/` and the thesis `.tex` removed

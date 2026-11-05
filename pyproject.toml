@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "energy_llm"
-version = "2.0.0"
+version = "2.1.0"
 description = "Extraction of Modern Hopfield retrieval metrics from the SwiGLU gate of LLMs."
 readme = "README.md"
 requires-python = ">=3.10"

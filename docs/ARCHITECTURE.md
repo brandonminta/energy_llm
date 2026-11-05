@@ -2,10 +2,10 @@
 
 > **What this document is.** A description of what the code in this
 > repository *actually does*, written from the source. The science it
-> serves is [`overview.md`](overview.md); where the code departs from the
-> thesis chapters (in Overleaf; removed from the repository after tag
-> `thesis-e1e3`) the departure is stated here as a fact about the code
-> (section 13 collects them all). Use it to decide what must change; it
+> serves is [`overview.md`](overview.md); where the code departs from it
+> (or from the older thesis chapters, in Overleaf; last in this repository
+> at tag `thesis-e1e3`) the departure is stated here as a fact about the
+> code (section 13 collects them all). Use it to decide what must change; it
 > does not say what *should* be.
 
 Contents
@@ -68,7 +68,7 @@ energy_llm/                 the installed package (CLI: energy-llm, python -m en
     smoke.py                extract + merge on N questions in one process, summary
   verification/             never a production output
     verify.py               checks vs the model and vs dev/reference.py, PASS/FAIL report
-    inspection.py           position/phase table of one id from a finished run
+    inspection.py           position table and per-layer reference tables of one id
 configs/                    qwen25_3b.yaml, llama32_3b.yaml (revisions pinned)
 hpc/                        env.sh (resources + helpers), submit.sh, *.sbatch,
                             missing_shards.sh, prefetch_models.sh
@@ -267,10 +267,8 @@ scores produce (hundreds or more) float32 probabilities underflow, which
 made the earlier p-domain JS stick at its log 2 clamp (fixed in commit
 `652fccc`; regression test
 `tests/test_metrics.py::test_divergences_survive_float32_underflow`).
-JS is used today only by `verify` (`self_divergence`); no output stores it.
-The six primitives above JS (v0.2 step 1) have naive float64 counterparts in
-`dev/reference.py`, compared in `tests/test_metrics.py`; they enter the
-outputs, and `verify`, with the per-token traces of step 4.
+Every primitive has a naive float64 counterpart in `dev/reference.py`
+(compared in `tests/test_metrics.py` and, through the traces, by `verify`).
 Squared Hellinger, top-k Jaccard and the mean-distribution helper were
 removed with the features table (v0.2, step 0).
 
@@ -605,7 +603,7 @@ Two hashes/contexts drive the guards:
 - The verification sequence on the cluster is in the README ("Verification
   on the cluster"). β\* values from `dev/` are verification-only.
 
-## 12. Tests (`tests/`, CPU only, ~45 s)
+## 12. Tests (`tests/`, CPU only, ~55 s)
 
 `conftest.py` builds tiny random Qwen2 and Llama models (3 layers, D=32,
 D_ff=48, non-trivial γ), word-level tokenizers with templates that mimic the
@@ -633,28 +631,31 @@ must override.
 Facts about the current code that a reader comparing it with the
 methodology, or deciding what to change next, should know.
 
-### 13.1 Code vs the thesis chapters
+### 13.1 Code vs `docs/overview.md`
 
-The chapters (`fundamentals-FINAL.tex`, `metodology-FINAL.tex`) live in
-Overleaf; their last version in this repository is at tag `thesis-e1e3`.
-The departures below were approved on 2026-10-26.
+The scientific specification is [`overview.md`](overview.md) (v0.2; its §3,
+§6 and §7 were aligned with the code in v0.2 step 7). Where the code still
+departs from it:
 
-| topic | `.tex` | code |
+| topic | `overview.md` | code |
 |---|---|---|
-| query / read point | `r = RMSNorm(x) = γ ⊙ x̂` (output of the second RMSNorm, `hook_target = mlp_input`) | residual `x` at the **input** of `post_attention_layernorm`; `x̂` recomputed in float32; γ folded into the bank |
-| bank rows | `A = W_gᵀ` rows, unit-normalised by `‖w_i‖` | `W̃ = W_g·diag(γ)`, normalised by `‖w̃_i‖` (never materialised) |
-| scores | `s_i = m̂_i · r = ‖r‖ cos θ_i` (query norm retained, no `1/√D`) | `s_i = (W̃_i·x̂)/(‖W̃_i‖√D)` ≈ cos θ_i ∈ [-1, 1] (query norm removed) |
-| energy | `-(1/β) lse(β s) + ½‖q‖² (+ c₀)` | `-(1/β) lse(β s)` only |
-| JS, Hellinger | mean over generated tokens of the per-token divergence to the reference | per-token `js` and signed `dkl` to three references (`question_last`, `prompt_last`, `response_first`) at every β; no mean over tokens (analysis); Hellinger removed |
-| response positions | all `T_g` generated tokens | generated tokens **excluding stop tokens** |
-| calibration positions | prefill reference position only, warm-up from the training split | last prompt token **+ response tokens**, warm-up JSONL disjoint from evaluation |
-| β grid / no bracket | approximately log grid; **clamp** to the closest endpoint and log it | `10^0…10^4`, 81 points; **fail** |
-| feature set | `φ_q = [ΔE ‖ ΔH̄ ‖ JS̄ ‖ Hel̄] ∈ R^{4L}`; `ΔH` (un-normalised) stored; `E_gen`, `H̄_gen` stored as diagnostics | **no features table**: per-token traces only; un-normalised `H` **not computed**; no `φ_q` assembled (that is analysis) |
-| prompt | fixed chat template with system turn | explicit single system instruction (`prompt.system`), Llama `date_string` fixed |
+| hooks (§5, Etapa 2) | output of `gate_proj` (`g`) and input of `mlp` (`r`) | one pre-hook on `post_attention_layernorm` (residual `x`); `x̂` and `s` recomputed in float32, γ folded into the bank; `g = ‖w̃‖√D·s` checked against the real `gate_proj` by `verify` (`gate`) |
+| bank storage (§5, Etapa 0.1) | `‖m_i‖` and `M̂` in float32 with a hash | `M̂` never materialised: γ and `‖w̃_i‖` in `bank.h5` with a fingerprint |
+| β\* (§5, Etapa 0.3) | 200 questions of a neutral corpus; `H̄* = 0.55` at the reference position | warm-up JSONL of any size, disjoint from evaluation; `H̄` averaged over **all layers** and over the last prompt token **+ response tokens**; log-β interpolation; fails if not bracketed |
+| reference `question_last` (§5, Etapa 2) | last *content* token of the question | last prompt token with role `question` (the role mask covers the whole question span, punctuation included) |
+| stored residuals (§7) | `r` and `h` at the three references | `x` (from which `r = γ ⊙ x̂`) at the three references **and** `response_last` |
+| TF vs generation (§8.1) | `‖Δr‖/‖r‖ < 10⁻³` | `verify: tf_vs_cache` on `x`: 1e-4 in float32, 5e-2 in bfloat16 (provisional, empirical; tokens must agree) |
+| extras (§6.2), `intervene` (§5) | optional | not implemented |
+| ablation (§6.3) | flag `drop_outlier_dims` | no flag; report-only ablation line in `smoke` (top-5 `|γ|` dims zeroed vs intact) |
+| response positions | generated tokens | generated tokens **excluding every stop token**; an empty response is a valid sample (NaN `*/response_first`) |
 | decoding | greedy | greedy with a **clean** generation config (Qwen's hub `repetition_penalty=1.05` removed); TF argmax checked |
-| precision / loading | bf16 on A100; 4-bit NF4 for local dev; bank cast to float32 on CPU; `banks.pt` | bf16 enforced; no quantisation path; bank never materialised, γ + row norms in `bank.h5` |
-| scope | banks → features → probe → stats in one package | extraction only; probe/stats in the analysis repository (legacy E1–E3 code at tag `thesis-e1e3`) |
-| extras not in the `.tex` | — | margin, `topk_mass`, `mean_score`, `var_score`, `xhat_top1_frac`, `topk_ids`, `dkl`, absolute β grid, three references, `hidden.h5`, token-level baselines, empty-response convention |
+| extras not in `overview.md` | — | `margin`, `xhat_top1_frac`, `mean_score` stored per token; `hidden.h5:response_last`; `answers.parquet: xhat_norm_max_rel_dev`; token-level baselines (`mean/min_logprob`, `mean_token_entropy`, `mean_neg_logit`) |
+
+The thesis chapters (`fundamentals-FINAL.tex`, `metodology-FINAL.tex`, in
+Overleaf; last in this repository at tag `thesis-e1e3`) predate both: query
+`r = γ⊙x̂` with its norm kept in the score, `E = lse + ½‖q‖²`, mean of
+per-token JS/Hellinger, β clamped when not bracketed, `banks.pt`, 4-bit
+loading — all superseded by `overview.md` and the code above.
 
 ### 13.2 Code vs code (internal)
 
@@ -690,12 +691,13 @@ The departures below were approved on 2026-10-26.
     consistent with "stop tokens are not response" but means `traces.h5`
     rows at those positions are indistinguishable from chat-template
     tokens without `answers.parquet`.
-11. **Un-normalised entropy `H` is recoverable** as `H̄ · log(D_ff)` but not
-    stored; `D_ff` is in `bank.h5` attrs and `manifest.json`.
+11. ~~Un-normalised entropy `H` is not stored~~ — **closed in v0.2**: `H̄`
+    is the specified quantity (`overview.md` §6.1); `H = H̄ · log(D_ff)` if
+    ever needed, with `D_ff` in `bank.h5` attrs and `manifest.json`.
 12. **`hidden_layers`** affects only `hidden.h5`; traces are always
     computed for every layer.
 
-### 13.3 Documentation (v0.2 step 0)
+### 13.3 Documentation (v0.2)
 
 - The former specification→code mapping document was folded: its
   departures table into 13.1, its spec→code table into section 5, its

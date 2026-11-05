@@ -37,13 +37,13 @@ Fuera de alcance (otros artículos): alineación de la actualización real con l
 
 Capa $l$ y posición $t$; se omite $(l)$ cuando no hay ambigüedad.
 
-- Punto de sonda: $r_t = \mathrm{RMSNorm}(\tilde h_t) = \hat x_t \odot \gamma$, con $\|\hat x_t\|_2 = \sqrt D$.
+- Punto de sonda: el residual $x_t$ a la entrada de la segunda RMSNorm (`post_attention_layernorm`); $\hat x_t = x_t/\sqrt{\mathrm{mean}(x_t^2)+\epsilon}$, con $\|\hat x_t\|_2 \approx \sqrt D$, y $r_t = \mathrm{RMSNorm}(x_t) = \hat x_t \odot \gamma$.
 - Sublayer: $\mathrm{FFN}(r) = \big(\mathrm{SiLU}(A r) \odot B r\big)^\top C$, con $A, B \in \mathbb R^{K\times D}$ (compuerta y rama lineal), $C \in \mathbb R^{K\times D}$.
-- Banco: $M = A$, filas $m_i$; banco normalizado $\hat M$, filas $\hat m_i = m_i/\|m_i\|$.
-- Pre-activaciones nativas: $g = A r$.
-- Scores: $s_i = g_i/(\|m_i\|\sqrt D) = \|r\|\cos\theta_i/\sqrt D$.
+- Banco: $\gamma$ se pliega en la compuerta, $\tilde W = A\,\mathrm{diag}(\gamma)$, filas $\tilde w_i$; banco normalizado con filas $\tilde w_i/\|\tilde w_i\|$ (nunca se materializa: se guardan $\gamma$ y $\|\tilde w_i\|$).
+- Pre-activaciones nativas: $g = A r = \tilde W \hat x$.
+- Scores (convención del código): $s_i = g_i/(\|\tilde w_i\|\sqrt D) = \cos(\tilde w_i, \hat x)\,\|\hat x\|/\sqrt D \approx \cos(\tilde w_i, \hat x) \in [-1, 1]$. La norma de la query sale del score; no hay término $E_{\mathrm{norm}}$ ($\tfrac12\|\hat x\|^2 \approx D/2$ es constante).
 - Distribución de recuperación: $p_i(\beta) = \mathrm{softmax}(\beta s)_i$.
-- Energía (Ramsauer et al. 2021), descompuesta: $E_{\mathrm{lse}} = -\tfrac1\beta\log\sum_i e^{\beta s_i}$, $E_{\mathrm{norm}} = \tfrac12\|r\|^2$.
+- Energía (Ramsauer et al. 2021): $E_{\mathrm{lse}} = -\tfrac1\beta\log\sum_i e^{\beta s_i}$, sin término cuadrático.
 - Termodinámica de la lectura: $\partial(\beta E_{\mathrm{lse}})/\partial\beta = -\langle s\rangle_\beta$ y $\partial^2(\beta E_{\mathrm{lse}})/\partial\beta^2 = -\mathrm{Var}_\beta(s)$.
 
 Tres niveles de correspondencia que el artículo declara: la compuerta como banco es una elección de modelado; el softmax es una lectura, no el mecanismo; no se ejecuta ninguna iteración de Hopfield.
@@ -116,25 +116,27 @@ Etiquetado, estratificación AH/UH, agregaciones sobre tokens y capas (media, ú
 
 ### 6.1 Núcleo (siempre se calcula)
 
-| Métrica | Definición | Para qué | $\beta$ |
-|---|---|---|---|
-| $E_{\mathrm{lse}}$ | $-\tfrac1\beta\log\sum_i e^{\beta s_i}$ | concentración (H1) | grilla |
-| $E_{\mathrm{norm}}$ | $\tfrac12\|r\|^2$ | confusor de magnitud, separado | no |
-| $\bar H$ | $H(p)/\log K$ | concentración (H1) | grilla |
-| masa top-10 | $\sum_{i\in\mathrm{top10}} p_i$ | compromiso (H1) | grilla |
-| $\mathrm{Var}_\beta(s)$ | $\sum_i p_i(s_i-\langle s\rangle)^2$ | competencia (H2) | grilla |
-| $D_{\mathrm{JS}}(p_t\|p_{\mathrm{ref}})$ | simétrica, acotada | desplazamiento entre fases (H1) | grilla |
-| $\Delta_{\mathrm{KL}}$ | $D_{\mathrm{KL}}(p_t\|p_{\mathrm{ref}}) - D_{\mathrm{KL}}(p_{\mathrm{ref}}\|p_t)$ | estrechamiento vs deriva (H1, H2) | grilla |
-| ids top-100 | índices de los 100 mayores $s_i$ | Jaccard frente a referencia y entre tokens consecutivos (H2), en análisis | no |
-| salida por token | logprob, entropía, logit del elegido | baselines | no |
+| Métrica | Definición | Para qué | $\beta$ | Dataset (`traces.h5`) |
+|---|---|---|---|---|
+| $E_{\mathrm{lse}}$ | $-\tfrac1\beta\log\sum_i e^{\beta s_i}$ | concentración (H1) | grilla | `energy` |
+| $\bar H$ | $H(p)/\log K$ | concentración (H1) | grilla | `norm_entropy` |
+| masa top-10 | $\sum_{i\in\mathrm{top10}} p_i$ | compromiso (H1) | grilla | `topk_mass` |
+| $\langle s\rangle_\beta$ | $\sum_i p_i s_i$ | primera derivada de $\beta E_{\mathrm{lse}}$ | grilla | `mean_score` |
+| $\mathrm{Var}_\beta(s)$ | $\sum_i p_i(s_i-\langle s\rangle)^2$ | competencia (H2) | grilla | `var_score` |
+| $D_{\mathrm{JS}}(p_t\|p_{\mathrm{ref}})$ | simétrica, acotada | desplazamiento entre fases (H1) | grilla | `js/<ref>` |
+| $\Delta_{\mathrm{KL}}$ | $D_{\mathrm{KL}}(p_t\|p_{\mathrm{ref}}) - D_{\mathrm{KL}}(p_{\mathrm{ref}}\|p_t)$ | estrechamiento vs deriva (H1, H2) | grilla | `dkl/<ref>` |
+| margen | $s_{(1)} - s_{(2)}$ | separación del ganador | no | `margin` |
+| fracción top-1 de $\hat x$ | $\max_j \hat x_j^2/D$ | activaciones masivas (diagnóstico) | no | `xhat_top1_frac` |
+| ids top-100 | índices de los 100 mayores $s_i$ | Jaccard frente a referencia y entre tokens consecutivos (H2), en análisis | no | `topk_ids` |
+| salida por token | logprob, entropía, logit del elegido | baselines | no | `answers.parquet`: `token_logprobs`, `token_entropies`, `token_logits`; `baselines.parquet` |
 
-Las comparativas se calculan frente a las tres referencias. Hellinger se elimina (redundante con JS; diferencia menor a 0,005 AUROC en los tres experimentos previos).
+`<ref>` ∈ {`question_last`, `prompt_last`, `response_first`}: último token de la pregunta, último token del prompt, primer token generado. Las comparativas se calculan frente a las tres referencias. Hellinger se elimina (redundante con JS; diferencia menor a 0,005 AUROC en los tres experimentos previos).
 
-### 6.2 Extras (`extras: false` por defecto)
+### 6.2 Extras (no implementados en v2.1.0)
 Energía nativa $E_{\mathrm{nat}}$ con $F(z)=z\,\mathrm{softplus}(z)+\mathrm{Li}_2(-e^z)$; razón de participación de los coeficientes nativos $a_i$; $\|\mathrm{FFN}(r)\|$ y cosenos de $\mathrm{FFN}(r)$ con $r$ y con $\bar m - r$; Spearman entre scores; distribución nula de la plantilla vacía. Requieren hooks adicionales (`up_proj`, salida de `mlp`).
 
 ### 6.3 Diagnóstico de dimensiones atípicas (piloto y ablación)
-Recalcular $s$ excluyendo las 5 dimensiones de mayor $|\gamma|$ por capa. Reportar la fracción de $\mathrm{Var}_i(s_i)$ atribuible a ellas y si cambia el signo de $\Delta\bar H$. Se ejecuta en el piloto y queda como bandera `drop_outlier_dims` para la ablación.
+Por capa, las 5 dimensiones de mayor $|\gamma|$ y la fracción de $\sum_i\|\tilde w_i\|^2$ que cargan (`bank.h5`, `manifest.json: gamma_diagnostic`). El `smoke` recalcula $\bar H$ con esas 5 entradas de $\gamma$ a cero y reporta, por tercio de capas, $\bar H(\text{respuesta}) - \bar H(\text{prompt\_last})$ intacto frente a ablacionado: si cambia el signo. Solo informe: no hay bandera de ablación en producción.
 
 ---
 
@@ -143,20 +145,20 @@ Recalcular $s$ excluyendo las 5 dimensiones de mayor $|\gamma|$ por capa. Report
 ```mermaid
 flowchart LR
     W[pesos A y gamma<br/>float32] --> N1[normalizar filas de A<br/>guardar normas y hash]
-    H[hooks r y g<br/>bfloat16] --> C1[upcast a float32]
-    C1 --> S[s = g / norma / sqrt D]
-    S --> P[softmax beta s<br/>grilla de 8 betas más beta*]
+    H[hook x en la entrada de<br/>post_attention_layernorm<br/>bfloat16] --> C1[upcast a float32<br/>x_hat = x / RMS]
+    C1 --> S[s = W_g · gamma x_hat / norma / sqrt D]
+    S --> P[softmax beta s<br/>grilla de 9 betas más beta*]
     P --> M1[escalares por capa y posición<br/>float16]
     S --> R[ids top-100 por capa y posición<br/>int32]
-    C1 --> V[r y h en las 3 referencias<br/>float16]
-    M1 & R & V --> F[HDF5 por pregunta<br/>meta: modelo, plantilla, semilla, hash, beta*, versión]
+    C1 --> V[x en las 3 referencias<br/>y en el último token de respuesta<br/>float16]
+    M1 & R & V --> F[HDF5 por pregunta<br/>traces.h5, hidden.h5; manifest.json]
 ```
 
 - Modelo en bfloat16; métricas en float32 tras upcast; almacenamiento float16 salvo ids.
-- Grilla de $\beta$: 8 valores log-espaciados entre 0,5 y 20, más $\beta^\star$. Toda métrica dependiente de $\beta$ se guarda para cada valor.
+- Grilla de $\beta$: 9 valores absolutos log-espaciados entre $10^0$ y $10^4$ (medias décadas; iguales para los dos modelos porque $s$ es un coseno), más $\beta^\star$ al final: $n_\beta = 10$. Toda métrica dependiente de $\beta$ se guarda para cada valor.
 - No se guardan vectores de scores completos ($K_l\times L\times T\times N$ supera los 40 GB). Los ids top-100 bastan para Jaccard e inspección cualitativa.
-- Esquema HDF5: `/meta`, `/tokens` (ids, logprob, entropía, logit), `/metrics/{nombre}` con forma $(L,T,n_\beta)$ o $(L,T)$, `/topk/ids` con forma $(L,T,100)$, `/ref/{contenido,plantilla,primero}/{r,h}` con forma $(L,D)$.
-- Coste (Qwen 3B, $L=36$, $T\approx 40$): menos de 1,5 MB por pregunta; 2.000 preguntas por celda, menos de 3 GB.
+- Esquema (`$SCRATCH_ROOT/energy_llm/runs/<modelo>/extract/<nombre>/`): `traces.h5` con `/<id>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` de forma $(L,T,n_\beta)$, `/<id>/{margin, xhat_top1_frac}` $(L,T)$, `/<id>/topk_ids` $(L,T,100)$ int32, `/<id>/role_mask` $(T)$ y atributos `betas`, `reference_positions`; `hidden.h5` con `/<id>/{question_last, prompt_last, response_first, response_last}` $(L,D)$; tokens, logprob, entropía y logit en `answers.parquet`; procedencia en `manifest.json`.
+- Coste (Qwen 3B, $L=36$, $T\approx 90$, $n_\beta = 10$): unos 2 MB por pregunta antes de gzip.
 
 ---
 

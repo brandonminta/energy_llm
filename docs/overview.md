@@ -99,13 +99,13 @@ El repositorio recibe solo identificador y pregunta. No conoce oro, juez ni etiq
 ### Etapa 0 (una vez por modelo)
 1. Extraer $A^{(l)}$ de los pesos congelados; guardar $\|m_i\|$ y $\hat M^{(l)}$ en float32 con hash.
 2. Diagnóstico de $\gamma$: las 5 dimensiones de mayor $|\gamma^{(l)}|$ por capa, guardadas en el manifiesto.
-3. $\beta^\star$: uno por modelo, calibrado en 200 preguntas de un corpus neutro ajeno a las condiciones, objetivo $\bar H^\star = 0{,}55$ en la posición de referencia, interpolación en $\log\beta$. Nunca por dataset ni por pregunta.
+3. $\beta^\star$: uno por modelo, calibrado en un warm-up disjunto de la evaluación (y ajeno a las condiciones), objetivo $\bar H^\star = 0{,}55$, con $\bar H$ promediada sobre todas las capas y sobre el último token del prompt y los tokens de la respuesta; interpolación en $\log\beta$ sobre una rejilla logarítmica; falla si no queda acotado (nunca se recorta). Nunca por dataset ni por pregunta.
 
 ### Etapa 1
 Plantilla de chat fija, greedy, tope de tokens fijo, semilla fija. Se guardan respuesta, ids del prompt y de la respuesta, y por token generado: logprob, entropía de salida, logit del token elegido.
 
 ### Etapa 2
-Un forward con teacher forcing sobre prompt + respuesta. Hooks: salida de `gate_proj` ($g$) y entrada de `mlp` ($r$). Por capa y posición se calculan las métricas de §6 y se descartan los vectores de tamaño $K_l$. Posiciones de referencia guardadas: último token de contenido de la pregunta, último token del prompt (token de plantilla), primer token generado.
+Un forward con teacher forcing sobre prompt + respuesta. Hooks: salida de `gate_proj` ($g$) y entrada de `mlp` ($r$). Por capa y posición se calculan las métricas de §6 y se descartan los vectores de tamaño $K_l$. Posiciones de referencia guardadas: último token con rol pregunta (puntuación incluida), último token del prompt (token de plantilla), primer token generado.
 
 ### Etapas 3 y 4 (fuera del repositorio)
 Etiquetado, estratificación AH/UH, agregaciones sobre tokens y capas (media, último, máximo, dispersión, pendiente, capa de compromiso, Jaccard entre tokens), probes, AUROC por estrato, sensibilidad a $\beta$ desde la grilla, ablaciones.

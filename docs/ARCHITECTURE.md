@@ -641,8 +641,6 @@ departs from it:
 |---|---|---|
 | hooks (§5, Etapa 2) | output of `gate_proj` (`g`) and input of `mlp` (`r`) | one pre-hook on `post_attention_layernorm` (residual `x`); `x̂` and `s` recomputed in float32, γ folded into the bank; `g = ‖w̃‖√D·s` checked against the real `gate_proj` by `verify` (`gate`) |
 | bank storage (§5, Etapa 0.1) | `‖m_i‖` and `M̂` in float32 with a hash | `M̂` never materialised: γ and `‖w̃_i‖` in `bank.h5` with a fingerprint |
-| β\* (§5, Etapa 0.3) | 200 questions of a neutral corpus; `H̄* = 0.55` at the reference position | warm-up JSONL of any size, disjoint from evaluation; `H̄` averaged over **all layers** and over the last prompt token **+ response tokens**; log-β interpolation; fails if not bracketed |
-| reference `question_last` (§5, Etapa 2) | last *content* token of the question | last prompt token with role `question` (the role mask covers the whole question span, punctuation included) |
 | stored residuals (§7) | `r` and `h` at the three references | `x` (from which `r = γ ⊙ x̂`) at the three references **and** `response_last` |
 | TF vs generation (§8.1) | `‖Δr‖/‖r‖ < 10⁻³` | `verify: tf_vs_cache` on `x`: 1e-4 in float32, 5e-2 in bfloat16 (provisional, empirical; tokens must agree) |
 | extras (§6.2), `intervene` (§5) | optional | not implemented |

@@ -70,7 +70,7 @@ submit_extract_array() {
     local dep=()
     [ -n "${5:-}" ] && dep=(--dependency="$5")
     mapfile -t acct < <(account_args)
-    sbatch --parsable "${acct[@]}" "${dep[@]}" --array="${4}%${MAX_CONCURRENT}" \
+    sbatch --parsable ${acct[@]+"${acct[@]}"} ${dep[@]+"${dep[@]}"} --array="${4}%${MAX_CONCURRENT}" \
         --partition="$PARTITION_GPU" --gres="$GRES" --cpus-per-task="$CPUS_GPU" \
         --mem="$MEM_EXTRACT" --time="$TIME_EXTRACT" --signal="B:USR1@$SIGNAL_LEAD_S" \
         hpc/extract_array.sbatch "$1" "$2" "$3"
@@ -81,7 +81,7 @@ submit_merge() {
     local dep=()
     [ -n "${4:-}" ] && dep=(--dependency="$4")
     mapfile -t acct < <(account_args)
-    sbatch --parsable "${acct[@]}" "${dep[@]}" --partition="$PARTITION_CPU" \
+    sbatch --parsable ${acct[@]+"${acct[@]}"} ${dep[@]+"${dep[@]}"} --partition="$PARTITION_CPU" \
         --cpus-per-task="$CPUS_MERGE" --mem="$MEM_MERGE" --time="$TIME_MERGE" \
         hpc/merge.sbatch "$1" "$2" "$3"
 }

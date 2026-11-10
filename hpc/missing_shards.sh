@@ -30,7 +30,7 @@ if [ -f "$LOG" ]; then
 fi
 
 # 1. cancel pending merges of earlier submissions
-for M in "${MERGES[@]}"; do
+for M in ${MERGES[@]+"${MERGES[@]}"}; do
     STATE=$(squeue -h -j "$M" -o "%T|%r" 2>/dev/null || true)
     if [[ "$STATE" == PENDING* ]]; then
         echo "cancelling pending merge $M (${STATE#*|})"
@@ -40,7 +40,7 @@ done
 
 # 2. active tasks of earlier arrays: never resubmit those shards
 ACTIVE_TASKS=(); ACTIVE_SHARDS=" "
-for A in "${ARRAYS[@]}"; do
+for A in ${ARRAYS[@]+"${ARRAYS[@]}"}; do
     while read -r JOBID STATE; do
         [ -z "${JOBID:-}" ] && continue
         TASK="${JOBID##*_}"
@@ -52,7 +52,7 @@ done
 
 TODO=()
 IFS=',' read -ra MISS <<< "$MISSING"
-for K in "${MISS[@]}"; do
+for K in ${MISS[@]+"${MISS[@]}"}; do
     [ -z "$K" ] && continue
     [[ "$ACTIVE_SHARDS" == *" $K "* ]] || TODO+=("$K")
 done
@@ -67,7 +67,7 @@ else
     SHARDS=""; ARRAY=""
     echo "no shard to relaunch"
 fi
-for T in "${ACTIVE_TASKS[@]}"; do DEPS="${DEPS:+$DEPS:}$T"; done
+for T in ${ACTIVE_TASKS[@]+"${ACTIVE_TASKS[@]}"}; do DEPS="${DEPS:+$DEPS:}$T"; done
 
 # 3. new merge
 MERGE=$(submit_merge "$CONFIG" "$INPUT" "$NAME" "${DEPS:+afterok:$DEPS}")

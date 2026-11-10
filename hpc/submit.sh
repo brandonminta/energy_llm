@@ -21,21 +21,21 @@ MODE="${1:?usage: submit.sh calibrate|smoke|verify|extract ...}"; shift
 case "$MODE" in
 calibrate)
     CONFIG="${1:?config}"; WARMUP="${2:?warmup.jsonl}"
-    JOB=$(sbatch --parsable "${ACCT[@]}" --partition="$PARTITION_GPU" --gres="$GRES" \
+    JOB=$(sbatch --parsable ${ACCT[@]+"${ACCT[@]}"} --partition="$PARTITION_GPU" --gres="$GRES" \
           --cpus-per-task="$CPUS_GPU" --mem="$MEM_CALIBRATE" --time="$TIME_CALIBRATE" \
           --signal="B:USR1@$SIGNAL_LEAD_S" hpc/calibrate.sbatch "$CONFIG" "$WARMUP")
     echo "calibrate -> job $JOB"
     ;;
 smoke)
     CONFIG="${1:?config}"; INPUT="${2:?input.jsonl}"; N="${3:-20}"
-    JOB=$(sbatch --parsable "${ACCT[@]}" --partition="$PARTITION_GPU" --gres="$GRES" \
+    JOB=$(sbatch --parsable ${ACCT[@]+"${ACCT[@]}"} --partition="$PARTITION_GPU" --gres="$GRES" \
           --cpus-per-task="$CPUS_GPU" --mem="$MEM_EXTRACT" --time="$TIME_SMOKE" \
           hpc/smoke.sbatch "$CONFIG" "$INPUT" "$N")
     echo "smoke -> job $JOB (logs/smoke_$JOB.out)"
     ;;
 verify)
     CONFIG="${1:?config}"; INPUT="${2:?input.jsonl}"; N="${3:-4}"
-    JOB=$(sbatch --parsable "${ACCT[@]}" --partition="$PARTITION_GPU" --gres="$GRES" \
+    JOB=$(sbatch --parsable ${ACCT[@]+"${ACCT[@]}"} --partition="$PARTITION_GPU" --gres="$GRES" \
           --cpus-per-task="$CPUS_GPU" --mem="$MEM_EXTRACT" --time="$TIME_VERIFY" \
           hpc/verify.sbatch "$CONFIG" "$INPUT" "$N")
     echo "verify -> job $JOB (logs/verify_$JOB.out)"

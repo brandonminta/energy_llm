@@ -87,5 +87,3 @@ mlruns/
 docs/*.html
 docs/*_files/
 
-# Project-specific AI guidance (not for public consumption)
-CLAUDE.md

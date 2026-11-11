@@ -26,7 +26,7 @@ import torch
 
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
-from energy_llm.core.bank import Bank, build_bank, gamma_diagnostic
+from energy_llm.core.bank import CONTROL, Bank, build_bank, gamma_diagnostic
 from energy_llm.core.capture import REFERENCES, ResidualHooks, forward_item
 from energy_llm.core.model import ModelBundle
 from energy_llm.core.prompting import ROLE_RESPONSE, build_prompt
@@ -270,8 +270,9 @@ def retrieval_diagnostics(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], 
                           "criteria": e["criteria"], "beta_l": beta_l[l]})
 
     hp_mean = float(np.mean(np.asarray(h_prompt))) if h_prompt else None
-    rgrid, rcurve = np.asarray(rec["beta_grid"]), np.asarray(rec["mean_norm_entropy_curve"])
-    i = int(np.searchsorted(rgrid, rec["beta_star"])) - 1
+    rv = rec["variants"][CONTROL]
+    rgrid, rcurve = np.asarray(rec["beta_grid"]), np.asarray(rv["mean_norm_entropy_curve"])
+    i = int(np.searchsorted(rgrid, rv["beta_star"])) - 1
     bracket = sorted([float(rcurve[i]), float(rcurve[i + 1])])
     return {
         "gamma_top_k": diag["k"],
@@ -316,7 +317,7 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
         "n_failed": len({r["id"] for r in failed}),
         "failures": [{"id": r["id"], "error": r["error"]} for r in failed],
         "model_dtype": bundle.dtype,
-        "beta_star": m["beta_star"],
+        "beta_star": m["beta_star"][CONTROL],      # per variant from C6
         "model_load_s": model_load_s,
         "sec_per_question": run.get("sec_per_item"),
         "peak_gpu_mem_gb": run.get("peak_gpu_mem_gb"),
@@ -345,7 +346,7 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
                     if pos >= 0:
                         xf[r].append(g["xhat_top1_frac"][:, pos])
 
-        diagnostics = retrieval_diagnostics(cfg, bundle, sel, list(ans["id"]), float(m["beta_star"]),
+        diagnostics = retrieval_diagnostics(cfg, bundle, sel, list(ans["id"]), float(m["beta_star"][CONTROL]),
                                             xf, h_prompt, var_p, var_r)
         summary |= {
             "tf_token_match_pct": 100.0 * (1 - n_mis / n_gen) if n_gen else None,

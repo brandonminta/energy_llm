@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from energy_llm.core import metrics
-from energy_llm.core.bank import Bank
+from energy_llm.core.bank import VARIANTS, Bank
 from energy_llm.core.model import ModelBundle, decoder_layers, ffn_norm
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, Prompt, PromptError
 
@@ -325,18 +325,22 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
 
 @torch.inference_mode()
 def norm_entropy_curve(bundle: ModelBundle, bank: Bank, trace: ForwardTrace,
-                       grid: list[float]) -> np.ndarray:
-    """Mean H_bar over layers and the calibration positions (last prompt
-    token + response tokens, stop tokens excluded) for every beta on the grid."""
+                       grid: list[float]) -> dict[str, np.ndarray]:
+    """Per score variant: mean H_bar over layers and the calibration positions
+    (last prompt token + response tokens, stop tokens excluded) for every beta
+    on the grid. One preactivation per layer serves both variants."""
     dims = bundle.dims
-    sel_idx = torch.tensor([trace.n_prompt - 1] + trace.response_positions, device=bank.device)
-    total = torch.zeros(len(grid), dtype=torch.float64)
+    sel = [trace.n_prompt - 1] + trace.response_positions
+    total = {v: torch.zeros(len(grid), dtype=torch.float64) for v in VARIANTS}
     for l in range(dims.n_layers):
-        _, s = _layer_scores(bank, trace.residuals[l], l, dims.rms_norm_eps)
-        s = s[sel_idx]
-        for i, beta in enumerate(grid):
-            total[i] += metrics.norm_entropy(metrics.log_distribution(s, beta)).mean().item()
-    curve = (total / dims.n_layers).numpy()
-    if not np.isfinite(curve).all():
+        x_hat = metrics.rms_normalise(trace.residuals[l][sel].to(bank.device), dims.rms_norm_eps)
+        z = bank.preactivation(l, x_hat)
+        for v in VARIANTS:
+            s = bank.from_preactivation(l, z, x_hat, v)
+            for i, beta in enumerate(grid):
+                total[v][i] += metrics.norm_entropy(metrics.log_distribution(s, beta)).mean().item()
+        del x_hat, z
+    curves = {v: (t / dims.n_layers).numpy() for v, t in total.items()}
+    if not all(np.isfinite(c).all() for c in curves.values()):
         raise NonFiniteError("non-finite calibration curve")
-    return curve
+    return curves

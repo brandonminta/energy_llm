@@ -30,7 +30,7 @@ import torch
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.bank import build_bank, read_bank_fingerprint
+from energy_llm.core.bank import CONTROL, VARIANTS, build_bank, read_bank_fingerprint
 from energy_llm.core.capture import REFERENCES, ItemResult, ResidualHooks, compute_item, forward_item
 from energy_llm.core.model import ModelBundle, release_cuda
 from energy_llm.core.prompting import build_prompt, check_template
@@ -58,12 +58,17 @@ def item_path(sdir: Path, item_id: str) -> Path:
 
 
 def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
-    """Read beta* and refuse it if it was calibrated under another context or
-    if any evaluation question is in the warm-up set."""
+    """Read the beta* record and refuse it if it lacks a beta* for any score
+    variant, was calibrated under another context, or if any evaluation
+    question is in the warm-up set."""
     path = cfg.beta_star_path
     if not path.exists():
         raise RuntimeError(f"{path} not found: run `energy-llm calibrate` first")
     rec = load_json(path)
+    missing = [v for v in VARIANTS if "beta_star" not in rec.get("variants", {}).get(v, {})]
+    if missing:
+        raise RuntimeError(f"{path} has no beta* for {missing}: re-run `energy-llm calibrate` "
+                           "in a new output_dir (one beta* per score variant)")
     if rec["context"] != json.loads(json.dumps(cfg.calibration_context())):
         raise RuntimeError(f"{path} was calibrated under a different model/prompt/generation config")
     warm_ids = set(rec["warmup_ids"])
@@ -193,7 +198,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
     sdir = shard_path(ext_dir, shard_index)
 
     beta_rec = load_beta_star(cfg, items)
-    beta_star = float(beta_rec["beta_star"])
+    beta_star = float(beta_rec["variants"][CONTROL]["beta_star"])   # both variants from C4
     _ensure_identity(sdir, {
         "shard_index": shard_index, "num_shards": len(shards),
         "ids": [it.id for it in work],

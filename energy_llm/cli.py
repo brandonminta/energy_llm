@@ -43,18 +43,23 @@ def _load(args):
 
 def cmd_calibrate(args) -> int:
     from energy_llm.config import load_config
-    from energy_llm.pipeline.calibrate import run_calibrate
+    from energy_llm.pipeline.calibrate import format_beta_stars, run_calibrate
+    from energy_llm.storage import load_json
 
     beta_path = load_config(args.config).beta_star_path
     if beta_path.exists():
+        rec = load_json(beta_path)
         print(f"beta* already calibrated: {beta_path}")
+        if "variants" in rec:
+            print(format_beta_stars(rec))
         return EXIT_DONE
     stopper = GracefulStop()
     cfg, items, bundle, _ = _load(args)
     rec = run_calibrate(cfg, bundle, items, args.input, stopper)
     if rec is None:
         return EXIT_PENDING
-    print(f"beta* = {rec['beta_star']:.6g}  ({cfg.beta_star_path})")
+    print(format_beta_stars(rec))
+    print(f"written to {cfg.beta_star_path}")
     return EXIT_DONE
 
 

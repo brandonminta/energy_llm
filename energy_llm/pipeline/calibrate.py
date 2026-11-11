@@ -1,12 +1,14 @@
 """beta* calibration on a warm-up JSONL disjoint from every evaluation set.
 
 For each warm-up question the full extraction forward runs (greedy +
-teacher forcing); for every beta on a log grid the normalised entropy is
-averaged over layers and over the calibration positions (last prompt token
-+ response tokens, stop tokens excluded). Questions are weighted equally.
-beta* is the log-linear interpolation where the mean curve crosses H_bar*.
-If the target is not bracketed by the grid, calibration fails (widen the
-grid) — beta* is never clamped.
+teacher forcing); for every beta on a log grid and for EACH score variant
+(cos_gamma_query, cos_gamma_key) the normalised entropy is averaged over
+layers and over the calibration positions (last prompt token + response
+tokens, stop tokens excluded). Questions are weighted equally. beta*_v is
+the log-linear interpolation where variant v's mean curve crosses H_bar*.
+If the target is not bracketed by the grid for either variant, calibration
+fails (widen the grid) — beta* is never clamped. A beta* within
+EDGE_DECADES of either end of the grid is flagged (``near_edge``) and logged.
 
 Resumable: each question's curve is its own atomic file; failures are
 retried up to ``extraction.max_attempts``. ``extract`` only reads
@@ -24,7 +26,9 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.bank import build_bank, gamma_diagnostic, read_bank_fingerprint, write_bank_h5
+from energy_llm.core.bank import (
+    PRIMARY, VARIANTS, build_bank, gamma_diagnostic, read_bank_fingerprint, write_bank_h5,
+)
 from energy_llm.core.capture import ResidualHooks, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, release_cuda
 from energy_llm.core.prompting import build_prompt, check_template
@@ -39,6 +43,35 @@ log = logging.getLogger("energy_llm.pipeline.calibrate")
 
 class CalibrationError(RuntimeError):
     pass
+
+
+EDGE_DECADES = 0.5     # beta* closer than this to an end of the calibration grid is flagged
+
+
+def grid_position(grid: list[float], beta_star: float) -> dict:
+    """Where beta* sits on the calibration grid: log10 beta*, the decades to
+    each end, the bracketing grid indices and whether it is near an edge."""
+    lb, lo, hi = math.log10(beta_star), math.log10(grid[0]), math.log10(grid[-1])
+    i = int(np.searchsorted(grid, beta_star)) - 1
+    return {"log10_beta_star": lb, "decades_from_min": lb - lo, "decades_from_max": hi - lb,
+            "bracket_indices": [i, i + 1],
+            "near_edge": min(lb - lo, hi - lb) < EDGE_DECADES}
+
+
+def format_beta_stars(rec: dict) -> str:
+    """One line per variant: beta*, its position on the calibration grid and a
+    WARNING when it is within EDGE_DECADES of an end."""
+    grid = rec["beta_grid"]
+    lines = [f"calibration grid beta in [{grid[0]:.4g}, {grid[-1]:.4g}] "
+             f"(log10 {math.log10(grid[0]):.2f} .. {math.log10(grid[-1]):.2f}), "
+             f"target H_bar* = {rec['target_norm_entropy']}"]
+    for v, r in rec["variants"].items():
+        p = r["grid_position"]
+        lines.append(f"  beta*[{v}]{' (primary)' if v == rec.get('primary') else ''} = {r['beta_star']:.6g}"
+                     f"   log10 {p['log10_beta_star']:.3f}: {p['decades_from_min']:.2f} decades above "
+                     f"the min, {p['decades_from_max']:.2f} below the max"
+                     + (f"   WARNING: within {EDGE_DECADES} decades of the grid edge" if p["near_edge"] else ""))
+    return "\n".join(lines)
 
 
 def interpolate_log_beta(grid: list[float], curve: np.ndarray, target: float) -> float:
@@ -86,7 +119,7 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     stopper = stopper or GracefulStop(install=False)
     if cfg.beta_star_path.exists():
         rec = load_json(cfg.beta_star_path)
-        log.info("beta* already calibrated: %.6g (%s)", rec["beta_star"], cfg.beta_star_path)
+        log.info("beta* already calibrated: %s", cfg.beta_star_path)
         return rec
 
     cal = cfg.calibration_dir
@@ -123,9 +156,9 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
                 prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question,
                                       cfg.prompt.date_string)
                 trace = forward_item(bundle, hooks, prompt)
-                curve = norm_entropy_curve(bundle, bank, trace, grid)
+                curves = norm_entropy_curve(bundle, bank, trace, grid)
                 write_json_atomic(path, {
-                    "id": it.id, "curve": curve.tolist(),
+                    "id": it.id, "curves": {v: c.tolist() for v, c in curves.items()},
                     "n_positions": 1 + len(trace.response_positions),
                 })
                 del trace
@@ -147,15 +180,23 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     if not done:
         raise CalibrationError("every warm-up question failed")
 
-    curves = np.stack([np.asarray(load_json(p)["curve"]) for p in done.values()])
-    mean_curve = curves.mean(axis=0)
-    beta_star = interpolate_log_beta(grid, mean_curve, cfg.calibration.target_norm_entropy)
+    per_q = [load_json(p)["curves"] for p in done.values()]
+    target = cfg.calibration.target_norm_entropy
+    variants = {}
+    for v in VARIANTS:
+        mean_curve = np.stack([np.asarray(c[v]) for c in per_q]).mean(axis=0)
+        try:
+            b = interpolate_log_beta(grid, mean_curve, target)
+        except CalibrationError as exc:
+            raise CalibrationError(f"{v}: {exc}") from None
+        variants[v] = {"beta_star": b, "mean_norm_entropy_curve": mean_curve.tolist(),
+                       "grid_position": grid_position(grid, b)}
     by_id = {it.id: it for it in items}
     record = {
-        "beta_star": beta_star,
-        "target_norm_entropy": cfg.calibration.target_norm_entropy,
+        "primary": PRIMARY,
+        "variants": variants,
+        "target_norm_entropy": target,
         "beta_grid": grid,
-        "mean_norm_entropy_curve": mean_curve.tolist(),
         "n_questions": len(done),
         "failed_ids": sorted(set(by_id) - set(done)),
         "warmup_ids": sorted(done),
@@ -169,7 +210,9 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     write_json_atomic(cfg.beta_star_path, record)
-    log.info("beta* = %.6g written to %s", beta_star, cfg.beta_star_path)
+    for line in format_beta_stars(record).splitlines():
+        (log.warning if "WARNING" in line else log.info)("%s", line)
+    log.info("beta* written to %s", cfg.beta_star_path)
     return record
 
 

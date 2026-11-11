@@ -52,7 +52,8 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
     stop = a["stop_token_id"]
     stop = "none" if stop is None or (isinstance(stop, float) and np.isnan(stop)) else int(stop)
 
-    out = [f"id {item_id}   beta*={manifest['beta_star']:.6g}   prompt tokens {n_p}, "
+    b_star = "  ".join(f"{v}={b:.6g}" for v, b in manifest["beta_star"].items())
+    out = [f"id {item_id}   beta* {b_star}   prompt tokens {n_p}, "
            f"generated {int(a['n_generated_tokens'])}, response {int(a['n_response_tokens'])}, "
            f"empty_response={bool(a['empty_response'])}, truncated={bool(a['truncated'])}, "
            f"stop_token_id={stop}",

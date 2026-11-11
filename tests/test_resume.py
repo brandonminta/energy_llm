@@ -78,15 +78,17 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
     assert "gold" not in ans.to_json() and "category" not in ans.columns
     with h5py.File(d / "traces.h5") as f:
         assert set(f.keys()) == {it.id for it in items}
-        assert f.attrs["beta_star"] == rec["beta_star"]
-        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["beta_star"])
+        b_ctrl = rec["variants"]["cos_gamma_key"]["beta_star"]
+        assert f.attrs["beta_star"] == b_ctrl
+        assert f.attrs["betas"].tolist() == cfg.extraction.betas(b_ctrl)
         g = f[items[0].id]
         assert g["energy"].shape[-1] == 10 and g["energy"].dtype == np.float16
         assert g["topk_ids"].dtype == np.int32 and g["js/question_last"].dtype == np.float16
     with h5py.File(d / "hidden.h5") as f:
         assert set(f[items[0].id]) == {"question_last", "prompt_last", "response_first", "response_last"}
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
-    assert m["beta_star"] == rec["beta_star"] and m["model_dtype"] == ["float32"]
+    assert m["beta_star"] == {v: r["beta_star"] for v, r in rec["variants"].items()}
+    assert m["model_dtype"] == ["float32"]
     g = m["gamma_diagnostic"]
     assert g["k"] == 5 and len(g["fraction"]) == bundle.dims.n_layers
     assert all(0.0 <= f <= 1.0 for f in g["fraction"])
@@ -109,7 +111,7 @@ def test_merge_of_two_shards(calibrated):
     assert list(ans.index) == ids
     with h5py.File(d / "traces.h5") as f:
         assert list(f) == sorted(ids)
-        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["beta_star"])
+        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["variants"]["cos_gamma_key"]["beta_star"])
         assert (f.attrs["topk_mass_k"], f.attrs["topk_ids_k"]) == (4, 8)
         assert list(f.attrs["reference_names"]) == list(REFERENCES)
         worst = dict.fromkeys(REFERENCES, 0.0)
@@ -292,7 +294,7 @@ def test_smoke_summary(calibrated, capsys):
     cfg, bundle, ev, rec = calibrated
     s = run_smoke(cfg, bundle, read_items(ev), n=5, name="smoke-test")
     assert s["n_questions"] == 5 and s["n_completed"] == 5 and s["n_failed"] == 0
-    assert s["model_dtype"] == "float32" and s["beta_star"] == rec["beta_star"]
+    assert s["model_dtype"] == "float32" and s["beta_star"] == rec["variants"]["cos_gamma_key"]["beta_star"]
     assert s["tf_token_match_pct"] == 100.0 and s["tf_exact_answers_pct"] == 100.0
     assert s["sec_per_question"] > 0 and s["peak_gpu_mem_gb"] is None   # CPU
     assert len(s["mean_norm_entropy_per_layer"]["prompt"]) == bundle.dims.n_layers
@@ -318,7 +320,7 @@ def test_smoke_summary(calibrated, capsys):
     assert s["bands_excluding_layer0"][1:] == s["bands"][1:]
     # re-matched beta: the ablated bank's mean H_bar(prompt_last) returns to the intact value
     ab = s["ablation_betas"]
-    assert ab["beta_matched"]["intact"] == rec["beta_star"]
+    assert ab["beta_matched"]["intact"] == rec["variants"]["cos_gamma_key"]["beta_star"]
     for k in ("top_gamma_zeroed", "dstar_zeroed"):
         bm = ab["beta_matched"][k]
         assert bm is None or bm > 0

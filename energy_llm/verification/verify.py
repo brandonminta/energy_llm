@@ -39,7 +39,7 @@ import torch
 
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
-from energy_llm.core.bank import Bank, build_bank
+from energy_llm.core.bank import CONTROL, Bank, build_bank
 from energy_llm.core.capture import REFERENCES, ResidualHooks, compute_item, forward_item, norm_entropy_curve
 from energy_llm.core.model import ModelBundle, decoder_layers, ffn_norm
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, build_prompt
@@ -652,7 +652,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     started = time.time()
     reference = load_reference()
     beta_rec = load_beta_star(cfg, items)
-    beta_star = float(beta_rec["beta_star"])
+    beta_star = float(beta_rec["variants"][CONTROL]["beta_star"])   # both variants from C5
     betas = cfg.extraction.betas(beta_star)
     k_mass, k_ids = cfg.extraction.topk_mass_k, cfg.extraction.topk_ids_k
     L = bundle.dims.n_layers
@@ -916,8 +916,9 @@ def _calibration_check(cfg: RunConfig, bundle: ModelBundle, bank: Bank, rec: dic
     path = Path(rec.get("input_path", ""))
     if not path.exists() or sha256_file(path) != rec["input_sha256"]:
         return Check("calibration", "SKIP", None, None, {"reason": f"warm-up file {path} not available"})
-    grid, curve = np.asarray(rec["beta_grid"]), np.asarray(rec["mean_norm_entropy_curve"])
-    i = int(np.searchsorted(grid, rec["beta_star"])) - 1
+    rv = rec["variants"][CONTROL]
+    grid, curve = np.asarray(rec["beta_grid"]), np.asarray(rv["mean_norm_entropy_curve"])
+    i = int(np.searchsorted(grid, rv["beta_star"])) - 1
     hi, lo = float(curve[i]), float(curve[i + 1])
     hooks = ResidualHooks(bundle.model)
     vals = []
@@ -927,7 +928,7 @@ def _calibration_check(cfg: RunConfig, bundle: ModelBundle, bank: Bank, rec: dic
                 continue
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            vals.append(float(norm_entropy_curve(bundle, bank, trace, [rec["beta_star"]])[0]))
+            vals.append(float(norm_entropy_curve(bundle, bank, trace, [rv["beta_star"]])[CONTROL][0]))
     finally:
         hooks.remove()
     h = float(np.mean(vals))

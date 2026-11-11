@@ -24,6 +24,7 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
+from energy_llm.core.bank import CONTROL
 from energy_llm.core.capture import REFERENCES
 from energy_llm.core.prompting import ROLE_NAMES
 from energy_llm.pipeline.extract import (
@@ -118,7 +119,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
         with h5py.File(t_tmp, "w") as tf, h5py.File(h_tmp, "w") as hf:
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
             tf.attrs["role_names"] = [ROLE_NAMES[k] for k in sorted(ROLE_NAMES)]
-            tf.attrs["beta_star"] = float(beta_rec["beta_star"])
+            tf.attrs["beta_star"] = float(beta_rec["variants"][CONTROL]["beta_star"])   # per variant from C4
             tf.attrs["reference_names"] = list(REFERENCES)
             tf.attrs["layout"] = ("per token: energy, norm_entropy, topk_mass, mean_score, var_score, "
                                   "js/<ref>, dkl/<ref>: [L, T, n_beta] float16 (betas, beta* last); "
@@ -173,10 +174,12 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "config": cfg.to_dict(),
         "config_sha256": cfg.sha256(),
-        "beta_star": beta_rec["beta_star"],
+        "beta_star": {v: r["beta_star"] for v, r in beta_rec["variants"].items()},
         "calibration": {k: beta_rec[k] for k in (
-            "beta_star", "target_norm_entropy", "n_questions", "input_sha256",
-            "bank_fingerprint", "code", "created")},
+            "primary", "target_norm_entropy", "beta_grid", "n_questions", "input_sha256",
+            "bank_fingerprint", "code", "created")} | {
+            "variants": {v: {"beta_star": r["beta_star"], "grid_position": r["grid_position"]}
+                         for v, r in beta_rec["variants"].items()}},
         "input": {"path": str(input_path), "sha256": sha256_file(input_path),
                   "n_items": len(items)},
         "counts": {"completed": len(order), "exhausted": sum(len(s.exhausted) for s in states),

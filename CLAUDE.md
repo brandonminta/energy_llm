@@ -38,8 +38,9 @@ pytest                             # CPU only, ~55 s; tiny random Qwen2 + Llama 
 micromamba run -n energy-lab python -m pytest -q
 ```
 
-Run the tests after every change; 148 pass + 1 skipped (real tokenizers,
-opt-in) is the baseline (v2.1.0 + step 9).
+Run the tests after every change; with a CUDA device 155 pass + 1 skipped
+(real tokenizers, opt-in) is the baseline (v2.1.0 + step 9); without CUDA,
+147 pass + 9 skipped (`test_gpu.py`, `test_gpu_verify.py`).
 
 ## CLI and layout
 

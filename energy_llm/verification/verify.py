@@ -183,7 +183,7 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, la
     eps = bundle.dims.rms_norm_eps
     ds = 0.0
     for l in layers:
-        s = bank.scores(l, metrics.rms_normalise(trace.residuals[l], eps)).double().cpu().numpy()
+        s = bank.scores(l, metrics.rms_normalise(trace.residuals[l].to(bank.device), eps)).double().cpu().numpy()
         ds = max(ds, float(np.abs(s - np.asarray(ref["scores"][l])).max()))
     s_range = max(float(np.ptp(np.asarray(ref["scores"][l]), axis=-1).max()) for l in layers)
     tol_s = score_tolerance(bundle.dims.d_model)
@@ -267,7 +267,7 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[float, float, fl
     eps, d = bundle.dims.rms_norm_eps, bundle.dims.d_model
     err = ctrl = 0.0
     for l in range(bundle.dims.n_layers):
-        x_hat = metrics.rms_normalise(cap.x[l][0], eps)
+        x_hat = metrics.rms_normalise(cap.x[l][0].to(bank.device), eps)
         s = bank.scores(l, x_hat)
         g_rec = s * bank.row_norms[l] * math.sqrt(d)
         g = cap.g[l]
@@ -281,10 +281,18 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[float, float, fl
     return err, ctrl, tol
 
 
+def cpu64(t: torch.Tensor) -> torch.Tensor:
+    """Convention of every comparison between computation paths (tf, cache,
+    fp32): both operands go to CPU float64 inside the comparing helper, never
+    in the caller, so operands kept on different devices (CPU-saved residuals
+    vs live GPU tensors) cannot meet in one op."""
+    return t.detach().to("cpu", torch.float64)
+
+
 def rel_err(a: torch.Tensor, b: torch.Tensor) -> np.ndarray:
-    """Per row ||a - b|| / ||b||, float32."""
-    a, b = a.float(), b.float()
-    return ((a - b).norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-30)).cpu().numpy()
+    """Per row ||a - b|| / ||b||, on CPU in float64 (cpu64)."""
+    a, b = cpu64(a), cpu64(b)
+    return ((a - b).norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-30)).numpy()
 
 
 def dist_stats(v) -> dict:
@@ -304,14 +312,19 @@ PROPAGATED = {"norm_entropy": "norm_entropy", "energy": "energy", "js": "js/ques
 def propagate(bank: Bank, eps: float, l: int, x_a: torch.Tensor, x_b: torch.Tensor,
               beta: float) -> dict[str, np.ndarray]:
     """Per position at one beta: |H_bar(a) - H_bar(b)|, |E(a) - E(b)| and
-    JS(p_a, p_b), with p = softmax(beta s) from the residuals x_a, x_b of layer l."""
-    s_a = bank.scores(l, metrics.rms_normalise(x_a.to(bank.device), eps))
-    s_b = bank.scores(l, metrics.rms_normalise(x_b.to(bank.device), eps))
-    la, lb = metrics.log_distribution(s_a, beta), metrics.log_distribution(s_b, beta)
-    out = {"norm_entropy": (metrics.norm_entropy(la) - metrics.norm_entropy(lb)).abs(),
-           "energy": (metrics.energy(s_a, beta) - metrics.energy(s_b, beta)).abs(),
+    JS(p_a, p_b), with p = softmax(beta s) from the residuals x_a, x_b of layer l.
+    Each path's scores and log p are computed as in production (float32 on the
+    bank device); the comparison (differences, JS) runs on CPU in float64 (cpu64)."""
+    side = []
+    for x in (x_a, x_b):
+        s = bank.scores(l, metrics.rms_normalise(x.to(bank.device), eps))
+        lp = metrics.log_distribution(s, beta)
+        side.append((cpu64(metrics.norm_entropy(lp)), cpu64(metrics.energy(s, beta)), cpu64(lp)))
+        del s, lp
+    (h_a, e_a, la), (h_b, e_b, lb) = side
+    out = {"norm_entropy": (h_a - h_b).abs(), "energy": (e_a - e_b).abs(),
            "js": metrics.js_divergence(la, lb)}
-    return {k: v.cpu().numpy() for k, v in out.items()}
+    return {k: v.numpy() for k, v in out.items()}
 
 
 def noise_to_signal(noise: dict, signal: dict) -> dict:
@@ -731,7 +744,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                 "role_mask_response_exact": list(np.flatnonzero(roles == ROLE_RESPONSE)) == indep_resp,
                 "last_prompt_position_not_response": roles[n_p - 1] != ROLE_RESPONSE,
             }
-            logit_diff = (tf_logits - info["first_step_logits"]).abs().max().item()
+            logit_diff = (cpu64(tf_logits) - cpu64(info["first_step_logits"])).abs().max().item()
             acc["align"].append((all(align.values()), align, logit_diff))
 
             # (d) hidden = the x the metrics read; files = in-memory values
@@ -778,7 +791,8 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             sel_pos = torch.tensor([n_p - 1] + trace.response_positions, device=bank.device)
             lim_worst, mono_worst, self_worst = 0.0, 0.0, 0.0
             for l in range(L):
-                s = bank.scores(l, metrics.rms_normalise(trace.residuals[l], bundle.dims.rms_norm_eps))
+                s = bank.scores(l, metrics.rms_normalise(trace.residuals[l].to(bank.device),
+                                                         bundle.dims.rms_norm_eps))
                 s0 = s[n_p - 1]
                 h0 = metrics.norm_entropy(metrics.log_distribution(s0, 1e-8)).item()
                 m0 = metrics.margin(s0).item()

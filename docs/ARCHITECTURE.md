@@ -547,6 +547,15 @@ median s per item` (a 2 h target inside the 3 h walltime).
 
 Verification checks (none is part of the production path):
 
+Device convention: every comparison between computation paths (TF, cached
+generation, float32 reference) runs on CPU in float64. The comparing helper
+moves both operands itself (`verify.cpu64`, used by `rel_err`, `propagate` and
+the alignment logit difference), never the caller: saved residuals live on CPU
+while live ones stay on the model device. `propagate` computes each path's
+scores and log p as in production (float32 on the bank device) and only the
+differences and JS in CPU float64. Score computations move their input to
+`bank.device` before `Bank.scores`.
+
 | check | implementation | tolerance and justification |
 |---|---|---|
 | `reference`: every per-token trace == independent float64 reference, at every β and reference position | `dev/reference.py` (explicit loops, no `energy_llm` imports; `reference_item` returns the traces of 5.8 and the reference positions, `question_last` passed in from the role mask); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); every trace by a first-order bound on the observed score error δ at each β (`reference_tolerances`): E δ; margin 2δ; H̄ 2βδ; `mean_score` 2βδ·range(s) + δ; `var_score` 2βδ·range(s) + 2δ·range(s); `topk_mass` max(k, 2)·βδ; JS 4βδ; `dkl` 2βδ·A + 8βδ with A = Σp\|log p − log q\| + Σq\|log q − log p\| computed per element from the reference scores; `xhat_top1_frac` within the score tolerance; plus a float32 floor 1e-5·max(1, \|value\|) per element; `topk_ids` as sets, row Jaccard ≥ 0.98 (near-ties at the k-th score); NaN patterns and reference positions equal |
@@ -666,6 +675,7 @@ must override.
 | `test_reference.py` | every production trace == `dev/reference.py` within the derived tolerances on the grid {1, 10², 10⁴, β\*} at three β\*; reference positions equal; empty response (NaN `*/response_first`); negative control (no γ) fails |
 | `test_verify.py` | all checks PASS on the tiny models (`fp32_reference` INFO); options recorded; `noise_to_signal` ratios; `fp32_reference` loads a separate instance and restores the matmul precision; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (each reference position marked once; five per-layer tables with the four columns) |
 | `test_gpu.py` | (skipped without CUDA) GPU == CPU within float32, peak memory recorded |
+| `test_gpu_verify.py` | (skipped without CUDA) `verify` (all checks PASS, `fp32_reference` INFO) and the smoke diagnostics on the tiny models on CUDA; `fp32_reference` with a separate instance on the device and CPU-saved residuals; `rel_err` / `propagate` accept operands on different devices and return float64 (regression: job 33013) |
 | `test_real_tokenizer.py` | (opt-in via `ENERGY_LLM_TOKENIZER_DIRS`) prompt ids equal the official template, role mask exact |
 
 ## 13. Audit: inconsistencies and open points

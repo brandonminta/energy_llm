@@ -168,6 +168,16 @@ def score_tolerance(d_model: int) -> float:
     return d_model * UNIT_ROUNDOFF["float32"]
 
 
+def divergence_scale(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
+    """A = sum p |log p - log q| + sum q |log q - log p| per row: the sum of
+    the absolute terms of KL(p||q) and KL(q||p), i.e. the condition scale of
+    dkl = KL(p||q) - KL(q||p). dkl is a difference of two KLs of up to
+    hundreds of nats at large beta, so its absolute rounding error scales
+    with A, not with |dkl| (ill-conditioned at high beta)."""
+    d = (logp - logq).abs()
+    return (logp.exp() * d).sum(dim=-1) + (logq.exp() * d).sum(dim=-1)
+
+
 def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, layers: list[int],
                            betas: list[float], k_mass: int) -> dict:
     eps = bundle.dims.rms_norm_eps
@@ -182,15 +192,12 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, la
     T = len(ref["scores"][layers[0]])
     dkl_tol = {r: np.zeros((len(layers), T, len(betas))) for r in REFERENCES}
     for li, l in enumerate(layers):
-        sc = np.asarray(ref["scores"][l], dtype=np.float64)
+        sc = torch.as_tensor(np.asarray(ref["scores"][l], dtype=np.float64))
         for bi, b in enumerate(betas):
-            z = b * sc
-            lp = z - (z.max(1, keepdims=True) + np.log(np.exp(z - z.max(1, keepdims=True)).sum(1, keepdims=True)))
-            p = np.exp(lp)
+            lp = torch.log_softmax(b * sc, dim=-1)
             for r, pos in ref["reference_positions"].items():
                 if pos is not None:
-                    d = np.abs(lp - lp[pos])
-                    a = (p * d).sum(1) + (p[pos] * d).sum(1)
+                    a = divergence_scale(lp, lp[pos]).numpy()
                     dkl_tol[r][li, :, bi] = 2 * b * ds * a + tols[bi][f"dkl/{r}"]
     ratio, nan_ok, per = 0.0, True, {}
     for name, r in ref["traces"].items():
@@ -454,6 +461,144 @@ class PermutedBank(Bank):
         return s / (self.row_norms[l] * math.sqrt(self.d_model))
 
 
+# Safety factor of the permutation tolerances: each term of a reduction also
+# carries a few roundings of its own (exp, product, difference: <= 3u, small
+# against ceil(log2 D_ff) u = 14u at D_ff = 11008) plus second-order terms.
+PERM_C = 2.0
+
+
+def gamma_shuffled_bank(base: Bank, seed: int = 1) -> Bank:
+    """Negative control: gamma permuted over the D input dims WITHOUT permuting
+    W_g. The memories change, so the permutation tolerances must be exceeded."""
+    g = torch.Generator().manual_seed(seed)
+    return Bank(gate_weights=base.gate_weights,
+                gamma=[gm[torch.randperm(gm.shape[0], generator=g).to(gm.device)] for gm in base.gamma],
+                row_norms=base.row_norms, d_model=base.d_model)
+
+
+@torch.inference_mode()
+def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank", trace, prod,
+                           betas: list[float], k_mass: int, c: float = PERM_C) -> dict[str, np.ndarray]:
+    """Per-element tolerance of every float trace under a permutation of the
+    memories (derivation: ARCHITECTURE section 13.5). The scores are the same
+    numbers in another order; what changes is the order of every reduction over
+    D_ff. Assumed: tree (pairwise) reductions, as torch does on CPU (cascade)
+    and CUDA (tree), so a sum of n terms is off by <= g_n sum|terms| with
+    g_n = ceil(log2 D_ff) u32 (first order). Quantities:
+      delta  = g_n + u (1 + log D_ff): a priori bound on the shift of every
+               log p_i = (z_i - max z) - log S, S = sum exp(z - max z) in
+               [1, D_ff] (log_softmax subtracts the max first, so the shift does
+               not grow with |lse|): g_n from the order of the sum S, u log D_ff
+               from rounding log S, u from the final subtraction's carry;
+      eps_i  <= u |log p_i|: once lse moves, each log p_i = beta s_i - lse is
+               rounded on its own (NOT a uniform shift), bounded with
+               Lambda_t = beta range_t(s) + log D_ff >= max_i |log p_i|;
+      H      = entropy in nats (= sum p |log p|), A = divergence_scale(p_t, p_ref),
+               A2 = sum p |log p| |d| + sum q |log q| |d| (d = log p - log q): the
+               exact weight of the per-element roundings in the divergences;
+      J      = sum p |log(p/m)| + sum q |log(q/m)|: sum of the absolute JS terms;
+      ds     = max |s_perm - s[perm]| (0 when the matmul is permutation-exact)
+               feeds the Lipschitz terms of reference_tolerances.
+    Then, times c (PERM_C), plus the Lipschitz terms and a floor u32 (the
+    float16 storage resolution near 0):
+      energy        delta/beta + 2u|E|          (lse = max + log S, rounded at |lse|)
+      norm_entropy  (delta (1+H) + u H (1+Lambda) + g_n H) / log D_ff
+      mean_score    delta + u H + g_n           (sum p|s| <= 1)
+      var_score     (delta + u Lambda + g_n) var   (centred form, nonnegative terms)
+      topk_mass     (delta + u Lambda + g_n) mass
+      js/<ref>      (delta_t + delta_r) 2 JS + u (H_t + H_r)(1 + ln2) + u A + u A2 + g_n J
+                    (a uniform shift of d = log p - log q cancels at first order,
+                    p sigmoid(-d) = q sigmoid(d) = pq/(p+q); a uniform rescaling
+                    of p multiplies the signed sum KL(p||m) <= 2 JS)
+      dkl/<ref>     (delta_t + delta_r)(2 + A) + u (2 H_t + 2 H_r + A)
+                    + u A2 + g_n A        (+ 2 beta ds A)
+      margin        2 ds;   xhat_top1_frac 0 (independent of the bank).
+    dkl is the worst-conditioned trace: its terms add up to A (hundreds of
+    nats at beta ~ 1e4) while |dkl| can be small."""
+    dims = bundle.dims
+    L, eps, logd = dims.n_layers, dims.rms_norm_eps, math.log(dims.d_ff)
+    u = UNIT_ROUNDOFF["float32"]
+    gn = math.ceil(math.log2(dims.d_ff)) * u
+    tr, refs = prod.traces, prod.reference_positions
+    T, nb = tr["energy"].shape[1], len(betas)
+    b = np.asarray(betas, dtype=np.float64)[None, None, :]
+    delta = gn + u * (1 + logd)
+    A = {r: np.full((L, T, nb), np.nan) for r in REFERENCES}
+    A2 = {r: np.full((L, T, nb), np.nan) for r in REFERENCES}
+    J = {r: np.full((L, T, nb), np.nan) for r in REFERENCES}
+    ds, srange, srow = np.zeros(L), np.zeros(L), np.zeros((L, T))
+    for l in range(L):
+        x_hat = metrics.rms_normalise(trace.residuals[l].to(bank.device), eps)
+        s, sp = bank.scores(l, x_hat), pbank.scores(l, x_hat)
+        ds[l] = (sp - s[:, pbank.perm[l]]).abs().max().item()
+        srow[l] = (s.max(-1).values - s.min(-1).values).cpu().numpy()
+        srange[l] = srow[l].max()
+        for bi, beta in enumerate(betas):
+            lp = metrics.log_distribution(s, beta)
+            for r, pos in refs.items():
+                if pos is not None:
+                    A[r][l, :, bi] = divergence_scale(lp, lp[pos]).cpu().numpy()
+                    d = (lp - lp[pos]).abs()
+                    A2[r][l, :, bi] = ((lp.exp() * lp.abs() * d).sum(-1)
+                                       + (lp[pos].exp() * lp[pos].abs() * d).sum(-1)).cpu().numpy()
+                    sd = lp - lp[pos]
+                    sp_ = torch.nn.functional.softplus
+                    J[r][l, :, bi] = ((lp.exp() * (metrics.LN2 - sp_(-sd)).abs()).sum(-1)
+                                      + (lp[pos].exp() * (metrics.LN2 - sp_(sd)).abs()).sum(-1)).cpu().numpy()
+        del x_hat, s, sp
+    lip = {}
+    for name in ("energy", "norm_entropy", "mean_score", "var_score", "topk_mass", "js", "dkl"):
+        key = name if name not in ("js", "dkl") else f"{name}/{REFERENCES[0]}"
+        lip[name] = np.asarray([[reference_tolerances(ds[l], bt, srange[l], k_mass, dims.d_model)[key]
+                                 for bt in betas] for l in range(L)])[:, None, :]
+    f64 = {k: v.astype(np.float64) for k, v in tr.items() if k != "topk_ids"}
+    E, H = f64["energy"], f64["norm_entropy"] * logd
+    lam = b * srow[:, :, None] + logd                       # >= max_i |log p_i|
+    tol = {
+        "energy": c * (delta / b + 2 * u * np.abs(E)) + lip["energy"],
+        "norm_entropy": c * (delta * (1 + H) + u * H * (1 + lam) + gn * H) / logd + lip["norm_entropy"],
+        "mean_score": c * (delta + u * H + gn) + lip["mean_score"],
+        "var_score": c * (delta + u * lam + gn) * f64["var_score"] + lip["var_score"],
+        "topk_mass": c * (delta + u * lam + gn) * f64["topk_mass"] + lip["topk_mass"],
+        "margin": np.broadcast_to(2 * ds[:, None], (L, T)).copy(),
+        "xhat_top1_frac": np.zeros((L, T)),
+    }
+    for r, pos in refs.items():
+        if pos is None:
+            tol[f"js/{r}"] = tol[f"dkl/{r}"] = np.full((L, T, nb), np.nan)
+            continue
+        dd = 2 * delta
+        hh = H + H[:, pos:pos + 1, :]
+        a, a2, l2 = A[r], A2[r], metrics.LN2
+        js = f64[f"js/{r}"]
+        tol[f"js/{r}"] = c * (dd * 2 * js + u * hh * (1 + l2) + u * a + u * a2 + gn * J[r]) + lip["js"]
+        tol[f"dkl/{r}"] = (c * (dd * (2 + a) + u * (2 * hh + a) + u * a2 + gn * a) + lip["dkl"]
+                           + 2 * b * ds[:, None, None] * a)
+    return {k: v + u for k, v in tol.items()}
+
+
+def trace_ratios(a: dict, b: dict, tol: dict, betas: list[float]) -> dict:
+    """Per float trace: max |a - b|, max |a - b| / tol and where (layer,
+    position, beta) the ratio peaks; plus the overall worst."""
+    per, worst = {}, {"ratio": 0.0}
+    for k, t in tol.items():
+        x, y = a[k].astype(np.float64), b[k].astype(np.float64)
+        err = np.abs(x - y)
+        m = np.isfinite(err) & np.isfinite(t)
+        if not m.any():
+            continue
+        q = np.where(m, err / t, -np.inf)
+        idx = np.unravel_index(int(np.argmax(q)), q.shape)
+        at = {"layer": int(idx[0]), "position": int(idx[1])}
+        if len(idx) == 3:
+            at["beta"] = float(betas[idx[2]])
+        per[k] = {"max_error": float(err[m].max()), "max_ratio": float(q[idx]), "at": at,
+                  "tolerance_at_max": float(t[idx])}
+        if per[k]["max_ratio"] > worst["ratio"]:
+            worst = {"ratio": per[k]["max_ratio"], "trace": k} | at
+    return {"traces": per, "worst": worst}
+
+
 # ----------------------------------------------------------------------
 # Driver
 # ----------------------------------------------------------------------
@@ -613,18 +758,20 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                                  and np.array_equal(f_tr["role_mask"], prod.role_mask)))
             acc["det_tokens"].append(list(f_ans["generated_token_ids"]) == trace.gen_ids)
 
-            # invariance under permutation of the memories
+            # invariance under permutation of the memories, per-trace tolerances
+            # from float32 reduction bounds; negative control: gamma shuffled
             if qi == 0:
                 pbank = PermutedBank(bank)
                 pres = compute_item(bundle, pbank, trace, it.id, betas, hidden_layers, k_mass, k_ids)
-                # Summation-order error is relative to the magnitude (dkl reaches
-                # hundreds at beta ~ 1e4): error measured as |a - b| / max(1, |b|)
-                perm_err = max(_nan_aware_max_diff(pres.traces[k_] / np.maximum(1.0, np.abs(v)),
-                                                   v / np.maximum(1.0, np.abs(v)))[0]
-                               for k_, v in prod.traces.items() if k_ != "topk_ids")
+                ptol = permutation_tolerances(bundle, bank, pbank, trace, prod, betas, k_mass)
+                perm = trace_ratios(pres.traces, prod.traces, ptol, betas)
+                cres = compute_item(bundle, gamma_shuffled_bank(bank), trace, it.id, betas,
+                                    hidden_layers, k_mass, k_ids)
+                ctrl = trace_ratios(cres.traces, prod.traces, ptol, betas)
                 # topk_ids are memory indices: permuted index j is original perm[j]
                 mapped = np.stack([pbank.perm[l].cpu().numpy()[pres.traces["topk_ids"][l]] for l in range(L)])
-                acc["perm"].append((perm_err, _topk_jaccard(mapped, prod.traces["topk_ids"])))
+                acc["perm"].append((perm, ctrl, _topk_jaccard(mapped, prod.traces["topk_ids"])))
+                del pres, cres, ptol
 
             # limits, monotonicity, self-divergence on real scores
             grid = cfg.calibration.beta_grid()
@@ -664,6 +811,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     del saved
 
     self_tol = self_divergence_tolerance(bundle.dims.d_ff)
+    perm, ctrl, perm_jac = acc["perm"][0]
     checks = [
         Check("reference", _status(all(ok for _, ok in acc["reference"])),
               max(r for r, _ in acc["reference"]), 1.0,
@@ -705,13 +853,18 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
               max(e for e, _ in acc["files"]), det_tol,
               {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation, in float16 ulps; "
                          "topk_ids exact on CPU, row Jaccard >= 0.98 on GPU"}),
-        Check("permutation", _status(max(e for e, _ in acc["perm"]) <= F32_FLOOR
-                                     and min(j for _, j in acc["perm"]) >= TOPK_MIN_JACCARD),
-              max(e for e, _ in acc["perm"]), F32_FLOOR,
-              {"metric": "max |change| / max(1, |value|) of every float trace "
-                         "(float32 summation order)",
-               "topk_ids_min_row_jaccard": min(j for _, j in acc["perm"]),
-               "topk_ids_required": TOPK_MIN_JACCARD}),
+        Check("permutation", _status(perm["worst"]["ratio"] <= 1.0 and ctrl["worst"]["ratio"] > 1.0
+                                     and perm_jac >= TOPK_MIN_JACCARD),
+              perm["worst"]["ratio"], 1.0,
+              {"metric": "max over traces and elements of |change| / tolerance; per-trace tolerances "
+                         "from float32 reduction bounds (permutation_tolerances)",
+               "reduction_model": "tree (pairwise): ceil(log2 D_ff) * u32 per reduction over D_ff",
+               "c": PERM_C, "worst": perm["worst"], "per_trace": perm["traces"],
+               "negative_control": {"what": "gamma permuted over D without permuting W_g; must exceed 1",
+                                    "worst": ctrl["worst"],
+                                    "per_trace_max_ratio": {k: v["max_ratio"]
+                                                            for k, v in ctrl["traces"].items()}},
+               "topk_ids_min_row_jaccard": perm_jac, "topk_ids_required": TOPK_MIN_JACCARD}),
         Check("limits", _status(max(acc["limits"]) <= F32_FLOOR), max(acc["limits"]), F32_FLOOR,
               {"metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
                          "|E + max s| - log(D_ff)/beta, var_score and 1 - topk_mass at beta=50/margin"}),

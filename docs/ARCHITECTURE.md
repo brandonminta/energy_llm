@@ -524,7 +524,7 @@ Verification checks (none is part of the production path):
 | `alignment`: last prompt position emits the first token; response = generated non-stop tokens | `verify.run_verify` | exact (booleans) |
 | `hidden`: residuals at the four positions, derived independently (roles, stop tokens) | `verify.run_verify` | exact |
 | `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | in float16 ulps: 0 on CPU, ≤ 1 on GPU (a float32 difference of a recomputation can flip the last float16 bit); `topk_ids` exact on CPU, row Jaccard ≥ 0.98 on GPU |
-| `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | `|Δ| / max(1, |value|)` ≤ 1e-5 (float32 summation order is relative to the magnitude; `dkl` reaches hundreds at β ~ 10⁴); `topk_ids` mapped through the permutation, row Jaccard ≥ 0.98 |
+| `permutation`: permuting memories changes nothing | `verify.PermutedBank`, `permutation_tolerances`, `trace_ratios`, `gamma_shuffled_bank`; `tests/test_invariance.py` | per trace and element, tolerance from float32 reduction bounds over D_ff (tree reduction, `g_n = ⌈log₂ D_ff⌉·u₃₂`, safety factor c = 2; derivation in §13.5); PASS if every `|Δ|/tol ≤ 1`, the **negative control** (γ permuted over D without permuting `W_g`) exceeds 1, and `topk_ids` mapped through the permutation have row Jaccard ≥ 0.98. Reported: per trace max error, max ratio and where (layer, position, β); the overall worst; the control's ratios |
 | `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| expected exactly 0 (pointwise forms); tolerance `4·u₃₂·log D_ff` (`self_divergence_tolerance`, 2.2e-6 at D_ff = 11008) |
 | `calibration`: H̄(β\*) on the warm-up set | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values |
 | `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, ≤ 1 float16 ulp on GPU |
@@ -714,6 +714,56 @@ loading — all superseded by `overview.md` and the code above.
   (report only) instead of a production flag.
 - `verification/verify.py: _Capture` is a second hook implementation; the
   alignment check recomputes response positions from scratch.
+
+### 13.5 Permutation tolerances (v0.2 step 9)
+
+Pilot (Qwen2.5-3B, bf16 model, float32 metrics): the former global criterion
+`|Δ|/max(1,|value|) ≤ 1e-5` failed at exactly 2⁻¹⁵ = 3.05e-5, on `dkl`:
+`dkl = KL(p‖q) − KL(q‖p)` (overview §6.1, unchanged) subtracts two KLs of up
+to hundreds of nats at large β; one float32 ulp of a value in [256, 512) is
+2⁻¹⁵, so its absolute error scales with `A = Σp|log p − log q| + Σq|log q −
+log p|`, not with `|dkl|`. **`dkl` is ill-conditioned at high β**; the
+definition stays, the tolerance follows its conditioning. `verify` reports
+the β at which the permutation maximum falls.
+
+Derivation (`verify.permutation_tolerances`). Permuting the memories gives
+the same scores in another order (observed `ds = max|s_perm − s[perm]|` = 0
+on CPU; if not, the Lipschitz terms of `reference_tolerances` in `ds` are
+added). What changes is the order of every reduction over D_ff. Assumed:
+**tree (pairwise) reduction** — torch's CPU cascade sum and CUDA tree
+reductions — so a sum of n terms is off by ≤ `g_n Σ|terms|`,
+`g_n = ⌈log₂ D_ff⌉·u₃₂` (14·u at D_ff = 11008), first order. Error sources:
+
+- `log_softmax` subtracts the max, then `log S`, `S = Σ exp(z − max) ∈ [1, D_ff]`:
+  a shift of every `log p_i` by at most `δ = g_n + u(1 + log D_ff)`,
+  independent of `|lse|`;
+- each `log p_i` is then rounded on its own, `ε_i ≤ u|log p_i|`; their
+  weights are computed exactly from the data: `H = Σp|log p|`,
+  `A₂ = Σp|log p||d| + Σq|log q||d|` (`d = log p − log q`),
+  `J = Σp|log(p/m)| + Σq|log(q/m)|`, and `Λ = β·range(s) + log D_ff ≥ max|log p_i|`
+  where no exact weight is cheap.
+
+Tolerances (× c = 2: each term's own roundings — exp, product, difference,
+≤ 3u — and second-order terms; plus a floor u₃₂, the float16 storage
+resolution near 0):
+
+| trace | tolerance / c |
+|---|---|
+| `energy` | `δ/β + 2u\|E\|` |
+| `norm_entropy` | `(δ(1+H) + uH(1+Λ) + g_n H) / log D_ff` |
+| `mean_score` | `δ + uH + g_n` |
+| `var_score` | `(δ + uΛ + g_n)·var` (centred form, non-negative terms) |
+| `topk_mass` | `(δ + uΛ + g_n)·mass` |
+| `js/<ref>` | `2δ·2JS + u(H_t + H_r)(1 + ln2) + uA + uA₂ + g_n J` — a uniform shift of `d` cancels at first order (`pσ(−d) = qσ(d)`); a uniform rescaling of p multiplies the signed `KL(p‖m) ≤ 2JS` |
+| `dkl/<ref>` | `2δ(2 + A) + u(2H_t + 2H_r + A) + uA₂ + g_n A` (+ `2β·ds·A`) |
+| `margin` | `2·ds` (0 when exact) |
+| `xhat_top1_frac` | 0 (does not involve the bank) |
+
+Tightness on the tiny test models (D_ff = 48; c = 2): observed / tolerance
+peaks at 0.1–0.3 for `energy`, `H̄`, `mean_score`, `var_score`, `topk_mass`
+and `dkl`, 0.02–0.2 for `js` (worst-case bounds on terms of mixed sign);
+the γ-shuffled control exceeds the tolerances by ≥ 10⁸. `verify_report.json`
+gives the same ratios per trace on the real model.
 
 ## 14. Glossary
 

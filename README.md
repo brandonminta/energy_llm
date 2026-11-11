@@ -301,7 +301,7 @@ full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
 | `fp32_reference` | how far the bf16 residuals (TF and cached) are from a float32 forward on the same tokens | INFO only: per-layer x distances and the same propagated ratios; loads a second, float32 instance (~12 GB) and frees it; TF32 off during the check. `--no-fp32-reference` skips it |
 | `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
 | `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
-| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket |
+| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket; `permutation`: per-trace ratios ≤ 1, negative control > 1, β of the max (`dkl` is ill-conditioned at high β, ARCHITECTURE §13.5) |
 
 If `tf_vs_cache` fails while tokens are equal, compare its ratios with
 `fp32_reference`: if the TF and cached residuals are equally far from float32,

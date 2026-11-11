@@ -10,7 +10,8 @@ from energy_llm.core import metrics
 from energy_llm.core.bank import build_bank
 from energy_llm.core.capture import ResidualHooks, compute_item, forward_item
 from energy_llm.core.prompting import build_prompt
-from energy_llm.verification.verify import PermutedBank
+from energy_llm.verification.verify import (PermutedBank, gamma_shuffled_bank, permutation_tolerances,
+                                             trace_ratios)
 from tests.conftest import DATE, SYSTEM, make_bundle
 
 Q = "what is the capital of france"
@@ -45,6 +46,26 @@ def test_permuting_memories_changes_nothing(setup):
             np.testing.assert_array_equal(pbank.perm[0][b.traces[name][0]].numpy(), arr[0])
         else:
             np.testing.assert_allclose(b.traces[name], arr, atol=1e-5, rtol=0, err_msg=name)
+
+
+def test_permutation_within_derived_tolerances_and_gamma_control_fails(setup):
+    """Per-trace tolerances from float32 reduction bounds: the true permutation
+    stays within them (and not by orders of magnitude for the noisy traces);
+    shuffling gamma without permuting W_g must exceed them."""
+    bundle, bank, tr = setup
+    L = list(range(bundle.dims.n_layers))
+    betas = [1.0, 31.6, 72.776, 1e4]
+    a = compute_item(bundle, bank, tr, "x", betas, L, 4, 8)
+    pbank = PermutedBank(bank, seed=3)
+    b = compute_item(bundle, pbank, tr, "x", betas, L, 4, 8)
+    tol = permutation_tolerances(bundle, bank, pbank, tr, a, betas, 4)
+    assert set(tol) == set(a.traces) - {"topk_ids"}
+    r = trace_ratios(b.traces, a.traces, tol, betas)
+    assert 0 < r["worst"]["ratio"] <= 1.0, r["worst"]
+    assert r["worst"]["beta"] in betas
+    assert r["traces"]["dkl/question_last"]["max_ratio"] > 1e-3      # not loose by orders
+    ctrl = compute_item(bundle, gamma_shuffled_bank(bank), tr, "x", betas, L, 4, 8)
+    assert trace_ratios(ctrl.traces, a.traces, tol, betas)["worst"]["ratio"] > 1e3
 
 
 def test_beta_limits(setup):

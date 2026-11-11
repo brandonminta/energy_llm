@@ -142,6 +142,22 @@ def test_var_score_limits():
     assert metrics.mean_score(lp_inf, s).item() == pytest.approx(s.max().item(), abs=1e-6)
 
 
+def test_var_score_is_centred():
+    """var_score = sum p (s - mean)^2, not E[s^2] - mean^2: with scores packed
+    near 0.9 (variance ~1e-8) the raw-moment form cancels catastrophically in
+    float32, the centred form matches float64."""
+    g = torch.Generator().manual_seed(5)
+    s = 0.9 + 1e-4 * torch.randn(K, generator=g)
+    lp = metrics.log_distribution(s, 1.0)
+    s64, lp64 = s.double(), torch.log_softmax(s.double(), dim=-1)
+    p64 = lp64.exp()
+    ref = (p64 * (s64 - (p64 * s64).sum()) ** 2).sum().item()
+    assert metrics.var_score(lp, s).item() == pytest.approx(ref, rel=1e-3)
+    p = lp.exp()
+    raw = ((p * s * s).sum() - (p * s).sum() ** 2).item()
+    assert abs(raw - ref) > 10 * abs(metrics.var_score(lp, s).item() - ref)
+
+
 def test_topk_mass_limits():
     _, s = _dist(9)
     b_inf = 50.0 / metrics.margin(s).item()

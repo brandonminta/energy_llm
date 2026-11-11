@@ -44,6 +44,11 @@ def test_verify_all_pass_on_tiny_models(run):
     for row in tf["per_layer"]:
         assert set(row) == {"layer", "norm_entropy", "energy", "js"}
         assert row["norm_entropy"]["sigma"] > 0
+    pm = checks["permutation"]["detail"]
+    assert pm["c"] == 2.0 and "tree" in pm["reduction_model"]
+    assert set(pm["worst"]) >= {"ratio", "trace", "layer", "position"}
+    assert pm["negative_control"]["worst"]["ratio"] > 1.0
+    assert all(set(v) == {"max_error", "max_ratio", "at", "tolerance_at_max"} for v in pm["per_trace"].values())
     fp = checks["fp32_reference"]["detail"]
     assert fp["separate_fp32_instance"] is False          # tiny models are float32
     assert fp["precision"]["cuda_matmul_allow_tf32"] is False

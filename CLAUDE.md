@@ -38,8 +38,8 @@ pytest                             # CPU only, ~55 s; tiny random Qwen2 + Llama 
 micromamba run -n energy-lab python -m pytest -q
 ```
 
-Run the tests after every change; 130 pass + 1 skipped (real tokenizers,
-opt-in) is the baseline (v2.1.0).
+Run the tests after every change; 148 pass + 1 skipped (real tokenizers,
+opt-in) is the baseline (v2.1.0 + step 9).
 
 ## CLI and layout
 
@@ -84,7 +84,8 @@ pinned). `output_dir` uses `${SCRATCH_ROOT}`, which is mandatory.
   float32.
 - Divergences (JS, KL) and topk_mass are computed from LOG-probabilities.
   Never reintroduce p-domain versions (float32 underflow at large beta; old
-  bug). Hellinger and Jaccard were removed (Jaccard of topk_ids is analysis).
+  bug). JS is pointwise in d = log p - log q (ln2 = softplus(0), xlogy
+  masking) so JS(p,p) and KL(p||p) are exactly 0. Hellinger and Jaccard were removed (Jaccard of topk_ids is analysis).
 - No features table: aggregation over tokens is analysis, not extraction.
   Per-token traces per layer (never mix layers) over every position at
   every beta; `role_mask` separates prompt and response. Response =
@@ -96,7 +97,8 @@ pinned). `output_dir` uses `${SCRATCH_ROOT}`, which is mandatory.
   ("Answer the question briefly and directly."), no few-shot; Llama
   `date_string` fixed. Greedy with a clean generation config (Qwen's hub
   repetition_penalty=1.05 must never leak in); teacher-forced argmax is
-  checked against greedy and mismatches recorded.
+  checked against greedy and mismatches recorded (with top1-top2 logit
+  margins; smoke criterion: every disagreement has margin < delta).
 - dtype: model must load as bfloat16 (fail otherwise); actual dtype recorded.
   transformers >= 4.56.
 - Extraction betas: absolute log grid `extraction.beta_grid_log10`

@@ -216,9 +216,12 @@ joins everything on `id`, and never needs the model.
 
 ## Pilot (HPC, after Step 7)
 
-1. `energy-llm verify` on `dev/dev_questions.jsonl`: all checks PASS.
+1. `energy-llm verify` on `dev/dev_questions.jsonl`: all checks PASS
+   (`tf_vs_cache`, `permutation`, `self_divergence`: **revised after the
+   pilot**, Step 9).
 2. `hpc/submit.sh smoke configs/qwen25_3b.yaml data/<pilot>.jsonl 50`
-   with the real warm-up beta*. Read, in order: TF == greedy 100 %;
+   with the real warm-up beta*. Read, in order: TF == greedy 100 %
+   (**revised after the pilot**, Step 9: every disagreement with margin < δ);
    `xhat_norm_max_rel_dev < 1e-3`; mean `H_bar` at beta* on
    `prompt_last` within 0.55 ± 0.05.
 3. `xhat_top1_frac` at `prompt_last`: median above 0.5 in any band means
@@ -229,6 +232,50 @@ joins everything on `id`, and never needs the model.
    a magnitude artefact; it is then reported as such and the analysis
    uses `question_last` and middle/late layers.
 5. Paste the smoke summary into `docs/pilot_<date>.md`.
+
+## Step 9: numerics, diagnostics and reports after the pilot
+
+Pilot (Qwen2.5-3B, bf16, A100, β\* = 72.776, jobs 32879/32880): `verify` FAIL on `tf_vs_cache` (max ‖x_cache − x_tf‖/‖x_tf‖ = 0.0907,
+tol 0.05 provisional, tokens equal), `permutation` (3.05e-5 = 2⁻¹⁵, tol 1e-5,
+Jaccard 1.0) and `self_divergence` (3.27e-7, tol 1e-7); `alignment` step-0
+logit difference 0.375. `smoke` (24 questions): TF == greedy on 99.64 % of
+tokens and 95.8 % of answers (one divergent token); mean H̄(prompt_last)
+≈ 0.598, outside the calibration bracket [0.474, 0.574]; `xhat_top1_frac`
+≈ 0.35 at question_last and prompt_last in layers 12–35; layer 0 H̄ = 0.95
+dominates the ΔH̄ of band 0–11. No change to `beta_grid_log10`, to the
+definitions of the metrics, or to SLURM resources. One commit per task.
+
+| task | change | file(s) |
+|---|---|---|
+| T2 | JS pointwise in `d = log p − log q` (`ln2 = softplus(0)`): `JS(p,p) = 0` exactly; terms with `p_i = 0` / `q_i = 0` masked (xlogy). KL already from one `log_softmax`: `KL(p‖p) = 0` exactly. `self_divergence` tolerance `4·u₃₂·log D_ff` | `core/metrics.py`, `verify.py` |
+| T1 | `tf_vs_cache`: per-layer x error distribution and location of its max; error propagated to H̄, E, JS at β\*; PASS = tokens equal and p99/σ_ℓ ≤ 0.1 (`--tf-max-noise-ratio`), max/σ apart. New `fp32_reference` (INFO, `--no-fp32-reference`): separate float32 instance, TF32 off, freed after. CLI options recorded in `verify_report.json` | `verify.py`, `cli.py`, `core/model.py` (`load_model(dtype=)`) |
+| T3 | `permutation`: per-trace tolerances from float32 tree-reduction bounds (c = 2; ARCHITECTURE §13.5), location (trace, layer, position, β) of the max, γ-shuffled negative control; `dkl` (unchanged, = KL(p‖q) − KL(q‖p) as in overview §6.1) documented as ill-conditioned at high β; `var_score` confirmed centred (test) | `verify.py` |
+| T4 | per generated step `max\|logit_gen − logit_tf\|`; at each mismatch top1−top2 margins in TF and generation; `answers.parquet`: `tf_exact`, `tf_mismatch_{tf_tokens,margin_tf,margin_gen,top_logit}`, `tf_logit_diff`, `tf_logit_diff_max`, `tf_logit_diff_step0`; smoke list of disagreements and criterion "all margins < δ" | `core/capture.py`, `smoke.py` |
+| T5 | smoke (report only): criteria 3 and 4 per layer and per band, also without layer 0; outlier dim d\* per layer; ablations (top-5 γ, d\*) at β\* and at the re-matched β; β_ℓ per layer with H̄_ℓ = 0.55; H̄(prompt_last) vs 0.55 ± 0.05 and the calibration bracket | `smoke.py` |
+| T6 | `hpc/pilot_bundle.sh <verify_jobid> <smoke_jobid>` (login node, bash 4.2, no Python packages): sacct, logs and the reports of the runs of THOSE jobs | `hpc/pilot_bundle.sh`, `smoke.py` (report path line) |
+| T7 | this section; ARCHITECTURE §13.1, §13.5, §13.6; overview §8.1 and new §8.6 | docs |
+
+Criteria **revised after the pilot** (overview §8, README):
+
+- §8.1 TF vs generation: was `‖Δr‖/‖r‖ < 10⁻³` (and `‖Δx‖/‖x‖ ≤ 5e-2` in
+  `verify`). Now noise/signal of the traces ≤ 0.1. Reason: in bf16 the
+  residual differs by up to 9 % with identical tokens; the question is
+  whether that moves the stored metrics relative to their spread between
+  questions.
+- Pilot step 2 / new §8.6 TF == greedy: was 100 % of tokens. Now every
+  disagreement has margin < δ. Reason: 99.64 % with one flipped near-tie is
+  the expected bf16 behaviour; a disagreement with a large margin would be
+  an alignment error, which the criterion still catches.
+- `permutation`: was a global `1e-5` relative to `max(1, |value|)`. Now
+  per-trace bounds. Reason: `dkl` subtracts two KLs of up to hundreds of
+  nats, so 1 ulp of a value in [256, 512) is 2⁻¹⁵ regardless of `|dkl|`.
+- `self_divergence`: was `1e-7`. Now exactly 0 expected, tolerance
+  `4·u₃₂·log D_ff`. Reason: the former JS form left one rounding of
+  `logaddexp`; the pointwise form removes it.
+
+Acceptance: `pytest` 148 passed + 1 skipped (CPU); on the cluster `verify`
+and `smoke` re-run on the same config and dev data as jobs 32879/32880,
+bundled with `hpc/pilot_bundle.sh`.
 
 ## Out of scope (do not implement)
 

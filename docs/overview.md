@@ -164,11 +164,12 @@ flowchart LR
 
 ## 8. Invariantes del piloto (50 preguntas, un modelo)
 
-1. Estados con teacher forcing iguales a los de generación: $\|\Delta r\|/\|r\| < 10^{-3}$ en todas las capas.
+1. Estados con teacher forcing equivalentes a los de generación, juzgados por su efecto en las trazas: en cada capa $\ell$, el p99 sobre preguntas y posiciones de $|\Delta\bar H|$, $|\Delta E_{\mathrm{lse}}|$ y $D_{\mathrm{JS}}(p_{\mathrm{cache}}\|p_{\mathrm{tf}})$ a $\beta^\star$ no supera $0{,}1\,\sigma_\ell$, con $\sigma_\ell$ la desviación estándar de la métrica entre posiciones de respuesta y preguntas (ruido/señal $\le 0{,}1$); los tokens deben coincidir. $\|\Delta x\|/\|x\|$ se reporta como dato informativo, junto con la distancia de ambos estados bf16 a un forward en float32. *(Revisado tras el piloto: en bfloat16 $\|\Delta x\|/\|x\|$ llegó a 0,09 con tokens idénticos; lo relevante es si ese ruido mueve las métricas frente a su dispersión entre preguntas.)*
 2. $g$ capturado en `gate_proj` igual a $A r$ con $r$ capturado en la entrada de `mlp` (manejo de $\gamma$ correcto).
 3. $\bar H$ en la referencia dentro de $0{,}55\pm0{,}05$ con $\beta^\star$.
 4. Diagnóstico de $\gamma$ ejecutado y reportado antes de escalar.
 5. Determinismo: dos ejecuciones con la misma semilla producen archivos idénticos en ids y métricas hasta float16.
+6. Desacuerdos teacher forcing / greedy: todo token en que el argmax con teacher forcing difiere del greedy tiene margen top1−top2 de logits (en ambas pasadas) menor que $\delta = \max(\text{p99 de } \max_v|\ell_{\mathrm{gen}}-\ell_{\mathrm{tf}}| \text{ en las posiciones no divergentes},\ 3\,\mathrm{ulp}_{\mathrm{bf16}}(|\ell_{\mathrm{top1}}|))$: es decir, son casi-empates volteados por la discrepancia numérica entre ambas pasadas, no errores de alineación. Los desacuerdos se registran y no son fatales. *(Revisado tras el piloto: TF == greedy en el 99,64 % de los tokens; el requisito previo de igualdad al 100 % no es alcanzable en bfloat16.)*
 
 ---
 

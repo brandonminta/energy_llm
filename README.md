@@ -318,7 +318,7 @@ cat logs/smoke_<job>.out
 
 Check:
 - `model dtype bfloat16`;
-- `TF == greedy 100.00 % of tokens, 100.0 % of answers` (anything less: report the ids from `smoke_report.json`);
+- `TF == greedy` % of tokens and answers, and `TF/greedy disagreements N: all margins < delta: True` (each disagreement listed with its margins; one above δ is an alignment problem: report it);
 - `max | ||x_hat||/sqrt(D) - 1 |` negligible (≲ 1e-3);
 - mean H̄ per layer at β\*: not saturated (not ≈ 0 or ≈ 1 in most layers);
 - peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);

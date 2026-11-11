@@ -186,7 +186,7 @@ def test_exhausted_ids_end_the_shard_and_are_reported(calibrated):
 
 
 @pytest.mark.parametrize("key, value", [
-    ("topk_ids_k", 4), ("beta_grid_log10", {"min": 0.0, "max": 3.0, "num": 7})])
+    ("topk_ids_k", 4), ("beta_grid_log10_offset", {"min": -0.5, "max": 0.5, "num": 7})])
 def test_changed_config_refuses_to_resume(calibrated, key, value):
     cfg, bundle, ev, _ = calibrated
     items = read_items(ev)

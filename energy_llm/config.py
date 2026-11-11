@@ -2,9 +2,10 @@
 
 The YAML is the complete scientific specification of a run: model and exact
 hub revision, dtype, prompt (single system instruction, no few-shot),
-generation cap, calibration target and grid, extraction beta grid and top-k
-sizes, probe layers and seed. beta* itself is not in the YAML: ``calibrate`` writes
-it to ``<output_dir>/calibration/beta_star.json`` and ``extract`` reads it.
+generation cap, calibration target and grid, extraction beta grid (relative
+to beta*) and top-k sizes, probe layers and seed. beta* itself is not in the
+YAML: ``calibrate`` writes one per score variant to
+``<output_dir>/calibration/beta_star.json`` and ``extract`` reads them.
 """
 
 from __future__ import annotations
@@ -63,18 +64,19 @@ def log_grid(log10_min: float, log10_max: float, num: int) -> list[float]:
 
 @dataclass
 class ExtractionConfig:
-    # absolute log-spaced betas (s is a cosine, so identical across models);
-    # beta* is always appended: betas(beta*)[-1] == beta*
-    beta_grid_log10: dict = field(default_factory=lambda: {"min": 0.0, "max": 4.0, "num": 9})
+    # betas relative to each variant's beta*: beta* * 10^o for o on a linear
+    # grid of log10 offsets; beta* is always appended: betas(beta*)[-1] == beta*
+    beta_grid_log10_offset: dict = field(default_factory=lambda: {"min": -0.7, "max": 0.9, "num": 9})
     topk_mass_k: int = 10
-    topk_ids_k: int = 100
+    topk_ids_k: int = 100              # topk_ids of the primary variant (cos_gamma_query)
+    control_topk_ids_k: int = 0        # topk_ids of the control variant; 0 = not stored
     hidden_layers: str | list[int] = "all"
     samples_per_shard: int = 1000
     max_attempts: int = 3
 
     def betas(self, beta_star: float) -> list[float]:
-        g = self.beta_grid_log10
-        return log_grid(g["min"], g["max"], g["num"]) + [float(beta_star)]
+        g = self.beta_grid_log10_offset
+        return [float(beta_star) * m for m in log_grid(g["min"], g["max"], g["num"])] + [float(beta_star)]
 
 
 @dataclass
@@ -168,13 +170,15 @@ class RunConfig:
         if c.num_grid < 2 or c.log10_beta_max <= c.log10_beta_min:
             raise ConfigError("calibration grid is empty")
         e = self.extraction
-        g = e.beta_grid_log10
+        g = e.beta_grid_log10_offset
         if not isinstance(g, dict) or set(g) != {"min", "max", "num"}:
-            raise ConfigError("extraction.beta_grid_log10 must have exactly the keys min, max, num")
+            raise ConfigError("extraction.beta_grid_log10_offset must have exactly the keys min, max, num")
         if not isinstance(g["num"], int) or g["num"] < 2 or g["max"] <= g["min"]:
-            raise ConfigError("extraction.beta_grid_log10 is empty (num >= 2, max > min)")
+            raise ConfigError("extraction.beta_grid_log10_offset is empty (num >= 2, max > min)")
         if e.topk_mass_k < 1 or e.topk_ids_k < 1:
             raise ConfigError("extraction.topk_mass_k and topk_ids_k must be >= 1")
+        if e.control_topk_ids_k < 0:
+            raise ConfigError("extraction.control_topk_ids_k must be >= 0 (0 = not stored)")
         if e.hidden_layers != "all" and not (
             isinstance(e.hidden_layers, list) and all(isinstance(l, int) for l in e.hidden_layers)
         ):

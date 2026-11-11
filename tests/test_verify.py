@@ -151,8 +151,8 @@ def test_cli_verify_exit_code(run, tmp_path, monkeypatch):
 
 def test_inspect_shows_positions_and_phases(run):
     cfg, bundle, items = run
-    r = run_verify(cfg, bundle, items, n=2)
-    text = inspect_item(r["extraction_dir"], items[0].id, tokenizer=bundle.tokenizer)
+    rep = run_verify(cfg, bundle, items, n=2)
+    text = inspect_item(rep["extraction_dir"], items[0].id, tokenizer=bundle.tokenizer)
     lines = text.splitlines()
     assert lines[0].startswith(f"id {items[0].id}")
     header = lines.index(next(l for l in lines if l.split()[:2] == ["pos", "token_id"]))
@@ -166,3 +166,9 @@ def test_inspect_shows_positions_and_phases(run):
                                             "response_first", "response_mean"]
         assert len([l for l in lines[start + 2: start + 2 + bundle.dims.n_layers]
                     if l.split()[0].isdigit()]) == bundle.dims.n_layers
+    assert "variant cos_gamma_query" in lines[0]
+    assert any(l.startswith("query_gain per layer") for l in lines)
+    ctrl = inspect_item(rep["extraction_dir"], items[0].id, tokenizer=bundle.tokenizer, variant="cos_gamma_key")
+    assert "variant cos_gamma_key" in ctrl.splitlines()[0] and ctrl != text
+    with pytest.raises(KeyError, match="variant"):
+        inspect_item(rep["extraction_dir"], items[0].id, tokenizer=bundle.tokenizer, variant="nope")

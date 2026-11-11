@@ -17,7 +17,9 @@ from energy_llm.core.bank import build_bank
 from energy_llm.core.capture import ResidualHooks, compute_item, forward_item
 from energy_llm.core.prompting import ROLE_QUESTION, build_prompt
 from energy_llm.verification.verify import compare_with_reference, load_reference
-from tests.conftest import DATE, QUESTION_WORDS, SYSTEM, make_bundle, make_questions
+from energy_llm.core.bank import CONTROL
+from energy_llm.verification.verify import view
+from tests.conftest import DATE, QUESTION_WORDS, SYSTEM, both, make_bundle, make_questions
 
 ref = load_reference()
 
@@ -39,8 +41,8 @@ def _both(bundle, bank, question, betas):
     tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, question, date))
     hooks.remove()
     L = bundle.dims.n_layers
-    prod = compute_item(bundle, bank, tr, "x", betas, list(range(L)), K_MASS, K_IDS)
-    return tr, prod, _ref(bundle, tr, betas)
+    prod = compute_item(bundle, bank, tr, "x", both(betas), list(range(L)), K_MASS, both(K_IDS))
+    return tr, view(prod.traces, CONTROL), _ref(bundle, tr, betas)
 
 
 @pytest.mark.parametrize("beta_star", [0.7, 12.0, 300.0])
@@ -51,8 +53,8 @@ def test_production_matches_reference(pair, beta_star):
     for q in make_questions(3, QUESTION_WORDS, 5):
         tr, prod, r = _both(bundle, bank, q, betas)
         assert r["response_positions"] == tr.response_positions
-        assert r["reference_positions"] == prod.reference_positions
-        assert set(r["traces"]) == set(prod.traces)
+        assert r["reference_positions"] == tr.reference_positions
+        assert set(r["traces"]) == set(prod) - {"query_gain"}
         cmp = compare_with_reference(bundle, bank, tr, prod, r, list(range(bundle.dims.n_layers)),
                                      betas, K_MASS)
         assert cmp["score_error"] <= cmp["score_tolerance"]
@@ -87,11 +89,11 @@ def test_reference_detects_a_wrong_pipeline(qwen_pair, monkeypatch):
     hooks.remove()
 
     def no_gamma(self, l, x_hat):
-        w = self.gate_weights[l].float()
-        return (x_hat @ w.T) / (w.norm(dim=1) * np.sqrt(self.d_model))
+        return x_hat @ self.gate_weights[l].float().T
 
-    monkeypatch.setattr(bank_mod.Bank, "scores", no_gamma)
+    monkeypatch.setattr(bank_mod.Bank, "preactivation", no_gamma)
     L = bundle.dims.n_layers
-    prod = compute_item(bundle, bank, tr, "x", [10.0], list(range(L)), K_MASS, K_IDS)
+    prod = compute_item(bundle, bank, tr, "x", both([10.0]), list(range(L)), K_MASS, both(K_IDS))
     r = _ref(bundle, tr, [10.0])
-    assert not compare_with_reference(bundle, bank, tr, prod, r, list(range(L)), [10.0], K_MASS)["ok"]
+    assert not compare_with_reference(bundle, bank, tr, view(prod.traces, CONTROL), r, list(range(L)),
+                                      [10.0], K_MASS)["ok"]

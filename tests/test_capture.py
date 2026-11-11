@@ -4,13 +4,13 @@ import torch
 from scipy.special import logsumexp
 
 from energy_llm.core import capture, metrics
-from energy_llm.core.bank import build_bank
+from energy_llm.core.bank import CONTROL, PRIMARY, VARIANTS, build_bank
 from energy_llm.core.capture import NonFiniteError, ResidualHooks, compute_item, forward_item
 from energy_llm.core.prompting import (
     ROLE_INSTRUCTION, ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, PromptError,
     build_prompt, check_template,
 )
-from tests.conftest import DATE, QUESTION_WORDS, SYSTEM, make_bundle, make_questions
+from tests.conftest import DATE, QUESTION_WORDS, SYSTEM, both, make_bundle, make_questions
 
 Q = "what is the capital of france"
 
@@ -186,7 +186,7 @@ def test_empty_response_is_a_valid_sample(pair):
     tr = _trace(bundle)
     assert tr.empty_response and tr.gen_ids == [first] and not tr.truncated
     assert tr.reference_positions["response_first"] is None
-    res = compute_item(bundle, bank, tr, "e", [1.0, 5.0], list(range(bundle.dims.n_layers)), 4, 8)
+    res = compute_item(bundle, bank, tr, "e", both([1.0, 5.0]), list(range(bundle.dims.n_layers)), 4, both(8))
     assert res.answer["empty_response"] and res.answer["n_response_tokens"] == 0
     assert res.answer["response"] == ""
     for name, arr in res.traces.items():
@@ -212,38 +212,46 @@ def item(pair):
     bank = build_bank(bundle.model, bundle.dims)
     tr = _trace(bundle)
     beta = 7.5
-    res = compute_item(bundle, bank, tr, "x1", [1.0, 30.0, beta], list(range(bundle.dims.n_layers)),
-                       K_MASS, K_IDS)
+    res = compute_item(bundle, bank, tr, "x1", both([1.0, 30.0, beta]), list(range(bundle.dims.n_layers)),
+                       K_MASS, both(K_IDS))
     return bundle, bank, tr, beta, res
 
 
-def _scores(bundle, bank, tr, l):
-    return capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps)
+def _scores(bundle, bank, tr, l, v):
+    return capture._layer_scores(bank, tr.residuals[l], l, bundle.dims.rms_norm_eps, v)
+
+
+PER_BETA = {"energy", "norm_entropy", "topk_mass", "mean_score", "var_score"} | {
+    f"{d}/{r}" for d in ("js", "dkl") for r in capture.REFERENCES}
 
 
 def test_item_shapes_and_bounds(item):
-    bundle, _, tr, _, res = item
+    bundle, bank, tr, _, res = item
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     T = tr.n_prompt + len(tr.gen_ids)
-    per_beta = {"energy", "norm_entropy", "topk_mass", "mean_score", "var_score"} | {
-        f"{d}/{r}" for d in ("js", "dkl") for r in capture.REFERENCES}
-    assert set(res.traces) == per_beta | {"margin", "xhat_top1_frac", "topk_ids"}
-    for name in per_beta:
-        assert res.traces[name].shape == (L, T, 3) and res.traces[name].dtype == np.float32, name
-    for name in ("margin", "xhat_top1_frac"):
-        assert res.traces[name].shape == (L, T)
-    assert res.traces["topk_ids"].shape == (L, T, K_IDS) and res.traces["topk_ids"].dtype == np.int32
+    assert set(res.traces) == {f"{v}/{n}" for v in VARIANTS for n in PER_BETA | {"margin", "topk_ids"}} | {
+        "query_gain", "xhat_top1_frac"}
+    for v in VARIANTS:
+        t = capture.variant_traces(res.traces, v)
+        for name in PER_BETA:
+            assert t[name].shape == (L, T, 3) and t[name].dtype == np.float32, name
+        assert t["margin"].shape == (L, T)
+        assert t["topk_ids"].shape == (L, T, K_IDS) and t["topk_ids"].dtype == np.int32
+        assert np.all((t["norm_entropy"] >= -1e-6) & (t["norm_entropy"] <= 1 + 1e-6))
+        assert np.all((t["topk_mass"] > 0) & (t["topk_mass"] <= 1 + 1e-6))
+        assert np.all(t["var_score"] >= 0)
+        for r in capture.REFERENCES:
+            assert np.all((t[f"js/{r}"] >= 0) & (t[f"js/{r}"] <= np.log(2)))
+    for name in ("query_gain", "xhat_top1_frac"):
+        assert res.traces[name].shape == (L, T) and res.traces[name].dtype == np.float32
     assert res.role_mask.shape == (T,) and res.role_mask.dtype == np.int8
     assert set(res.hidden) == {"question_last", "prompt_last", "response_first", "response_last"}
     for h in res.hidden.values():
         assert h.shape == (L, D) and h.dtype == np.float16
     t = res.traces
-    assert np.all((t["norm_entropy"] >= -1e-6) & (t["norm_entropy"] <= 1 + 1e-6))
-    assert np.all((t["topk_mass"] > 0) & (t["topk_mass"] <= 1 + 1e-6))
-    assert np.all(t["var_score"] >= 0)
     assert np.all((t["xhat_top1_frac"] >= 1 / D - 1e-6) & (t["xhat_top1_frac"] <= 1 + 1e-6))
-    for r in capture.REFERENCES:
-        assert np.all((t[f"js/{r}"] >= 0) & (t[f"js/{r}"] <= np.log(2)))
+    # the two variants are different numbers (gamma moved from key to query)
+    assert not np.allclose(t[f"{PRIMARY}/norm_entropy"], t[f"{CONTROL}/norm_entropy"])
     assert 0.0 <= res.answer["xhat_norm_max_rel_dev"] < 0.05  # tiny residuals: eps is visible
     assert res.answer["n_response_tokens"] == len(tr.response_positions)
     assert res.answer["tf_exact"] is True and res.answer["tf_mismatch_margin_tf"] == []
@@ -251,6 +259,25 @@ def test_item_shapes_and_bounds(item):
     assert res.answer["tf_logit_diff_max"] == max(res.answer["tf_logit_diff"])
     assert res.answer["tf_logit_diff_step0"] == res.answer["tf_logit_diff"][0]
     assert "gold" not in str(res.answer)
+
+
+def test_query_gain_is_the_norm_of_the_gamma_query(item):
+    """g_t = ||gamma * x_hat|| / sqrt(D) per layer and position, explicitly."""
+    bundle, _, tr, _, res = item
+    D = bundle.dims.d_model
+    for l, layer in enumerate(bundle.model.model.layers):
+        x_hat = metrics.rms_normalise(tr.residuals[l], bundle.dims.rms_norm_eps)
+        q = x_hat * layer.post_attention_layernorm.weight.float()
+        np.testing.assert_allclose(res.traces["query_gain"][l], (q.norm(dim=-1) / D ** 0.5).numpy(), rtol=1e-6)
+
+
+def test_control_topk_ids_omitted_when_zero(qwen_pair):
+    bundle = make_bundle(*qwen_pair)
+    bank = build_bank(bundle.model, bundle.dims)
+    tr = _trace(bundle)
+    res = compute_item(bundle, bank, tr, "x", both([2.0]), [0], K_MASS, {PRIMARY: K_IDS, CONTROL: 0})
+    assert f"{PRIMARY}/topk_ids" in res.traces and f"{CONTROL}/topk_ids" not in res.traces
+    assert res.topk_ids_k == {PRIMARY: K_IDS, CONTROL: 0}
 
 
 def test_reference_positions(item):
@@ -269,58 +296,62 @@ def test_reference_requires_a_question_token(qwen_pair):
         tr.reference_positions
 
 
-def test_own_reference_rows_are_zero(item):
+@pytest.mark.parametrize("v", VARIANTS)
+def test_own_reference_rows_are_zero(item, v):
     *_, res = item
     for r, pos in res.reference_positions.items():
-        assert np.abs(res.traces[f"js/{r}"][:, pos]).max() <= 1e-7      # one rounding in logaddexp
-        assert np.abs(res.traces[f"dkl/{r}"][:, pos]).max() == 0.0
+        assert np.abs(res.traces[f"{v}/js/{r}"][:, pos]).max() == 0.0
+        assert np.abs(res.traces[f"{v}/dkl/{r}"][:, pos]).max() == 0.0
 
 
-def test_divergences_match_explicit_formula(item):
+@pytest.mark.parametrize("v", VARIANTS)
+def test_divergences_match_explicit_formula(item, v):
     bundle, bank, tr, _, res = item
     l, bi, beta = 1, 1, 30.0
-    _, s = _scores(bundle, bank, tr, l)
+    _, s = _scores(bundle, bank, tr, l, v)
     lp = torch.log_softmax(beta * s.double(), dim=-1)
     for r, pos in res.reference_positions.items():
         p, q = lp.exp(), lp[pos].exp()
         kl_pq = (p * (lp - lp[pos])).sum(-1)
         kl_qp = (q * (lp[pos] - lp)).sum(-1)
-        np.testing.assert_allclose(res.traces[f"dkl/{r}"][l, :, bi], (kl_pq - kl_qp).numpy(), atol=1e-4)
+        np.testing.assert_allclose(res.traces[f"{v}/dkl/{r}"][l, :, bi], (kl_pq - kl_qp).numpy(), atol=1e-4)
         m = 0.5 * (p + q)
         js = 0.5 * (p * (p / m).log()).sum(-1) + 0.5 * (q * (q / m).log()).sum(-1)
-        np.testing.assert_allclose(res.traces[f"js/{r}"][l, :, bi], js.numpy(), atol=1e-5)
+        np.testing.assert_allclose(res.traces[f"{v}/js/{r}"][l, :, bi], js.numpy(), atol=1e-5)
 
 
-def test_topk_ids_sorted_and_unique(item):
+@pytest.mark.parametrize("v", VARIANTS)
+def test_topk_ids_sorted_and_unique(item, v):
     bundle, bank, tr, _, res = item
     for l in range(bundle.dims.n_layers):
-        _, s = _scores(bundle, bank, tr, l)
-        for t, row in enumerate(res.traces["topk_ids"][l]):
+        _, s = _scores(bundle, bank, tr, l, v)
+        for t, row in enumerate(res.traces[f"{v}/topk_ids"][l]):
             assert len(set(row.tolist())) == K_IDS
             vals = s[t, torch.as_tensor(row, dtype=torch.long)]
             assert (vals[:-1] >= vals[1:]).all()
             assert vals[-1] >= torch.topk(s[t], K_IDS + 1).values[-1]
 
 
-def test_energy_at_beta_star_equals_single_beta_trace(item):
+@pytest.mark.parametrize("v", VARIANTS)
+def test_energy_at_beta_star_equals_single_beta_trace(item, v):
     """The last beta column is the former single-beta trace at beta*; stored as
     float16 it stays within one float16 rounding."""
     bundle, bank, tr, beta, res = item
     for l in range(bundle.dims.n_layers):
-        _, s = _scores(bundle, bank, tr, l)
+        _, s = _scores(bundle, bank, tr, l, v)
         single = metrics.energy(s, beta).numpy()
-        assert np.array_equal(res.traces["energy"][l, :, -1], single)
-        np.testing.assert_allclose(res.traces["energy"][l, :, -1].astype(np.float16), single,
+        assert np.array_equal(res.traces[f"{v}/energy"][l, :, -1], single)
+        np.testing.assert_allclose(res.traces[f"{v}/energy"][l, :, -1].astype(np.float16), single,
                                    rtol=2.0 ** -11, atol=0)
     l = bundle.dims.n_layers - 1
-    _, s = _scores(bundle, bank, tr, l)
+    _, s = _scores(bundle, bank, tr, l, v)
     ref = -logsumexp(beta * s.double().numpy(), axis=-1) / beta
-    np.testing.assert_allclose(res.traces["energy"][l, :, -1], ref, rtol=1e-5)
+    np.testing.assert_allclose(res.traces[f"{v}/energy"][l, :, -1], ref, rtol=1e-5)
 
 
 def test_betas_record_the_grid_with_beta_star_last(item):
     *_, beta, res = item
-    assert res.betas == [1.0, 30.0, beta]
+    assert res.betas == both([1.0, 30.0, beta])
 
 
 def test_non_finite_values_raise(qwen_pair, monkeypatch):
@@ -329,4 +360,4 @@ def test_non_finite_values_raise(qwen_pair, monkeypatch):
     tr = _trace(bundle)
     monkeypatch.setattr(capture.metrics, "energy", lambda s, b: torch.full(s.shape[:-1], float("nan")))
     with pytest.raises(NonFiniteError):
-        compute_item(bundle, bank, tr, "x", [5.0], [0], K_MASS, K_IDS)
+        compute_item(bundle, bank, tr, "x", both([5.0]), [0], K_MASS, both(K_IDS))

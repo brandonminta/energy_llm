@@ -78,12 +78,18 @@ def test_outputs_indexed_by_id_without_input_extras(calibrated):
     assert "gold" not in ans.to_json() and "category" not in ans.columns
     with h5py.File(d / "traces.h5") as f:
         assert set(f.keys()) == {it.id for it in items}
-        b_ctrl = rec["variants"]["cos_gamma_key"]["beta_star"]
-        assert f.attrs["beta_star"] == b_ctrl
-        assert f.attrs["betas"].tolist() == cfg.extraction.betas(b_ctrl)
+        vs = list(f.attrs["variants"])
+        assert vs == ["cos_gamma_query", "cos_gamma_key"] and f.attrs["primary"] == "cos_gamma_query"
+        stars = [rec["variants"][v]["beta_star"] for v in vs]
+        assert f.attrs["beta_star"].tolist() == stars
+        assert f.attrs["betas"].tolist() == [cfg.extraction.betas(b) for b in stars]
+        assert f.attrs["topk_ids_k"].tolist() == [8, 0]
         g = f[items[0].id]
-        assert g["energy"].shape[-1] == 10 and g["energy"].dtype == np.float16
-        assert g["topk_ids"].dtype == np.int32 and g["js/question_last"].dtype == np.float16
+        for v in vs:
+            assert g[f"{v}/energy"].shape[-1] == 10 and g[f"{v}/energy"].dtype == np.float16
+            assert g[f"{v}/js/question_last"].dtype == np.float16
+        assert g["cos_gamma_query/topk_ids"].dtype == np.int32 and "topk_ids" not in g["cos_gamma_key"]
+        assert g["query_gain"].dtype == np.float16 and g["query_gain"].shape == g["xhat_top1_frac"].shape
     with h5py.File(d / "hidden.h5") as f:
         assert set(f[items[0].id]) == {"question_last", "prompt_last", "response_first", "response_last"}
     assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
@@ -111,8 +117,8 @@ def test_merge_of_two_shards(calibrated):
     assert list(ans.index) == ids
     with h5py.File(d / "traces.h5") as f:
         assert list(f) == sorted(ids)
-        assert f.attrs["betas"].tolist() == cfg.extraction.betas(rec["variants"]["cos_gamma_key"]["beta_star"])
-        assert (f.attrs["topk_mass_k"], f.attrs["topk_ids_k"]) == (4, 8)
+        assert f.attrs["betas"][1].tolist() == cfg.extraction.betas(rec["variants"]["cos_gamma_key"]["beta_star"])
+        assert f.attrs["topk_mass_k"] == 4 and f.attrs["topk_ids_k"].tolist() == [8, 0]
         assert list(f.attrs["reference_names"]) == list(REFERENCES)
         worst = dict.fromkeys(REFERENCES, 0.0)
         for i in ids:
@@ -120,7 +126,7 @@ def test_merge_of_two_shards(calibrated):
             pos = g.attrs["reference_positions"].tolist()
             assert pos[1] == a["n_prompt_tokens"] - 1
             assert pos[2] == (-1 if a["empty_response"] else a["n_prompt_tokens"])
-            assert g["energy"].chunks == (1, g["energy"].shape[1], 10)
+            assert g["cos_gamma_query/energy"].chunks == (1, g["cos_gamma_query/energy"].shape[1], 10)
             for r, p in zip(REFERENCES, pos):
                 if p >= 0:
                     worst[r] = max(worst[r], float(g["xhat_top1_frac"][:, p].max()))
@@ -138,7 +144,7 @@ def test_merge_refuses_items_with_different_betas(calibrated):
     cfg, bundle, ev, _ = calibrated
     items, _ = _run_all(cfg, bundle, ev, "b")
     with h5py.File(item_path(shard_path(cfg.extraction_dir("b"), 1), items[3].id), "r+") as f:
-        f.attrs["betas"] = f.attrs["betas"] * 2
+        f["traces/cos_gamma_key"].attrs["betas"] = f["traces/cos_gamma_key"].attrs["betas"] * 2
     with pytest.raises(RuntimeError, match="betas"):
         run_merge(cfg, items, ev, "b")
 
@@ -282,10 +288,12 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
     base = pd.read_parquet(d / "baselines.parquet").set_index("id")
     assert np.isnan(base.loc[items[0].id, "mean_logprob"])
     with h5py.File(d / "traces.h5") as f, h5py.File(d / "hidden.h5") as h:
-        assert np.isfinite(f[items[0].id]["energy"][()]).all()
         assert np.isnan(h[items[0].id]["response_last"][()]).all()
-        assert np.isnan(f[items[0].id]["dkl/response_first"][()]).all()
-        assert np.isfinite(f[items[0].id]["dkl/prompt_last"][()]).all()
+        for v in ("cos_gamma_query", "cos_gamma_key"):
+            g = f[items[0].id][v]
+            assert np.isfinite(g["energy"][()]).all()
+            assert np.isnan(g["dkl/response_first"][()]).all()
+            assert np.isfinite(g["dkl/prompt_last"][()]).all()
 
 
 def test_smoke_summary(calibrated, capsys):
@@ -343,7 +351,7 @@ def test_smoke_summary(calibrated, capsys):
     deltas = []
     with h5py.File(d / "traces.h5") as f:
         for i, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
-            h, resp = f[i]["norm_entropy"][..., -1].astype(np.float64), f[i]["role_mask"][()] == 3
+            h, resp = f[i]["cos_gamma_key/norm_entropy"][..., -1].astype(np.float64), f[i]["role_mask"][()] == 3
             if resp.any():
                 deltas.append(h[:, resp].mean(1) - h[:, n_p - 1])
     for b in s["bands"]:

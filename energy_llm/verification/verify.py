@@ -39,11 +39,13 @@ import torch
 
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
-from energy_llm.core.bank import CONTROL, Bank, build_bank
-from energy_llm.core.capture import REFERENCES, ResidualHooks, compute_item, forward_item, norm_entropy_curve
+from energy_llm.core.bank import CONTROL, PRIMARY, Bank, build_bank
+from energy_llm.core.capture import (
+    REFERENCES, SHARED, ResidualHooks, compute_item, forward_item, norm_entropy_curve, variant_traces,
+)
 from energy_llm.core.model import ModelBundle, decoder_layers, ffn_norm
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, build_prompt
-from energy_llm.pipeline.extract import load_beta_star
+from energy_llm.pipeline.extract import load_beta_star, variant_betas, variant_topk_ids
 from energy_llm.storage import Item, read_items, sha256_file, write_json_atomic
 
 REFERENCE_PATH = Path(__file__).resolve().parents[2] / "dev" / "reference.py"
@@ -178,7 +180,12 @@ def divergence_scale(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
     return (logp.exp() * d).sum(dim=-1) + (logq.exp() * d).sum(dim=-1)
 
 
-def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, layers: list[int],
+def view(traces: dict, variant: str) -> dict:
+    """One variant's traces (prefix removed) plus the shared ones."""
+    return variant_traces(traces, variant) | {k: traces[k] for k in SHARED if k in traces}
+
+
+def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, traces: dict, ref, layers: list[int],
                            betas: list[float], k_mass: int) -> dict:
     eps = bundle.dims.rms_norm_eps
     ds = 0.0
@@ -201,7 +208,9 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, la
                     dkl_tol[r][li, :, bi] = 2 * b * ds * a + tols[bi][f"dkl/{r}"]
     ratio, nan_ok, per = 0.0, True, {}
     for name, r in ref["traces"].items():
-        p = prod.traces[name][layers]
+        if name not in traces:          # topk_ids not stored for this variant
+            continue
+        p = traces[name][layers]
         if name == "topk_ids":
             jac = _topk_jaccard(p, r)
             per[name] = {"min_row_jaccard": jac, "required": TOPK_MIN_JACCARD}
@@ -218,7 +227,7 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, prod, ref, la
         per[name] = {"max_error": float(err[m].max()) if m.any() else 0.0,
                      "max_error_over_tolerance": worst}
         ratio = max(ratio, worst)
-    ids_ok = per["topk_ids"]["min_row_jaccard"] >= TOPK_MIN_JACCARD
+    ids_ok = "topk_ids" not in per or per["topk_ids"]["min_row_jaccard"] >= TOPK_MIN_JACCARD
     return {"score_error": ds, "score_tolerance": tol_s, "nan_pattern_equal": nan_ok,
             "max_error_over_tolerance": ratio, "traces": per,
             "ok": ds <= tol_s and nan_ok and ratio <= 1.0 and ids_ok}
@@ -491,7 +500,7 @@ def gamma_shuffled_bank(base: Bank, seed: int = 1) -> Bank:
 
 
 @torch.inference_mode()
-def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank", trace, prod,
+def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank", trace, tr: dict,
                            betas: list[float], k_mass: int, c: float = PERM_C) -> dict[str, np.ndarray]:
     """Per-element tolerance of every float trace under a permutation of the
     memories (derivation: ARCHITECTURE section 13.5). The scores are the same
@@ -533,7 +542,7 @@ def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank
     L, eps, logd = dims.n_layers, dims.rms_norm_eps, math.log(dims.d_ff)
     u = UNIT_ROUNDOFF["float32"]
     gn = math.ceil(math.log2(dims.d_ff)) * u
-    tr, refs = prod.traces, prod.reference_positions
+    refs = trace.reference_positions
     T, nb = tr["energy"].shape[1], len(betas)
     b = np.asarray(betas, dtype=np.float64)[None, None, :]
     delta = gn + u * (1 + logd)
@@ -565,7 +574,7 @@ def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank
         key = name if name not in ("js", "dkl") else f"{name}/{REFERENCES[0]}"
         lip[name] = np.asarray([[reference_tolerances(ds[l], bt, srange[l], k_mass, dims.d_model)[key]
                                  for bt in betas] for l in range(L)])[:, None, :]
-    f64 = {k: v.astype(np.float64) for k, v in tr.items() if k != "topk_ids"}
+    f64 = {k: v.astype(np.float64) for k, v in tr.items() if k not in ("topk_ids", "query_gain")}
     E, H = f64["energy"], f64["norm_entropy"] * logd
     lam = b * srow[:, :, None] + logd                       # >= max_i |log p_i|
     tol = {
@@ -653,8 +662,9 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     reference = load_reference()
     beta_rec = load_beta_star(cfg, items)
     beta_star = float(beta_rec["variants"][CONTROL]["beta_star"])   # both variants from C5
-    betas = cfg.extraction.betas(beta_star)
-    k_mass, k_ids = cfg.extraction.topk_mass_k, cfg.extraction.topk_ids_k
+    all_betas, k_ids = variant_betas(cfg, beta_rec), variant_topk_ids(cfg)
+    betas = all_betas[CONTROL]
+    k_mass = cfg.extraction.topk_mass_k
     L = bundle.dims.n_layers
     ref_layers = ref_layers if ref_layers is not None else sorted({0, L // 2, L - 1})
     hidden_layers = cfg.hidden_layer_indices(L)
@@ -684,7 +694,8 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            prod = compute_item(bundle, bank, trace, it.id, betas, hidden_layers, k_mass, k_ids)
+            prod = compute_item(bundle, bank, trace, it.id, all_betas, hidden_layers, k_mass, k_ids)
+            pv = view(prod.traces, CONTROL)
 
             # reference (float64, naive)
             if qi < ref_n:
@@ -692,8 +703,8 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                 ref = reference.reference_item(
                     bundle.model, {l: trace.residuals[l].float().cpu().numpy() for l in ref_layers},
                     trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, betas, q_last,
-                    k_mass, k_ids)
-                cmp = compare_with_reference(bundle, bank, trace, prod, ref, ref_layers, betas, k_mass)
+                    k_mass, k_ids[PRIMARY])
+                cmp = compare_with_reference(bundle, bank, trace, pv, ref, ref_layers, betas, k_mass)
                 cmp["reference_positions_equal"] = ref["reference_positions"] == prod.reference_positions
                 cmp["ok"] &= cmp["reference_positions_equal"]
                 ref_details.append({"id": it.id} | {k_: v for k_, v in cmp.items() if k_ != "ok"})
@@ -722,7 +733,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                                       beta_star).items():
                     tf_noise[m][l].append(v)
                 for m, ds_name in PROPAGATED.items():
-                    tf_signal[m][l].append(prod.traces[ds_name][l, resp, -1])
+                    tf_signal[m][l].append(pv[ds_name][l, resp, -1])
             acc["tf_cache"].append((max(float(np.max(r[-1])) for r in x_rel), info["tokens_equal"]))
             if fp32_check:
                 saved.append({"ids": trace.prompt.input_ids + trace.gen_ids, "x_cache": x_cache,
@@ -762,11 +773,12 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             acc["hidden"].append(h_err)
             # files hold float16(traces), topk_ids int32 and the float16 residuals
             f_tr, f_hid, f_ans = _read_outputs(ext_dir, it.id)
-            floats = {k: v for k, v in prod.traces.items() if k != "topk_ids"}
+            floats = {k: v for k, v in prod.traces.items() if not k.endswith("topk_ids")}
             diffs = [*(_f16_ulp_diff(f_tr[k_], v) for k_, v in floats.items()),
                      *(_f16_ulp_diff(f_hid[k_], v) for k_, v in prod.hidden.items())]
             acc["files"].append((max(d for d, _ in diffs), all(s_ for _, s_ in diffs)
-                                 and _topk_jaccard(f_tr["topk_ids"], prod.traces["topk_ids"]) >= ids_min_jaccard
+                                 and all(_topk_jaccard(f_tr[k_], v) >= ids_min_jaccard
+                                         for k_, v in prod.traces.items() if k_.endswith("topk_ids"))
                                  and set(f_tr) == set(prod.traces) | {"role_mask"}
                                  and set(f_hid) == set(prod.hidden)
                                  and np.array_equal(f_tr["role_mask"], prod.role_mask)))
@@ -776,15 +788,16 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             # from float32 reduction bounds; negative control: gamma shuffled
             if qi == 0:
                 pbank = PermutedBank(bank)
-                pres = compute_item(bundle, pbank, trace, it.id, betas, hidden_layers, k_mass, k_ids)
-                ptol = permutation_tolerances(bundle, bank, pbank, trace, prod, betas, k_mass)
-                perm = trace_ratios(pres.traces, prod.traces, ptol, betas)
-                cres = compute_item(bundle, gamma_shuffled_bank(bank), trace, it.id, betas,
+                pres = compute_item(bundle, pbank, trace, it.id, all_betas, hidden_layers, k_mass, k_ids)
+                ptol = permutation_tolerances(bundle, bank, pbank, trace, pv, betas, k_mass)
+                perm = trace_ratios(view(pres.traces, CONTROL), pv, ptol, betas)
+                cres = compute_item(bundle, gamma_shuffled_bank(bank), trace, it.id, all_betas,
                                     hidden_layers, k_mass, k_ids)
-                ctrl = trace_ratios(cres.traces, prod.traces, ptol, betas)
+                ctrl = trace_ratios(view(cres.traces, CONTROL), pv, ptol, betas)
                 # topk_ids are memory indices: permuted index j is original perm[j]
-                mapped = np.stack([pbank.perm[l].cpu().numpy()[pres.traces["topk_ids"][l]] for l in range(L)])
-                acc["perm"].append((perm, ctrl, _topk_jaccard(mapped, prod.traces["topk_ids"])))
+                ids = f"{PRIMARY}/topk_ids"
+                mapped = np.stack([pbank.perm[l].cpu().numpy()[pres.traces[ids][l]] for l in range(L)])
+                acc["perm"].append((perm, ctrl, _topk_jaccard(mapped, prod.traces[ids])))
                 del pres, cres, ptol
 
             # limits, monotonicity, self-divergence on real scores

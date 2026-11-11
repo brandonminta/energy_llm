@@ -123,7 +123,7 @@ def cmd_verify(args) -> int:
 def cmd_inspect(args) -> int:
     from energy_llm.verification.inspection import inspect_item
 
-    print(inspect_item(args.run, args.id))
+    print(inspect_item(args.run, args.id, variant=args.variant))
     return EXIT_DONE
 
 
@@ -213,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("inspect", help="print positions and per-layer phases of one id")
     sp.add_argument("--run", required=True, help="extraction directory (with manifest.json)")
     sp.add_argument("--id", required=True)
+    sp.add_argument("--variant", default="cos_gamma_query",
+                    help="score variant: cos_gamma_query (primary, default) or cos_gamma_key")
 
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,

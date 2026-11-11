@@ -30,7 +30,7 @@ import torch
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.bank import CONTROL, VARIANTS, build_bank, read_bank_fingerprint
+from energy_llm.core.bank import CONTROL, PRIMARY, VARIANTS, build_bank, read_bank_fingerprint
 from energy_llm.core.capture import REFERENCES, ItemResult, ResidualHooks, compute_item, forward_item
 from energy_llm.core.model import ModelBundle, release_cuda
 from energy_llm.core.prompting import build_prompt, check_template
@@ -80,23 +80,32 @@ def load_beta_star(cfg: RunConfig, items: list[Item]) -> dict:
     return rec
 
 
+def variant_betas(cfg: RunConfig, beta_rec: dict) -> dict[str, list[float]]:
+    """Per score variant: the extraction grid around its beta*, beta* last."""
+    return {v: cfg.extraction.betas(beta_rec["variants"][v]["beta_star"]) for v in VARIANTS}
+
+
+def variant_topk_ids(cfg: RunConfig) -> dict[str, int]:
+    """topk_ids size per variant (0 = not stored)."""
+    return {PRIMARY: cfg.extraction.topk_ids_k, CONTROL: cfg.extraction.control_topk_ids_k}
+
+
 # ----------------------------------------------------------------------
 # Per-id item files
 # ----------------------------------------------------------------------
 
 def write_item(sdir: Path, res: ItemResult) -> None:
-    """One HDF5 file per id: traces/<name> (floats as float16, topk_ids int32),
-    hidden/<position> float16, role_mask (``storage.write_array``: gzip 4,
-    one chunk per layer); attrs betas, topk_mass_k, topk_ids_k and
-    reference_positions (in ``REFERENCES`` order, -1 for None)."""
+    """One HDF5 file per id: traces/<variant>/<name> and traces/<shared name>
+    (floats as float16, topk_ids int32), hidden/<position> float16, role_mask
+    (``storage.write_array``: gzip 4, one chunk per layer); attrs topk_mass_k
+    and reference_positions (in ``REFERENCES`` order, -1 for None); attrs
+    betas and topk_ids_k on each traces/<variant> group."""
     import h5py
 
     with atomic_path(item_path(sdir, res.item_id)) as tmp:
         with h5py.File(tmp, "w") as f:
             f.attrs["id"] = res.item_id
-            f.attrs["betas"] = np.asarray(res.betas, dtype=np.float64)
             f.attrs["topk_mass_k"] = res.topk_mass_k
-            f.attrs["topk_ids_k"] = res.topk_ids_k
             f.attrs["reference_positions"] = np.asarray(
                 [-1 if res.reference_positions[r] is None else res.reference_positions[r]
                  for r in REFERENCES], dtype=np.int64)
@@ -108,6 +117,9 @@ def write_item(sdir: Path, res: ItemResult) -> None:
             for name, arr in res.hidden.items():
                 write_array(f, f"hidden/{name}", arr)
             write_array(f, "role_mask", res.role_mask)
+            for v in VARIANTS:
+                f["traces"][v].attrs["betas"] = np.asarray(res.betas[v], dtype=np.float64)
+                f["traces"][v].attrs["topk_ids_k"] = res.topk_ids_k[v]
     append_jsonl(sdir / "completed.jsonl",
                  {"id": res.item_id, "key": item_key(res.item_id), "time": time.time()})
 
@@ -125,9 +137,9 @@ def read_item(path: Path) -> dict:
         pos = f.attrs["reference_positions"]
         return {
             "id": str(f.attrs["id"]),
-            "betas": np.asarray(f.attrs["betas"]),
+            "betas": {v: np.asarray(f["traces"][v].attrs["betas"]) for v in VARIANTS},
             "topk_mass_k": int(f.attrs["topk_mass_k"]),
-            "topk_ids_k": int(f.attrs["topk_ids_k"]),
+            "topk_ids_k": {v: int(f["traces"][v].attrs["topk_ids_k"]) for v in VARIANTS},
             "reference_positions": {r: None if p < 0 else int(p) for r, p in zip(REFERENCES, pos)},
             "answer": json.loads(f["answer_json"][()].decode("utf-8")),
             "baselines": json.loads(f["baselines_json"][()].decode("utf-8")),
@@ -198,13 +210,12 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
     sdir = shard_path(ext_dir, shard_index)
 
     beta_rec = load_beta_star(cfg, items)
-    beta_star = float(beta_rec["variants"][CONTROL]["beta_star"])   # both variants from C4
     _ensure_identity(sdir, {
         "shard_index": shard_index, "num_shards": len(shards),
         "ids": [it.id for it in work],
         "input_sha256": sha256_file(input_path),
         "config_sha256": cfg.sha256(),
-        "beta_star": beta_star,
+        "beta_star": {v: beta_rec["variants"][v]["beta_star"] for v in VARIANTS},
         "bank_fingerprint": beta_rec["bank_fingerprint"],
     })
 
@@ -224,7 +235,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                 read_bank_fingerprint(cfg.bank_h5_path) != fingerprint:
             raise RuntimeError("model weights differ from the calibrated bank")
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
-        betas = cfg.extraction.betas(beta_star)
+        betas, k_ids = variant_betas(cfg, beta_rec), variant_topk_ids(cfg)
         hooks = ResidualHooks(bundle.model)
         t_items = time.time()
         try:
@@ -236,7 +247,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
                                           cfg.prompt.date_string)
                     trace = forward_item(bundle, hooks, prompt)
                     res = compute(bundle, bank, trace, it.id, betas, layers_h,
-                                  cfg.extraction.topk_mass_k, cfg.extraction.topk_ids_k)
+                                  cfg.extraction.topk_mass_k, k_ids)
                     del trace
                     write_item(sdir, res)
                     n_done += 1

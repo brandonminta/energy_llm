@@ -11,9 +11,12 @@ residual hooks, and every per-layer metric.
    max |logit_gen - logit_tf| (the TF/decoding discrepancy) is kept.
 3. A forward pre-hook on every layer's FFN norm (``core.model.ffn_norm``:
    ``post_attention_layernorm`` in Qwen2 / Llama) reads the residual x at its INPUT. x_hat, scores and all metrics are float32.
-4. Per layer (layers never mixed), per-token traces over every position
-   (prompt and response; the role mask separates them downstream) at every
-   beta of the grid (beta* last). No aggregation over tokens: that is
+4. Per layer (layers never mixed) and per score variant (``core.bank``:
+   cos_gamma_query primary, cos_gamma_key control, each with its own beta
+   grid, beta*_v last), per-token traces over every position (prompt and
+   response; the role mask separates them downstream). Trace names are
+   ``<variant>/<trace>``; ``query_gain`` and ``xhat_top1_frac`` do not depend
+   on the memories and are stored once. No aggregation over tokens: that is
    analysis, not extraction. Divergences compare each position with three
    reference positions: question_last (last question token), prompt_last
    (last prompt token) and response_first (first response token).
@@ -38,6 +41,15 @@ from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLAT
 
 FP16_MAX = float(np.finfo(np.float16).max)
 REFERENCES = ("question_last", "prompt_last", "response_first")
+PER_BETA = ("energy", "norm_entropy", "topk_mass", "mean_score", "var_score") + tuple(
+    f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES)
+SHARED = ("query_gain", "xhat_top1_frac")       # [L, T], independent of the memories
+
+
+def variant_traces(traces: dict, variant: str) -> dict:
+    """The traces of one variant with the ``<variant>/`` prefix removed."""
+    pre = variant + "/"
+    return {k[len(pre):]: v for k, v in traces.items() if k.startswith(pre)}
 
 
 class NonFiniteError(RuntimeError):
@@ -194,65 +206,80 @@ class ItemResult:
     item_id: str
     answer: dict
     baselines: dict
-    betas: list[float]                      # grid + [beta*]
+    betas: dict[str, list[float]]           # per variant: grid + [beta*_v]
     topk_mass_k: int
-    topk_ids_k: int
+    topk_ids_k: dict[str, int]              # per variant; 0 = topk_ids not stored
     reference_positions: dict[str, int | None]
-    # name -> [L, T, n_beta] float32 (energy, norm_entropy, topk_mass, mean_score,
-    # var_score, js/<ref>, dkl/<ref>), [L, T] float32 (margin, xhat_top1_frac),
-    # [L, T, k_ids] int32 (topk_ids). Item files store the floats as float16.
+    # "<variant>/<name>" -> [L, T, n_beta] float32 (PER_BETA), [L, T] float32
+    # (margin), [L, T, k_ids] int32 (topk_ids, only if k_ids > 0); SHARED
+    # names -> [L, T] float32. Item files store the floats as float16.
     traces: dict[str, np.ndarray]
     role_mask: np.ndarray                   # [T] int8
     hidden: dict[str, np.ndarray]           # position name -> [L_h, D] float16
 
 
-def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float):
+def _layer_scores(bank: Bank, x: torch.Tensor, l: int, eps: float, variant: str):
     x_hat = metrics.rms_normalise(x.to(bank.device), eps)
-    return x_hat, bank.scores(l, x_hat)
+    return x_hat, bank.scores(l, x_hat, variant)
+
+
+def _fill_variant(tr: dict, v: str, l: int, s: torch.Tensor, betas: list[float],
+                  refs: dict, topk_mass_k: int, topk_ids_k: int) -> None:
+    """Every trace of variant v at layer l from its scores s [T, D_ff]."""
+    tr[f"{v}/margin"][l] = metrics.margin(s)
+    if topk_ids_k:
+        # the ranking of p is the ranking of s at any beta > 0
+        tr[f"{v}/topk_ids"][l] = metrics.topk_indices(s, topk_ids_k)
+    for bi, beta in enumerate(betas):
+        logp = metrics.log_distribution(s, beta)
+        tr[f"{v}/energy"][l, :, bi] = metrics.energy(s, beta)
+        tr[f"{v}/norm_entropy"][l, :, bi] = metrics.norm_entropy(logp)
+        tr[f"{v}/topk_mass"][l, :, bi] = metrics.topk_mass(logp, topk_mass_k)
+        tr[f"{v}/mean_score"][l, :, bi] = metrics.mean_score(logp, s)
+        tr[f"{v}/var_score"][l, :, bi] = metrics.var_score(logp, s)
+        for r, pos in refs.items():
+            if pos is None:      # empty response: response_first undefined (NaN)
+                continue
+            lq = logp[pos]
+            tr[f"{v}/js/{r}"][l, :, bi] = metrics.js_divergence(logp, lq)
+            tr[f"{v}/dkl/{r}"][l, :, bi] = (metrics.kl_divergence(logp, lq)
+                                           - metrics.kl_divergence(lq, logp))
+        del logp
 
 
 @torch.inference_mode()
 def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: str,
-                 betas: list[float], hidden_layers: list[int], topk_mass_k: int,
-                 topk_ids_k: int) -> ItemResult:
-    """``betas``: the extraction grid with beta* last (``ExtractionConfig.betas``).
-    One s [T, D_ff] per layer; the grid is looped inside the layer."""
+                 betas: dict[str, list[float]], hidden_layers: list[int], topk_mass_k: int,
+                 topk_ids_k: dict[str, int]) -> ItemResult:
+    """``betas[v]``: variant v's extraction grid with beta*_v last
+    (``ExtractionConfig.betas``); ``topk_ids_k[v]`` = 0 stores no topk_ids for
+    v. One preactivation [T, D_ff] per layer serves both variants; the grid is
+    looped inside the layer."""
     dims = bundle.dims
-    L, T, nb = dims.n_layers, trace.n_prompt + len(trace.gen_ids), len(betas)
+    L, T = dims.n_layers, trace.n_prompt + len(trace.gen_ids)
     refs = trace.reference_positions
     nan = float("nan")
 
-    per_beta = ["energy", "norm_entropy", "topk_mass", "mean_score", "var_score"] + \
-        [f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES]
     dev = bank.device
-    tr = {k: torch.full((L, T, nb), nan, device=dev) for k in per_beta}
-    tr["margin"] = torch.empty(L, T, device=dev)
-    tr["xhat_top1_frac"] = torch.empty(L, T, device=dev)
-    tr["topk_ids"] = torch.empty(L, T, topk_ids_k, dtype=torch.int32, device=dev)
+    tr = {}
+    for v in VARIANTS:
+        tr |= {f"{v}/{k}": torch.full((L, T, len(betas[v])), nan, device=dev) for k in PER_BETA}
+        tr[f"{v}/margin"] = torch.empty(L, T, device=dev)
+        if topk_ids_k[v]:
+            tr[f"{v}/topk_ids"] = torch.empty(L, T, topk_ids_k[v], dtype=torch.int32, device=dev)
+    for k in SHARED:
+        tr[k] = torch.empty(L, T, device=dev)
     max_dev = 0.0
     for l in range(L):
-        x_hat, s = _layer_scores(bank, trace.residuals[l], l, dims.rms_norm_eps)
+        x_hat = metrics.rms_normalise(trace.residuals[l].to(dev), dims.rms_norm_eps)
         max_dev = max(max_dev, (x_hat.norm(dim=-1) / math.sqrt(dims.d_model) - 1.0).abs().max().item())
-        tr["margin"][l] = metrics.margin(s)
         tr["xhat_top1_frac"][l] = metrics.xhat_top1_frac(x_hat)
-        # the ranking of p is the ranking of s at any beta > 0
-        tr["topk_ids"][l] = metrics.topk_indices(s, topk_ids_k)
-        for bi, beta in enumerate(betas):
-            logp = metrics.log_distribution(s, beta)
-            tr["energy"][l, :, bi] = metrics.energy(s, beta)
-            tr["norm_entropy"][l, :, bi] = metrics.norm_entropy(logp)
-            tr["topk_mass"][l, :, bi] = metrics.topk_mass(logp, topk_mass_k)
-            tr["mean_score"][l, :, bi] = metrics.mean_score(logp, s)
-            tr["var_score"][l, :, bi] = metrics.var_score(logp, s)
-            for r, pos in refs.items():
-                if pos is None:      # empty response: response_first undefined (NaN)
-                    continue
-                lq = logp[pos]
-                tr[f"js/{r}"][l, :, bi] = metrics.js_divergence(logp, lq)
-                tr[f"dkl/{r}"][l, :, bi] = (metrics.kl_divergence(logp, lq)
-                                            - metrics.kl_divergence(lq, logp))
-            del logp
-        del x_hat, s
+        tr["query_gain"][l] = bank.query_gain(l, x_hat)
+        z = bank.preactivation(l, x_hat)
+        for v in VARIANTS:
+            _fill_variant(tr, v, l, bank.from_preactivation(l, z, x_hat, v), betas[v], refs,
+                          topk_mass_k, topk_ids_k[v])
+        del x_hat, z
 
     empty = trace.empty_response
     hidden_pos = refs | {"response_last": trace.response_positions[-1] if not empty else None}
@@ -316,8 +343,9 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "empty_response": empty,
     }
     return ItemResult(
-        item_id=item_id, answer=answer, baselines=baselines, betas=list(betas),
-        topk_mass_k=topk_mass_k, topk_ids_k=topk_ids_k, reference_positions=refs, traces=traces,
+        item_id=item_id, answer=answer, baselines=baselines,
+        betas={v: list(b) for v, b in betas.items()},
+        topk_mass_k=topk_mass_k, topk_ids_k=dict(topk_ids_k), reference_positions=refs, traces=traces,
         role_mask=np.asarray(trace.roles, dtype=np.int8),
         hidden={k: v.astype(np.float16) for k, v in hidden.items()},
     )

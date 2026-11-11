@@ -334,8 +334,8 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
         with h5py.File(ext_dir / "traces.h5") as f:
             for item_id, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
                 g = f[item_id]
-                h = g["norm_entropy"][..., -1]                            # beta* is last
-                v = g["var_score"][..., -1]
+                h = g[f"{CONTROL}/norm_entropy"][..., -1]                 # beta* is last
+                v = g[f"{CONTROL}/var_score"][..., -1]
                 resp = g["role_mask"][()] == ROLE_RESPONSE
                 h_prompt.append(h[:, n_p - 1])
                 var_p.append(v[:, :n_p].mean(axis=1))

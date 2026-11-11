@@ -12,7 +12,9 @@ from energy_llm.core.capture import ResidualHooks, compute_item, forward_item
 from energy_llm.core.prompting import build_prompt
 from energy_llm.verification.verify import (PermutedBank, gamma_shuffled_bank, permutation_tolerances,
                                              trace_ratios)
-from tests.conftest import DATE, SYSTEM, make_bundle
+from energy_llm.core.bank import CONTROL
+from energy_llm.verification.verify import view
+from tests.conftest import DATE, SYSTEM, both, make_bundle
 
 Q = "what is the capital of france"
 
@@ -35,14 +37,14 @@ def _scores(bundle, bank, tr, l):
 def test_permuting_memories_changes_nothing(setup):
     bundle, bank, tr = setup
     L = list(range(bundle.dims.n_layers))
-    a = compute_item(bundle, bank, tr, "x", [2.0, 9.0], L, 4, 8)
+    a = compute_item(bundle, bank, tr, "x", both([2.0, 9.0]), L, 4, both(8))
     pbank = PermutedBank(bank, seed=3)
     assert any((p != torch.arange(len(p))).any() for p in pbank.perm)
     s, sp = _scores(bundle, bank, tr, 0), _scores(bundle, pbank, tr, 0)
     np.testing.assert_allclose(sp.numpy(), s[:, pbank.perm[0]].numpy(), atol=1e-6)
-    b = compute_item(bundle, pbank, tr, "x", [2.0, 9.0], L, 4, 8)
+    b = compute_item(bundle, pbank, tr, "x", both([2.0, 9.0]), L, 4, both(8))
     for name, arr in a.traces.items():
-        if name == "topk_ids":     # memory indices move with the permutation
+        if name.endswith("topk_ids"):     # memory indices move with the permutation
             np.testing.assert_array_equal(pbank.perm[0][b.traces[name][0]].numpy(), arr[0])
         else:
             np.testing.assert_allclose(b.traces[name], arr, atol=1e-5, rtol=0, err_msg=name)
@@ -55,17 +57,18 @@ def test_permutation_within_derived_tolerances_and_gamma_control_fails(setup):
     bundle, bank, tr = setup
     L = list(range(bundle.dims.n_layers))
     betas = [1.0, 31.6, 72.776, 1e4]
-    a = compute_item(bundle, bank, tr, "x", betas, L, 4, 8)
+    a = compute_item(bundle, bank, tr, "x", both(betas), L, 4, both(8))
     pbank = PermutedBank(bank, seed=3)
-    b = compute_item(bundle, pbank, tr, "x", betas, L, 4, 8)
-    tol = permutation_tolerances(bundle, bank, pbank, tr, a, betas, 4)
-    assert set(tol) == set(a.traces) - {"topk_ids"}
-    r = trace_ratios(b.traces, a.traces, tol, betas)
+    b = compute_item(bundle, pbank, tr, "x", both(betas), L, 4, both(8))
+    av, bv = view(a.traces, CONTROL), view(b.traces, CONTROL)
+    tol = permutation_tolerances(bundle, bank, pbank, tr, av, betas, 4)
+    assert set(tol) == set(av) - {"topk_ids", "query_gain"}
+    r = trace_ratios(bv, av, tol, betas)
     assert 0 < r["worst"]["ratio"] <= 1.0, r["worst"]
     assert r["worst"]["beta"] in betas
     assert r["traces"]["dkl/question_last"]["max_ratio"] > 1e-3      # not loose by orders
-    ctrl = compute_item(bundle, gamma_shuffled_bank(bank), tr, "x", betas, L, 4, 8)
-    assert trace_ratios(ctrl.traces, a.traces, tol, betas)["worst"]["ratio"] > 1e3
+    ctrl = compute_item(bundle, gamma_shuffled_bank(bank), tr, "x", both(betas), L, 4, both(8))
+    assert trace_ratios(view(ctrl.traces, CONTROL), av, tol, betas)["worst"]["ratio"] > 1e3
 
 
 def test_beta_limits(setup):
@@ -111,8 +114,8 @@ def test_two_identical_runs_are_bit_identical_on_cpu(pair):
         date = DATE if "date_string" in bundle.tokenizer.chat_template else None
         tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, Q, date))
         hooks.remove()
-        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", [2.0, 9.0],
-                                               list(range(bundle.dims.n_layers)), 4, 8)))
+        outs.append((tr.gen_ids, compute_item(bundle, bank, tr, "x", both([2.0, 9.0]),
+                                               list(range(bundle.dims.n_layers)), 4, both(8))))
     assert outs[0][0] == outs[1][0]
     a, b = outs[0][1], outs[1][1]
     for name in a.traces:

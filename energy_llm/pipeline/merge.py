@@ -5,9 +5,10 @@ atomically, into ``<output_dir>/extract/<name>/``:
 
     answers.parquet    id, prompt, response, token ids, lengths, truncation, ...
     baselines.parquet  mean/min token log-probability, mean token entropy, mean_neg_logit
-    traces.h5          /<id>/{energy, norm_entropy, topk_mass, mean_score, var_score,
-                              js/<ref>, dkl/<ref>} [L, T, n_beta], {margin, xhat_top1_frac}
-                       [L, T], topk_ids [L, T, k], role_mask [T]
+    traces.h5          /<id>/<variant>/{energy, norm_entropy, topk_mass, mean_score,
+                              var_score, js/<ref>, dkl/<ref>} [L, T, n_beta], margin [L, T],
+                              topk_ids [L, T, k] (cos_gamma_key: only if control_topk_ids_k > 0);
+                       /<id>/{query_gain, xhat_top1_frac} [L, T], role_mask [T]
     hidden.h5          /<id>/{question_last, prompt_last, response_first, response_last}
                        [layers, D] float16
     bank.h5            gamma and W_tilde row norms per layer (copied from calibration)
@@ -24,7 +25,7 @@ import numpy as np
 
 from energy_llm import manifest
 from energy_llm.config import RunConfig
-from energy_llm.core.bank import CONTROL
+from energy_llm.core.bank import PRIMARY, VARIANTS
 from energy_llm.core.capture import REFERENCES
 from energy_llm.core.prompting import ROLE_NAMES
 from energy_llm.pipeline.extract import (
@@ -113,27 +114,32 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
             if "gamma_top_k" in f.attrs else None
 
     answers, baselines = [], []
-    constants = None                       # (betas, topk_mass_k, topk_ids_k): equal for every item
+    constants = None                       # (betas, topk_mass_k, topk_ids_k) per variant: equal for every item
     max_xhat_top1 = dict.fromkeys(REFERENCES)
     with atomic_path(ext_dir / "traces.h5") as t_tmp, atomic_path(ext_dir / "hidden.h5") as h_tmp:
         with h5py.File(t_tmp, "w") as tf, h5py.File(h_tmp, "w") as hf:
             tf.attrs["role_codes"] = np.asarray(sorted(ROLE_NAMES), dtype=np.int8)
             tf.attrs["role_names"] = [ROLE_NAMES[k] for k in sorted(ROLE_NAMES)]
-            tf.attrs["beta_star"] = float(beta_rec["variants"][CONTROL]["beta_star"])   # per variant from C4
+            tf.attrs["variants"] = list(VARIANTS)
+            tf.attrs["primary"] = PRIMARY
+            tf.attrs["beta_star"] = np.asarray([beta_rec["variants"][v]["beta_star"] for v in VARIANTS])
             tf.attrs["reference_names"] = list(REFERENCES)
-            tf.attrs["layout"] = ("per token: energy, norm_entropy, topk_mass, mean_score, var_score, "
-                                  "js/<ref>, dkl/<ref>: [L, T, n_beta] float16 (betas, beta* last); "
-                                  "margin, xhat_top1_frac: [L, T] float16; topk_ids: [L, T, "
-                                  "topk_ids_k] int32; role_mask: [T]; gzip 4, chunks [1, ...]; "
-                                  "group attr reference_positions [3] in reference_names order, "
-                                  "-1 = none (empty response)")
+            tf.attrs["layout"] = ("per id and score variant (attr variants; primary first), "
+                                  "<variant>/{energy, norm_entropy, topk_mass, mean_score, var_score, "
+                                  "js/<ref>, dkl/<ref>}: [L, T, n_beta] float16 (attr betas[variant], "
+                                  "beta*_v last); <variant>/margin: [L, T] float16; "
+                                  "<variant>/topk_ids: [L, T, topk_ids_k[variant]] int32 (absent when "
+                                  "0); per id query_gain, xhat_top1_frac: [L, T] float16; role_mask: "
+                                  "[T]; gzip 4, chunks [1, ...]; group attr reference_positions [3] "
+                                  "in reference_names order, -1 = none (empty response)")
             hf.attrs["layers"] = np.asarray(cfg.hidden_layer_indices(n_layers))
             hf.attrs["layout"] = ("residual at the input of post_attention_layernorm at "
                                   "question_last, prompt_last, response_first, response_last "
                                   "(NaN when the response is empty): [layers, D] float16")
             for item_id in order:
                 rec = read_item(item_path(shard_path(ext_dir, shard_of[item_id]), item_id))
-                c = (rec["betas"].tolist(), rec["topk_mass_k"], rec["topk_ids_k"])
+                c = ({v: b.tolist() for v, b in rec["betas"].items()}, rec["topk_mass_k"],
+                     rec["topk_ids_k"])
                 if constants is None:
                     constants = c
                 elif c != constants:
@@ -156,8 +162,10 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
                 for k, arr in rec["hidden"].items():
                     write_array(g, k, arr)
             if constants is not None:
-                tf.attrs["betas"] = np.asarray(constants[0], dtype=np.float64)   # last = beta*
-                tf.attrs["topk_mass_k"], tf.attrs["topk_ids_k"] = constants[1], constants[2]
+                # [n_variants, n_beta] in `variants` order; last column = beta*_v
+                tf.attrs["betas"] = np.asarray([constants[0][v] for v in VARIANTS], dtype=np.float64)
+                tf.attrs["topk_mass_k"] = constants[1]
+                tf.attrs["topk_ids_k"] = np.asarray([constants[2][v] for v in VARIANTS], dtype=np.int64)
 
     _write_parquet(pd.DataFrame(answers), ext_dir / "answers.parquet")
     _write_parquet(pd.DataFrame(baselines), ext_dir / "baselines.parquet")

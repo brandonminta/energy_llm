@@ -3,8 +3,9 @@
 Reads only the merged outputs of an extraction directory (no model). Prints
 the position table (position, token id, token text when the tokenizer is in
 the local cache, role, reference position / response) and, per layer, E,
-H_bar, margin, var_score and topk_mass at beta* from traces.h5 at the three
-reference positions and averaged over the response.
+H_bar, margin, var_score and topk_mass at beta*_v of one score variant
+(default the primary, cos_gamma_query) and the query gain g_t from
+traces.h5, at the three reference positions and averaged over the response.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
+from energy_llm.core.bank import PRIMARY
 from energy_llm.core.capture import REFERENCES
 from energy_llm.core.prompting import ROLE_NAMES, ROLE_RESPONSE
 from energy_llm.storage import load_json
@@ -28,7 +30,7 @@ def _tokenizer(manifest: dict):
         return None
 
 
-def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
+def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None, variant: str = PRIMARY) -> str:
     import h5py
     import pandas as pd
 
@@ -39,10 +41,13 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
         raise KeyError(f"id {item_id!r} not in {run_dir}/answers.parquet")
     a = ans.loc[item_id]
     with h5py.File(run_dir / "traces.h5") as f:
+        if variant not in f.attrs["variants"]:
+            raise KeyError(f"variant {variant!r} not in {list(f.attrs['variants'])}")
         g = f[item_id]
-        # beta* is the last beta; margin is beta-free
-        tables = {name: g[name][()] if name == "margin" else g[name][..., -1]
+        # beta*_v is the last beta; margin and query_gain are beta-free
+        tables = {name: g[f"{variant}/{name}"][()] if name == "margin" else g[f"{variant}/{name}"][..., -1]
                   for name in ("energy", "norm_entropy", "margin", "var_score", "topk_mass")}
+        tables["query_gain"] = g["query_gain"][()]
         roles = g["role_mask"][()]
         refs = {r: int(p) for r, p in zip(REFERENCES, g.attrs["reference_positions"]) if p >= 0}
     ids = list(a["prompt_token_ids"]) + list(a["generated_token_ids"])
@@ -52,8 +57,8 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
     stop = a["stop_token_id"]
     stop = "none" if stop is None or (isinstance(stop, float) and np.isnan(stop)) else int(stop)
 
-    b_star = "  ".join(f"{v}={b:.6g}" for v, b in manifest["beta_star"].items())
-    out = [f"id {item_id}   beta* {b_star}   prompt tokens {n_p}, "
+    out = [f"id {item_id}   variant {variant}   beta*={manifest['beta_star'][variant]:.6g}   "
+           f"prompt tokens {n_p}, "
            f"generated {int(a['n_generated_tokens'])}, response {int(a['n_response_tokens'])}, "
            f"empty_response={bool(a['empty_response'])}, truncated={bool(a['truncated'])}, "
            f"stop_token_id={stop}",
@@ -68,7 +73,7 @@ def inspect_item(run_dir: str | Path, item_id: str, tokenizer=None) -> str:
     nan = float("nan")
     cols = list(REFERENCES) + ["response_mean"]
     for name, tr in tables.items():
-        out += ["", f"{name} per layer" + ("" if name == "margin" else " at beta*"),
+        out += ["", f"{name} per layer" + ("" if name in ("margin", "query_gain") else " at beta*"),
                 f"{'layer':>5}  " + "  ".join(f"{c:>14}" for c in cols)]
         for l in range(tr.shape[0]):
             vals = [tr[l, refs[r]] if r in refs else nan for r in REFERENCES]

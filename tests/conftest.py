@@ -91,6 +91,13 @@ def make_pair(arch: str):
     return model, tok
 
 
+def both(x):
+    """The same value for every score variant (betas / topk_ids_k of compute_item)."""
+    from energy_llm.core.bank import VARIANTS
+
+    return {v: x for v in VARIANTS}
+
+
 def make_bundle(model, tok, max_new_tokens: int = 8):
     from energy_llm.core.model import prepare_bundle
 

@@ -94,6 +94,10 @@ def test_smoke_diagnostics_on_cuda(gpu_run):
     s = run_smoke(cfg, bundle, items, n=3, name="smoke-gpu")
     assert s["n_completed"] == 3 and s["n_failed"] == 0
     assert s["peak_gpu_mem_gb"] is not None
-    assert len(s["per_layer"]) == bundle.dims.n_layers
-    assert {"ablation_betas", "beta_per_layer", "prompt_last_entropy", "bands_excluding_layer0"} <= set(s)
+    assert len(s["per_layer_shared"]) == bundle.dims.n_layers
+    assert set(s["variants"]) == {"cos_gamma_query", "cos_gamma_key"}
+    for pv in s["variants"].values():
+        assert {"ablation_betas", "beta_per_layer", "prompt_last_entropy", "bands_excluding_layer0",
+                "layer_exclusion"} <= set(pv)
+    assert len(s["query_gain"]["per_layer"]) == bundle.dims.n_layers
     assert "ablation dstar_zeroed" in format_summary(s)

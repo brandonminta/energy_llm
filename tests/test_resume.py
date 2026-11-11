@@ -300,14 +300,39 @@ def test_smoke_summary(calibrated, capsys):
     from energy_llm.pipeline.smoke import format_summary, run_smoke
 
     cfg, bundle, ev, rec = calibrated
+    variants = ["cos_gamma_query", "cos_gamma_key"]
     s = run_smoke(cfg, bundle, read_items(ev), n=5, name="smoke-test")
     assert s["n_questions"] == 5 and s["n_completed"] == 5 and s["n_failed"] == 0
-    assert s["model_dtype"] == "float32" and s["beta_star"] == rec["variants"]["cos_gamma_key"]["beta_star"]
+    assert s["model_dtype"] == "float32" and s["trace_dtype"] == "float32"
+    assert s["beta_star"] == {v: rec["variants"][v]["beta_star"] for v in variants}
+    assert s["primary"] == "cos_gamma_query" and set(s["variants"]) == set(variants)
+    assert set(s["calibration"]["grid_position"]) == set(variants)
     assert s["tf_token_match_pct"] == 100.0 and s["tf_exact_answers_pct"] == 100.0
     assert s["sec_per_question"] > 0 and s["peak_gpu_mem_gb"] is None   # CPU
-    assert len(s["mean_norm_entropy_per_layer"]["prompt"]) == bundle.dims.n_layers
     assert {"n_empty_response", "n_truncated", "xhat_norm_max_rel_dev"} <= set(s)
     assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
+    L = bundle.dims.n_layers
+    # topk_ids of the control variant are not stored: the saving is reported
+    ts = s["topk_ids_storage"]
+    assert ts["control_topk_ids_k"] == 0 and ts["would_be_k"] == 8
+    T_mean = np.mean([a + b for a, b in zip(*[pd.read_parquet(cfg.extraction_dir("smoke-test") / "answers.parquet")[c]
+                                               for c in ("n_prompt_tokens", "n_generated_tokens")])])
+    assert ts["saved_mb_per_question_uncompressed"] == pytest.approx(L * T_mean * 8 * 4 / 1e6)
+    assert 0 < ts["saved_mb_per_question_gzip_estimate"]
+    # bands by relative depth, with the shared per-layer diagnostics
+    assert [b["layers"] for b in s["depth_bands"]] == [[0, 0], [1, 1], [2, 2]]     # L = 3: l/L thirds
+    assert len(s["per_layer_shared"]) == L
+    for r in s["per_layer_shared"]:
+        assert 0 <= r["dstar"] < bundle.dims.d_model and 0 < r["dstar_share"] <= 1
+    qg = s["query_gain"]
+    assert len(qg["per_layer"]) == L and len(qg["bands"]) == 3
+    for row in qg["per_layer"]:
+        for r in ("question_last", "prompt_last", "response"):
+            st = row[r]
+            assert 0 < st["min"] <= st["p10"] <= st["median"] <= st["p90"] <= st["max"]
+    ex = s["layer_exclusion"]
+    assert ex["applied"] is False and ex["proposed_from"] == "cos_gamma_query"
+    assert ex["proposed_excluded_layers"] is None or ex["proposed_excluded_layers"][0] == 0
     text = format_summary(s)
     assert "TF == greedy" in text and "layer   0" in text
     assert s["tf_disagreements"]["n"] == 0 and s["tf_disagreements"]["all_below_delta"] is True
@@ -315,55 +340,103 @@ def test_smoke_summary(calibrated, capsys):
     assert f"report: {cfg.extraction_dir('smoke-test')}/smoke_report.json" in text
     assert "ablation top_gamma_zeroed" in text and "ablation dstar_zeroed" in text
     assert "without layer 0" in text and "beta_l" in text and "re-matched beta" in text
-    L = bundle.dims.n_layers
-    assert len(s["per_layer"]) == L
-    for r in s["per_layer"]:
-        assert 0 <= r["dstar"] < bundle.dims.d_model and 0 < r["dstar_share"] <= 1
-        assert set(r["delta_norm_entropy"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
-        assert set(r["criteria"]) == {"criterion3_xhat_prompt_last_median_gt_0.5",
-                                      "criterion4_gamma_fraction_gt_0.5_or_sign_flip",
-                                      "gamma_ablation_sign_flip"}
-    first = s["bands_excluding_layer0"][0]          # None when the first third is layer 0 alone
-    assert first is None if s["bands"][0]["layers"] == [0, 0] else first["layers"][0] == 1
-    assert s["bands_excluding_layer0"][1:] == s["bands"][1:]
-    # re-matched beta: the ablated bank's mean H_bar(prompt_last) returns to the intact value
-    ab = s["ablation_betas"]
-    assert ab["beta_matched"]["intact"] == rec["variants"]["cos_gamma_key"]["beta_star"]
-    for k in ("top_gamma_zeroed", "dstar_zeroed"):
-        bm = ab["beta_matched"][k]
-        assert bm is None or bm > 0
-        blk = s["bands"][0]["ablation"][k]
-        assert (blk["beta_matched"] is None) == (bm is None)
-    # intact at the re-matched beta is intact at beta*
-    assert s["bands"][0]["ablation"]["intact"]["beta_matched"] == s["bands"][0]["ablation"]["intact"]["beta_star"]
-    bl = s["beta_per_layer"]
-    assert len(bl["per_layer"]) == L and bl["target"] == rec["target_norm_entropy"]
-    assert bl["min"] is None or bl["min"] <= bl["max"]
-    pl = s["prompt_last_entropy"]
-    assert pl["target_band"] == pytest.approx([rec["target_norm_entropy"] - 0.05, rec["target_norm_entropy"] + 0.05])
-    lo, hi = pl["calibration_bracket"]
-    assert lo <= hi and pl["in_calibration_bracket"] == (lo <= pl["mean_h_prompt_last_beta_star"] <= hi)
-    L = bundle.dims.n_layers
-    assert len(s["bands"]) == 3 and s["bands"][0]["layers"][0] == 0 and s["bands"][-1]["layers"][1] == L - 1
-    # the intact branch of the ablation equals the production traces (float16 storage)
+    assert "beta*[cos_gamma_query] (primary)" in text and "beta*[cos_gamma_key]" in text
+    assert "== cos_gamma_query (primary)" in text and "== cos_gamma_key" in text
+    assert "NOT applied" in text and "query gain g_t" in text and "MB/question" in text
     d = cfg.extraction_dir("smoke-test")
     ans = pd.read_parquet(d / "answers.parquet")
-    deltas = []
-    with h5py.File(d / "traces.h5") as f:
-        for i, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
-            h, resp = f[i]["cos_gamma_key/norm_entropy"][..., -1].astype(np.float64), f[i]["role_mask"][()] == 3
-            if resp.any():
-                deltas.append(h[:, resp].mean(1) - h[:, n_p - 1])
-    for b in s["bands"]:
-        lo, hi = b["layers"]
-        want = np.mean(np.asarray(deltas)[:, lo:hi + 1])
-        got = b["delta_norm_entropy_response_minus_prompt_last"]
-        assert got["intact"] == pytest.approx(want, abs=2e-3)
-        assert np.isfinite(got["top_gamma_zeroed"]) and np.isfinite(got["dstar_zeroed"])
-        assert 0.0 <= b["gamma_top_fraction"] <= 1.0
-        for r in ("question_last", "prompt_last", "response_first"):
-            x = b["xhat_top1_frac"][r]
-            assert 0.0 < x["median"] <= x["max"] <= 1.0
+    for v in variants:
+        pv = s["variants"][v]
+        assert pv["beta_star"] == rec["variants"][v]["beta_star"]
+        assert len(pv["per_layer"]) == L
+        for r in pv["per_layer"]:
+            assert set(r["delta_norm_entropy"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
+            assert set(r["delta_norm_entropy_question_last"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
+            assert set(r["js_beta_star"]) == {"question_last", "prompt_last"}
+            assert set(r["criteria"]) == {"criterion3_xhat_prompt_last_median_gt_0.5",
+                                          "criterion4_gamma_fraction_gt_0.5_or_sign_flip",
+                                          "gamma_ablation_sign_flip"}
+        assert pv["bands_excluding_layer0"][0] is None          # the first third is layer 0 alone
+        assert pv["bands_excluding_layer0"][1:] == pv["bands"][1:]
+        ab = pv["ablation_betas"]
+        assert ab["beta_matched"]["intact"] == rec["variants"][v]["beta_star"]
+        for k in ("top_gamma_zeroed", "dstar_zeroed"):
+            bm = ab["beta_matched"][k]
+            assert bm is None or bm > 0
+            blk = pv["bands"][0]["ablation"][k]
+            assert (blk["beta_matched"] is None) == (bm is None)
+        assert pv["bands"][0]["ablation"]["intact"]["beta_matched"] == pv["bands"][0]["ablation"]["intact"]["beta_star"]
+        bl = pv["beta_per_layer"]
+        assert len(bl["per_layer"]) == L and bl["target"] == rec["target_norm_entropy"]
+        assert bl["min"] is None or bl["min"] <= bl["max"]
+        pl = pv["prompt_last_entropy"]
+        assert pl["target_band"] == pytest.approx([rec["target_norm_entropy"] - 0.05,
+                                                   rec["target_norm_entropy"] + 0.05])
+        lo, hi = pl["calibration_bracket"]
+        assert lo <= hi and pl["in_calibration_bracket"] == (lo <= pl["mean_h_prompt_last_beta_star"] <= hi)
+        le = pv["layer_exclusion"]
+        assert len(le["beta_star_not_counted"]["per_layer"]) == L
+        assert le["beta_matched"] is None or le["beta_matched"]["excluded"][0] == 0
+        # the intact branch of the ablation equals the production traces (float16 storage)
+        deltas, deltas_q = [], []
+        with h5py.File(d / "traces.h5") as f:
+            for i, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
+                g = f[i]
+                h, resp = g[f"{v}/norm_entropy"][..., -1].astype(np.float64), g["role_mask"][()] == 3
+                q = g.attrs["reference_positions"][0]
+                if resp.any():
+                    deltas.append(h[:, resp].mean(1) - h[:, n_p - 1])
+                    deltas_q.append(h[:, resp].mean(1) - h[:, q])
+        for b in pv["bands"]:
+            lo, hi = b["layers"]
+            got = b["delta_norm_entropy_response_minus_prompt_last"]
+            assert got["intact"] == pytest.approx(np.mean(np.asarray(deltas)[:, lo:hi + 1]), abs=2e-3)
+            gq = b["delta_norm_entropy_response_minus_question_last"]
+            assert gq["intact"] == pytest.approx(np.mean(np.asarray(deltas_q)[:, lo:hi + 1]), abs=2e-3)
+            assert np.isfinite(got["top_gamma_zeroed"]) and np.isfinite(got["dstar_zeroed"])
+            assert 0.0 <= b["gamma_top_fraction"] <= 1.0
+            for r in ("question_last", "prompt_last", "response_first"):
+                x = b["xhat_top1_frac"][r]
+                assert 0.0 < x["median"] <= x["max"] <= 1.0
+    # the two variants are different numbers
+    assert s["variants"]["cos_gamma_query"]["per_layer"] != s["variants"]["cos_gamma_key"]["per_layer"]
+
+
+def test_depth_bands_are_relative():
+    from energy_llm.pipeline.smoke import depth_bands
+
+    for L in (3, 28, 36):
+        bands = depth_bands(L)
+        assert np.concatenate(bands).tolist() == list(range(L))
+        for k, b in enumerate(bands):
+            assert all(k / 3 <= l / L < (k + 1) / 3 for l in b)
+    assert [len(b) for b in depth_bands(36)] == [12, 12, 12]
+    assert [len(b) for b in depth_bands(28)] == [10, 9, 9]
+
+
+def test_layer_exclusion_rule():
+    """A flip counts only with |dH| > 0.02 on both sides and both bootstrap
+    CIs excluding 0 with opposite signs; the first layer is always excluded."""
+    from energy_llm.pipeline.smoke import exclusion_layers
+
+    rng = np.random.default_rng(0)
+    n = 30
+    intact = np.stack([rng.normal(0.05, 0.01, n),        # l0: no flip (first layer anyway)
+                       rng.normal(0.05, 0.01, n),        # l1: clear flip
+                       rng.normal(0.01, 0.01, n),        # l2: flip but |dH| < 0.02 intact
+                       rng.normal(0.05, 0.30, n),        # l3: flip in mean, CI includes 0
+                       rng.normal(0.05, 0.01, n)], 1)    # l4: no flip
+    ablated = np.stack([rng.normal(0.05, 0.01, n), rng.normal(-0.05, 0.01, n),
+                        rng.normal(-0.05, 0.01, n), rng.normal(-0.05, 0.30, n),
+                        rng.normal(0.04, 0.01, n)], 1)
+    intact[0, 4] = np.nan                                # empty response dropped
+    out = exclusion_layers(intact, ablated, seed=42)
+    assert out["flip_layers"] == [1] and out["excluded"] == [0, 1]
+    l1 = out["per_layer"][1]
+    assert l1["ci_intact"][0] > 0 and l1["ci_ablated"][1] < 0 and l1["flip_counts"]
+    assert out["per_layer"][4]["n"] == n - 1
+    assert not out["per_layer"][3]["flip_counts"]
+    assert exclusion_layers(intact, ablated, seed=42) == out          # fixed seed: reproducible
 
 
 def test_tf_disagreements_delta_rule():

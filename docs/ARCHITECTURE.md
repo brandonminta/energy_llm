@@ -259,8 +259,8 @@ config key and no ablation path in production. `extract` refuses to run if the l
 | top-k mass | `topk_mass = exp(logsumexp of the k largest log p)` (sum of the k largest `p`, in the log domain) |
 | top-k indices | `topk_indices`: int32 indices of the k largest `log p`, descending |
 | x̂ top-1 fraction | `xhat_top1_frac = max_j x̂_j² / D` per row (1 for a one-hot residual, 1/D for a constant one) |
-| Kullback–Leibler (nats) | `KL(p‖q) = Σ p (log p - log q)`, clamped at 0 |
-| Jensen–Shannon (nats) | `log m = logaddexp(log p, log q) - log 2`; `JS = ½Σ p (log p - log m) + ½Σ q (log q - log m)`, clamped to `[0, log 2]` |
+| Kullback–Leibler (nats) | `KL(p‖q) = Σ p (log p - log q)`, clamped at 0; both rows come from one `log_softmax(β s)`, so `KL(p‖p) = 0` exactly |
+| Jensen–Shannon (nats) | pointwise in `d = log p - log q`: `log(p/m) = ln2 - softplus(-d)`, `log(q/m) = ln2 - softplus(d)`, `JS = ½Σ p log(p/m) + ½Σ q log(q/m)` with `ln2 := softplus(0)` in float32, so `JS(p,p) = 0` exactly; terms with `p_i = 0` (resp. `q_i = 0`) are 0 (xlogy convention, masked: no `0·inf`); clamped to `[0, log 2]` |
 
 Divergences take **log-probabilities**: at the β\* values that cosine
 scores produce (hundreds or more) float32 probabilities underflow, which
@@ -314,8 +314,8 @@ reduction over tokens is done in the module (aggregation is analysis).
   | `dkl/<ref>` | `[L, T, n_beta]` | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
 
   `<ref>` ∈ {`question_last`, `prompt_last`, `response_first`}. At a
-  reference position its own `dkl` row is exactly 0 and its own `js` row is
-  0 up to one float32 rounding (≤ 1e-7, from `logaddexp`). Plus
+  reference position its own `dkl` and `js` rows are exactly 0 (pointwise
+  forms, one `log_softmax`). Plus
   `role_mask [T] int8`.
 - Not computed anywhere: the un-normalised entropy `H`, pooled
   prompt-span references, any aggregate across layers or tokens.
@@ -524,7 +524,7 @@ Verification checks (none is part of the production path):
 | `hidden`: residuals at the four positions, derived independently (roles, stop tokens) | `verify.run_verify` | exact |
 | `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | in float16 ulps: 0 on CPU, ≤ 1 on GPU (a float32 difference of a recomputation can flip the last float16 bit); `topk_ids` exact on CPU, row Jaccard ≥ 0.98 on GPU |
 | `permutation`: permuting memories changes nothing | `verify.PermutedBank`; `tests/test_invariance.py` | `|Δ| / max(1, |value|)` ≤ 1e-5 (float32 summation order is relative to the magnitude; `dkl` reaches hundreds at β ~ 10⁴); `topk_ids` mapped through the permutation, row Jaccard ≥ 0.98 |
-| `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| ≤ 1e-7 (one rounding in logaddexp) |
+| `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| expected exactly 0 (pointwise forms); tolerance `4·u₃₂·log D_ff` (`self_divergence_tolerance`, 2.2e-6 at D_ff = 11008) |
 | `calibration`: H̄(β\*) on the warm-up set | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values |
 | `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, ≤ 1 float16 ulp on GPU |
 

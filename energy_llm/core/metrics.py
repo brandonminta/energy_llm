@@ -18,6 +18,8 @@ in nats, bounded by log 2; KL in nats) take LOG-probabilities: at large beta
 most float32 probabilities underflow to 0, which made m = (p+q)/2 vanish and
 JS jump to its log 2 clamp. log_softmax is always finite, so every divergence
 is computed in the log domain; topk_mass sums the top-k in the log domain too.
+JS is written pointwise in d = log p - log q so that JS(p, p) == 0 and
+KL(p || p) == 0 hold exactly (verify: self_divergence).
 """
 
 from __future__ import annotations
@@ -78,15 +80,27 @@ def xhat_top1_frac(x_hat: torch.Tensor) -> torch.Tensor:
 
 def kl_divergence(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
     """KL(p || q) in nats from log-probabilities, clamped at 0 (float32
-    rounding can make it slightly negative when p ~ q)."""
+    rounding can make it slightly negative when p ~ q). Callers pass both
+    rows of ONE log_softmax(beta s) tensor, so KL(p || p) is exactly 0: every
+    term is p * (logp - logp) = 0."""
     return (logp.exp() * (logp - logq)).sum(dim=-1).clamp_min(0.0)
 
 
 def js_divergence(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
-    """Jensen-Shannon divergence in nats from log-probabilities, with
-    log m = logaddexp(log p, log q) - log 2 (never -inf). Clamped to
-    [0, log 2] to absorb float32 rounding at the bounds."""
-    log_m = torch.logaddexp(logp, logq) - LN2
-    js = 0.5 * (logp.exp() * (logp - log_m)).sum(dim=-1) \
-        + 0.5 * (logq.exp() * (logq - log_m)).sum(dim=-1)
-    return js.clamp(0.0, LN2)
+    """Jensen-Shannon divergence in nats from log-probabilities, pointwise:
+    with d = log p - log q,
+        log(p/m) = log 2 - softplus(-d),   log(q/m) = log 2 - softplus(d),
+        JS = 1/2 sum p log(p/m) + 1/2 sum q log(q/m).
+    log 2 is taken as softplus(0) in the same dtype, so every term vanishes
+    exactly where d = 0 and JS(p, p) == 0 bit-exactly (the former
+    logaddexp(log p, log q) - log 2 form left one float32 rounding). Terms
+    with p_i = 0 (resp. q_i = 0) are 0 by the xlogy convention: masked, so
+    log p = -inf never produces 0 * inf. Clamped to [0, log 2] to absorb
+    float32 rounding at the bounds."""
+    d = logp - logq
+    ln2 = torch.nn.functional.softplus(torch.zeros((), dtype=d.dtype, device=d.device))
+    p, q = logp.exp(), logq.exp()
+    zero = torch.zeros((), dtype=d.dtype, device=d.device)
+    tp = torch.where(p > 0, p * (ln2 - torch.nn.functional.softplus(-d)), zero)
+    tq = torch.where(q > 0, q * (ln2 - torch.nn.functional.softplus(d)), zero)
+    return (0.5 * tp.sum(dim=-1) + 0.5 * tq.sum(dim=-1)).clamp(0.0, LN2)

@@ -76,8 +76,9 @@ def test_self_divergence_is_zero(setup):
     bundle, bank, tr = setup
     for l in range(bundle.dims.n_layers):
         lp = metrics.log_distribution(_scores(bundle, bank, tr, l), 9.0)
-        # logaddexp(a, a) - log 2 equals a up to one float32 rounding
-        assert metrics.js_divergence(lp, lp).abs().max().item() <= 1e-7
+        # pointwise JS and KL from one log_softmax: exactly zero
+        assert (metrics.js_divergence(lp, lp) == 0).all()
+        assert (metrics.kl_divergence(lp, lp) == 0).all()
 
 
 def test_two_identical_runs_are_bit_identical_on_cpu(pair):

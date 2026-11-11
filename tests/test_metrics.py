@@ -63,7 +63,33 @@ def test_js_symmetric_bounded_and_matches_scipy_convention():
     assert 0.0 <= js_pq <= math.log(2)
     ref = jensenshannon(p.double().numpy(), q.double().numpy(), base=2) ** 2 * math.log(2)
     assert js_pq == pytest.approx(ref, rel=1e-4)
-    assert metrics.js_divergence(p.log(), p.log()).item() == pytest.approx(0.0, abs=1e-6)
+    assert metrics.js_divergence(p.log(), p.log()).item() == 0.0
+
+
+@pytest.mark.parametrize("beta", [1.0, 72.776, 1e4])
+def test_self_divergences_are_exactly_zero(beta):
+    """JS(p, p) and KL(p || p) are 0 bit-exactly from one log_softmax(beta s)."""
+    _, s = _dist(11)
+    s = torch.stack([s, s.flip(0)])
+    lp = metrics.log_distribution(s, beta)
+    assert (metrics.js_divergence(lp, lp) == 0).all()
+    assert (metrics.kl_divergence(lp, lp) == 0).all()
+
+
+def test_js_with_zero_probabilities_follows_xlogy():
+    """log p = -inf (p_i = 0) contributes 0, never 0 * inf = NaN."""
+    ninf = float("-inf")
+    lp = torch.log(torch.tensor([0.5, 0.5, 0.0, 0.0]))
+    lq = torch.log(torch.tensor([0.5, 0.0, 0.5, 0.0]))
+    assert lp[2] == ninf and lq[1] == ninf
+    js = metrics.js_divergence(lp, lq).item()
+    p, q = np.array([0.5, 0.5, 0, 0]), np.array([0.5, 0, 0.5, 0])
+    ref = jensenshannon(p, q, base=2) ** 2 * math.log(2)
+    assert math.isfinite(js) and js == pytest.approx(ref, rel=1e-6)
+    assert metrics.js_divergence(lp, lp).item() == 0.0
+    # disjoint supports with -inf on both sides: exactly log 2 up to the clamp
+    a = torch.log(torch.tensor([1.0, 0.0])); b = torch.log(torch.tensor([0.0, 1.0]))
+    assert metrics.js_divergence(a, b).item() == pytest.approx(math.log(2), abs=1e-7)
 
 
 def test_js_reaches_log2_on_disjoint_supports():

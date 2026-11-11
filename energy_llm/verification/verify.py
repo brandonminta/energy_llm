@@ -149,6 +149,18 @@ def reference_tolerances(delta_s: float, beta: float, s_range: float, k_mass: in
 TOPK_MIN_JACCARD = 0.98
 
 
+def self_divergence_tolerance(d_ff: int, c: float = 4.0) -> float:
+    """JS(p, p) and KL(p || p) are computed pointwise from ONE log_softmax(beta s)
+    (metrics.js_divergence, metrics.kl_divergence), so every term is exactly 0
+    and the expected value is 0 bit-exactly. The tolerance is the bound a
+    non-exact implementation would have to meet: each of the D_ff terms carries
+    at most a relative rounding u32 on a log-ratio of size <= log D_ff (the
+    worst log-probability gap of a near-uniform p), hence c * u32 * log D_ff
+    with c = 4 (two roundings per term, the 1/2 weights, one of margin).
+    At D_ff = 11008: 2.2e-6."""
+    return c * UNIT_ROUNDOFF["float32"] * math.log(d_ff)
+
+
 def score_tolerance(d_model: int) -> float:
     """Sequential float32 dot product of D terms: |fl(sum) - sum| <= D u sum|terms|
     (first order), and sum|w_tilde_ij x_hat_j| / (||w_tilde_i|| sqrt(D)) <= 1
@@ -487,6 +499,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     finally:
         hooks.remove()
 
+    self_tol = self_divergence_tolerance(bundle.dims.d_ff)
     checks = [
         Check("reference", _status(all(ok for _, ok in acc["reference"])),
               max(r for r, _ in acc["reference"]), 1.0,
@@ -526,8 +539,9 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                          "|E + max s| - log(D_ff)/beta, var_score and 1 - topk_mass at beta=50/margin"}),
         Check("monotone", _status(max(acc["monotone"]) <= F32_FLOOR), max(acc["monotone"]), F32_FLOOR,
               {"metric": "max increase of H_bar between consecutive grid betas"}),
-        Check("self_divergence", _status(max(acc["self"]) <= 1e-7), max(acc["self"]), 1e-7,
-              {"metric": "max of JS(p, p) and |KL(p || p)|"}),
+        Check("self_divergence", _status(max(acc["self"]) <= self_tol), max(acc["self"]), self_tol,
+              {"metric": "max of JS(p, p) and |KL(p || p)| (expected exactly 0: pointwise forms)",
+               "tolerance_is": "4 * u32 * log(D_ff), see self_divergence_tolerance"}),
         Check("determinism", _status(all(acc["det_tokens"]) and max(e for e, _ in acc["files"]) <= det_tol),
               max(e for e, _ in acc["files"]), det_tol,
               {"tokens_equal": all(acc["det_tokens"]), "device": bundle.device.type,

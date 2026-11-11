@@ -86,6 +86,43 @@ def test_teacher_forcing_reproduces_greedy(pair, seed):
     assert checked == 4
 
 
+def test_tf_logit_discrepancy_recorded_and_exact_answers(pair):
+    bundle = make_bundle(*pair, max_new_tokens=6)
+    tr = _trace(bundle)
+    assert tr.tf_logit_diff.shape == (len(tr.gen_ids),) and tr.tf_logit_diff.dtype == np.float32
+    assert (tr.tf_logit_diff >= 0).all() and tr.tf_logit_diff.max() < 1e-3   # float32 tiny model
+    assert tr.tf_mismatch_margin_tf == tr.tf_mismatch_margin_gen == tr.tf_mismatch_tf_tokens == []
+
+
+def test_tf_mismatch_margins_are_recorded(qwen_pair, monkeypatch):
+    """Force the TF argmax off the greedy token at step 1: the mismatch, the TF
+    token and both top1 - top2 margins are recorded."""
+    bundle = make_bundle(*qwen_pair, max_new_tokens=6)
+    model = bundle.model
+    orig = model.forward
+    bump = {}
+
+    def forward(*args, **kwargs):
+        out = orig(*args, **kwargs)
+        if kwargs.get("use_cache") is False and out.logits.shape[1] > 2:
+            row = out.logits[0, 1]
+            top2 = torch.topk(row, 2)
+            bump["token"] = int(top2.indices[1])
+            row[top2.indices[1]] = top2.values[0] + 0.25        # runner-up wins by 0.25
+        return out
+
+    monkeypatch.setattr(model, "forward", forward)
+    tr = _trace(bundle)
+    if len(tr.gen_ids) < 2:
+        pytest.skip("needs two generated tokens")
+    assert tr.tf_mismatch_positions == [1]
+    assert tr.tf_mismatch_tf_tokens == [bump["token"]]
+    assert tr.tf_mismatch_margin_tf[0] == pytest.approx(0.25, abs=1e-5)
+    assert tr.tf_mismatch_margin_gen[0] > 0
+    assert tr.tf_mismatch_top_logit[0] > 0
+    assert tr.tf_logit_diff[1] >= 0.25 - 1e-5
+
+
 def test_token_logits_are_the_decoding_logits_of_the_chosen_tokens(qwen_pair):
     bundle = make_bundle(*qwen_pair, max_new_tokens=6)
     tr = _trace(bundle)
@@ -209,6 +246,10 @@ def test_item_shapes_and_bounds(item):
         assert np.all((t[f"js/{r}"] >= 0) & (t[f"js/{r}"] <= np.log(2)))
     assert 0.0 <= res.answer["xhat_norm_max_rel_dev"] < 0.05  # tiny residuals: eps is visible
     assert res.answer["n_response_tokens"] == len(tr.response_positions)
+    assert res.answer["tf_exact"] is True and res.answer["tf_mismatch_margin_tf"] == []
+    assert len(res.answer["tf_logit_diff"]) == res.answer["n_generated_tokens"]
+    assert res.answer["tf_logit_diff_max"] == max(res.answer["tf_logit_diff"])
+    assert res.answer["tf_logit_diff_step0"] == res.answer["tf_logit_diff"][0]
     assert "gold" not in str(res.answer)
 
 

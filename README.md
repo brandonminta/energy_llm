@@ -399,7 +399,7 @@ provenance, joins everything on `id`, and never needs the model.
 | File | Content |
 |---|---|
 | `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
-| `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches, `xhat_norm_max_rel_dev` |
+| `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches (`tf_exact`, positions, TF tokens, top1 − top2 margins in TF and generation), per-step TF/decoding logit discrepancy (`tf_logit_diff`, `tf_logit_diff_max`, `tf_logit_diff_step0`), `xhat_norm_max_rel_dev` |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy, `mean_neg_logit` (response tokens; NaN when empty) |
 | `traces.h5` | the datasets of "What is computed" per id, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions` (−1 = none); file attrs `betas` (β\* last), `topk_mass_k`, `topk_ids_k`, `reference_names`, `role_names`; gzip 4, one chunk per layer |
 | `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 (`response_*` NaN when empty) |

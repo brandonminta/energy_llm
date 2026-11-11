@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import math
 
 import numpy as np
 import torch
@@ -48,6 +49,38 @@ def run_single_process(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], pre
     report = run_extract(cfg, bundle, sel, inp, name, 0, stopper=stopper, model_load_s=model_load_s)
     m = run_merge(cfg, sel, inp, name, allow_incomplete=True)
     return cfg, ext_dir, report, m
+
+
+def bf16_ulp(x: float) -> float:
+    """One bfloat16 ulp at |x| (8 significand bits)."""
+    x = abs(float(x))
+    return 2.0 ** (math.floor(math.log2(x)) - 7) if x > 0 else 0.0
+
+
+def tf_disagreements(ans) -> dict:
+    """Every TF/greedy disagreement with its top1 - top2 logit margins, against
+    delta = max(p99 over the NON-divergent generated steps of the smoke of
+    max_v |logit_gen - logit_tf|, 3 bfloat16 ulps of |top1 logit| at that step).
+    Criterion: every disagreement has max(margin_tf, margin_gen) < delta, i.e.
+    it is a near-tie flipped by the TF/decoding numerical discrepancy."""
+    nondiv = [d for diffs, pos in zip(ans["tf_logit_diff"], ans["tf_mismatch_positions"])
+              for j, d in enumerate(diffs) if j not in set(int(p) for p in pos)]
+    p99 = float(np.percentile(nondiv, 99)) if nondiv else 0.0
+    rows = []
+    for r in ans.itertuples():
+        for k, j in enumerate(r.tf_mismatch_positions):
+            delta = max(p99, 3 * bf16_ulp(r.tf_mismatch_top_logit[k]))
+            m_tf, m_gen = float(r.tf_mismatch_margin_tf[k]), float(r.tf_mismatch_margin_gen[k])
+            rows.append({"id": r.id, "step": int(j), "token_gen": int(r.generated_token_ids[j]),
+                         "token_tf": int(r.tf_mismatch_tf_tokens[k]), "margin_tf": m_tf,
+                         "margin_gen": m_gen, "top_logit": float(r.tf_mismatch_top_logit[k]),
+                         "delta": delta, "below_delta": max(m_tf, m_gen) < delta})
+    return {"delta_rule": "max(p99 of max|logit_gen - logit_tf| over non-divergent steps, "
+                          "3 bf16 ulp(|top1 logit|))",
+            "p99_logit_diff_non_divergent": p99,
+            "max_logit_diff_step0": float(ans["tf_logit_diff_step0"].max()),
+            "n": len(rows), "all_below_delta": all(r["below_delta"] for r in rows),
+            "list": rows}
 
 
 def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 20,
@@ -155,7 +188,8 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
             })
         summary |= {
             "tf_token_match_pct": 100.0 * (1 - n_mis / n_gen) if n_gen else None,
-            "tf_exact_answers_pct": 100.0 * float((ans["tf_mismatch_count"] == 0).mean()),
+            "tf_exact_answers_pct": 100.0 * float(ans["tf_exact"].mean()),
+            "tf_disagreements": tf_disagreements(ans),
             "xhat_norm_max_rel_dev": float(ans["xhat_norm_max_rel_dev"].max()),
             "n_empty_response": int(ans["empty_response"].sum()),
             "n_truncated": int(ans["truncated"].sum()),
@@ -182,6 +216,17 @@ def format_summary(s: dict) -> str:
         f"  TF == greedy           {f(s.get('tf_token_match_pct'), '.2f')} % of tokens, "
         f"{f(s.get('tf_exact_answers_pct'), '.1f')} % of answers",
         f"  max | ||x_hat||/sqrt(D) - 1 |  {f(s.get('xhat_norm_max_rel_dev'), '.2e')}",
+    ]
+    d = s.get("tf_disagreements")
+    if d:
+        lines.append(f"  TF/greedy disagreements {d['n']}: all margins < delta: {d['all_below_delta']}   "
+                     f"(p99 non-divergent |dlogit| {d['p99_logit_diff_non_divergent']:.3g}, "
+                     f"max step-0 {d['max_logit_diff_step0']:.3g})")
+        for r in d["list"]:
+            lines.append(f"    {r['id']} step {r['step']}: gen {r['token_gen']} tf {r['token_tf']}  margin "
+                         f"tf {r['margin_tf']:.4g} gen {r['margin_gen']:.4g}  delta {r['delta']:.4g}  "
+                         f"{'ok' if r['below_delta'] else 'ABOVE'}")
+    lines += [
         f"  peak GPU memory        {f(peak.get('allocated'), '.2f')} GB allocated, "
         f"{f(peak.get('reserved'), '.2f')} GB reserved",
         f"  seconds / question     {f(s.get('sec_per_question'), '.2f')}   (model load "

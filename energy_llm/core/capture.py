@@ -6,7 +6,9 @@ residual hooks, and every per-layer metric.
    and predictive entropy (float32, from the decoding logits) and a
    truncation flag are kept.
 2. One forward pass over prompt ++ generated tokens. The argmax of its
-   logits must reproduce the greedy tokens; any mismatch is recorded.
+   logits must reproduce the greedy tokens; any mismatch is recorded with the
+   top1 - top2 logit margin in both passes, and per generated step the
+   max |logit_gen - logit_tf| (the TF/decoding discrepancy) is kept.
 3. A forward pre-hook on every ``post_attention_layernorm`` reads the
    residual x at its INPUT. x_hat, scores and all metrics are float32.
 4. Per layer (layers never mixed), per-token traces over every position
@@ -88,6 +90,14 @@ class ForwardTrace:
     response_positions: list[int]     # absolute positions, stop tokens excluded
     tf_mismatch_positions: list[int]  # indices j into gen_ids
     residuals: dict[int, torch.Tensor] = field(repr=False)
+    # TF vs decoding logits (float32): per generated step max_v |logit_gen - logit_tf|;
+    # at each mismatch the top1 - top2 margin in both passes, the TF argmax and
+    # max(|top1|) of the two (the scale of one bfloat16 ulp)
+    tf_logit_diff: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
+    tf_mismatch_margin_tf: list[float] = field(default_factory=list)
+    tf_mismatch_margin_gen: list[float] = field(default_factory=list)
+    tf_mismatch_tf_tokens: list[int] = field(default_factory=list)
+    tf_mismatch_top_logit: list[float] = field(default_factory=list)
 
     @property
     def n_prompt(self) -> int:
@@ -136,7 +146,7 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     token_logprobs = chosen.cpu().numpy().astype(np.float32)
     token_logits = logits.gather(1, gen_idx)[:, 0].cpu().numpy().astype(np.float32)
     token_entropies = ent.cpu().numpy().astype(np.float32)
-    del logits, logp
+    del logp
 
     max_new = bundle.generation_config.max_new_tokens
     stop_id = gen[-1] if gen[-1] in stops else None
@@ -151,16 +161,27 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
                    use_cache=False, logits_to_keep=len(gen) + 1)
     finally:
         hooks.enabled = False
-    tf_argmax = tf.logits[0, : len(gen)].argmax(dim=-1).tolist()
+    tf_logits = tf.logits[0, : len(gen)].float()                # [T_g, V]
     del tf
+    tf_argmax = tf_logits.argmax(dim=-1).tolist()
     mismatches = [j for j, (a, b) in enumerate(zip(tf_argmax, gen)) if a != b]
+    logit_diff = (logits - tf_logits).abs().max(dim=-1).values.cpu().numpy().astype(np.float32)
+    top_g = torch.topk(logits[mismatches], 2, dim=-1).values if mismatches else None
+    top_t = torch.topk(tf_logits[mismatches], 2, dim=-1).values if mismatches else None
+    del logits, tf_logits
     residuals, hooks.x = hooks.x, {}
+    mm = {"tf_mismatch_margin_tf": [], "tf_mismatch_margin_gen": [], "tf_mismatch_top_logit": []}
+    if mismatches:
+        mm["tf_mismatch_margin_tf"] = (top_t[:, 0] - top_t[:, 1]).tolist()
+        mm["tf_mismatch_margin_gen"] = (top_g[:, 0] - top_g[:, 1]).tolist()
+        mm["tf_mismatch_top_logit"] = torch.maximum(top_t[:, 0].abs(), top_g[:, 0].abs()).tolist()
 
     return ForwardTrace(
         prompt=prompt, gen_ids=gen, token_logprobs=token_logprobs, token_logits=token_logits,
         token_entropies=token_entropies, truncated=truncated, stop_token_id=stop_id,
         response_positions=resp_pos, tf_mismatch_positions=mismatches,
-        residuals=residuals,
+        residuals=residuals, tf_logit_diff=logit_diff,
+        tf_mismatch_tf_tokens=[tf_argmax[j] for j in mismatches], **mm,
     )
 
 
@@ -272,6 +293,14 @@ def compute_item(bundle: ModelBundle, bank: Bank, trace: ForwardTrace, item_id: 
         "token_entropies": trace.token_entropies.tolist(),
         "tf_mismatch_count": len(trace.tf_mismatch_positions),
         "tf_mismatch_positions": list(trace.tf_mismatch_positions),
+        "tf_exact": not trace.tf_mismatch_positions,
+        "tf_mismatch_tf_tokens": list(trace.tf_mismatch_tf_tokens),
+        "tf_mismatch_margin_tf": list(trace.tf_mismatch_margin_tf),
+        "tf_mismatch_margin_gen": list(trace.tf_mismatch_margin_gen),
+        "tf_mismatch_top_logit": list(trace.tf_mismatch_top_logit),
+        "tf_logit_diff": trace.tf_logit_diff.tolist(),
+        "tf_logit_diff_max": float(trace.tf_logit_diff.max()),
+        "tf_logit_diff_step0": float(trace.tf_logit_diff[0]),
         "xhat_norm_max_rel_dev": float(max_dev),
     }
     lp = trace.token_logprobs[resp_j]

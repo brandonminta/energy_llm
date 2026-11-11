@@ -300,6 +300,8 @@ def test_smoke_summary(calibrated, capsys):
     assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
     text = format_summary(s)
     assert "TF == greedy" in text and "layer   0" in text
+    assert s["tf_disagreements"]["n"] == 0 and s["tf_disagreements"]["all_below_delta"] is True
+    assert "TF/greedy disagreements 0" in text
     assert "ablation" in text and "gamma zeroed" in text
     L = bundle.dims.n_layers
     assert len(s["bands"]) == 3 and s["bands"][0]["layers"][0] == 0 and s["bands"][-1]["layers"][1] == L - 1
@@ -322,3 +324,27 @@ def test_smoke_summary(calibrated, capsys):
         for r in ("question_last", "prompt_last", "response_first"):
             x = b["xhat_top1_frac"][r]
             assert 0.0 < x["median"] <= x["max"] <= 1.0
+
+
+def test_tf_disagreements_delta_rule():
+    import pandas as pd
+
+    from energy_llm.pipeline.smoke import bf16_ulp, tf_disagreements
+
+    assert bf16_ulp(1.0) == 2.0 ** -7 and bf16_ulp(-20.0) == 2.0 ** -3 and bf16_ulp(0.0) == 0.0
+    ans = pd.DataFrame([
+        {"id": "a", "generated_token_ids": [5, 6, 7], "tf_mismatch_positions": [1],
+         "tf_mismatch_tf_tokens": [9], "tf_mismatch_margin_tf": [0.01], "tf_mismatch_margin_gen": [0.02],
+         "tf_mismatch_top_logit": [20.0], "tf_logit_diff": [0.05, 0.9, 0.05], "tf_logit_diff_step0": 0.05},
+        {"id": "b", "generated_token_ids": [1, 2], "tf_mismatch_positions": [1],
+         "tf_mismatch_tf_tokens": [3], "tf_mismatch_margin_tf": [0.5], "tf_mismatch_margin_gen": [0.4],
+         "tf_mismatch_top_logit": [1.0], "tf_logit_diff": [0.1, 0.6], "tf_logit_diff_step0": 0.1},
+    ])
+    d = tf_disagreements(ans)
+    # non-divergent steps: 0.05, 0.05, 0.1 -> p99 (linear) 0.099; the 0.9 / 0.6 steps are excluded
+    assert d["p99_logit_diff_non_divergent"] == pytest.approx(0.099)
+    assert d["max_logit_diff_step0"] == 0.1
+    a, b = d["list"]
+    assert a["delta"] == 3 * 2.0 ** -3 and a["below_delta"]                # 3 ulp at |20| = 0.375
+    assert b["token_gen"] == 2 and b["token_tf"] == 3 and not b["below_delta"]
+    assert d["n"] == 2 and d["all_below_delta"] is False

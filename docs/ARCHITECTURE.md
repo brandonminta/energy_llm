@@ -193,7 +193,14 @@ For one item `{id, question}` inside `extract` (the same sequence runs in
   `n_prompt-1 … n_prompt+len(gen)-2` is compared with `gen`;
   `tf_mismatch_positions` lists the indices `j` that differ. Mismatches are
   **recorded, not fatal** (`answers.parquet: tf_mismatch_count`,
-  `manifest.json: checks.tf_mismatch_ids`).
+  `tf_exact`, `manifest.json: checks.tf_mismatch_ids`). For every generated
+  step `j` the TF/decoding discrepancy `max_v |logit_gen − logit_tf|` (float32)
+  is kept (`tf_logit_diff`, its max `tf_logit_diff_max`, and
+  `tf_logit_diff_step0` = the alignment discrepancy at the last prompt
+  position); at each mismatch the top1 − top2 logit margin in TF
+  (`tf_mismatch_margin_tf`) and in generation (`tf_mismatch_margin_gen`), the
+  TF argmax (`tf_mismatch_tf_tokens`) and `max(|top1|)` of the two passes
+  (`tf_mismatch_top_logit`, the scale of a bfloat16 ulp).
 
 ### 5.4 Read point (`core/capture.py: ResidualHooks`)
 
@@ -334,6 +341,8 @@ reduction over tokens is done in the module (aggregation is analysis).
   `empty_response`, `truncated`, `stop_token_id`, per-token log-probs,
   logits of the chosen token (`token_logits`, float32, the same decoding
   logits as the log-probs) and entropies, TF mismatch count and positions,
+  `tf_exact`, the per-mismatch margins, TF tokens and top logits, the per-step
+  `tf_logit_diff` with `tf_logit_diff_max` and `tf_logit_diff_step0` (5.3),
   `xhat_norm_max_rel_dev`.
 
 ### 5.9 Empty responses and failures
@@ -486,7 +495,11 @@ median s per item` (a 2 h target inside the 3 h walltime).
   selected items to `<ext_dir>/input.jsonl`, runs `run_extract` for shard 0
   and `run_merge(allow_incomplete=True)` in the same process; `run_smoke`
   then summarises: counts, dtype, β\*, TF==greedy % of tokens and of
-  answers, max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
+  answers, the **list of TF/greedy disagreements** (id, step, generated and TF
+  token, margins in both passes) against `δ = max(p99 over the non-divergent
+  generated steps of the smoke of tf_logit_diff, 3 bf16 ulp(|top1 logit|))`
+  with the criterion "every disagreement has max(margin_tf, margin_gen) < δ"
+  (`smoke.tf_disagreements`; the step-0 maximum is reported as information), max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
   truncated counts, per layer the mean over ids of `H̄` at β\* (last
   β column) read from `traces.h5` (prompt = last prompt token | response = each id's mean over
   its response positions, empty responses skipped), and per layer band

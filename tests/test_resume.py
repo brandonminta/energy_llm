@@ -302,6 +302,7 @@ def test_smoke_summary(calibrated, capsys):
     assert "TF == greedy" in text and "layer   0" in text
     assert s["tf_disagreements"]["n"] == 0 and s["tf_disagreements"]["all_below_delta"] is True
     assert "TF/greedy disagreements 0" in text
+    assert f"report: {cfg.extraction_dir('smoke-test')}/smoke_report.json" in text
     assert "ablation top_gamma_zeroed" in text and "ablation dstar_zeroed" in text
     assert "without layer 0" in text and "beta_l" in text and "re-matched beta" in text
     L = bundle.dims.n_layers

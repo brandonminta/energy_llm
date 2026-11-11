@@ -309,6 +309,7 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
     ans = pd.read_parquet(ext_dir / "answers.parquet") if m["counts"]["completed"] else None
     summary: dict = {
         "name": name,
+        "extraction_dir": str(ext_dir),
         "n_questions": len(sel),
         "n_completed": m["counts"]["completed"],
         "n_failed": len({r["id"] for r in failed}),
@@ -445,4 +446,6 @@ def format_summary(s: dict) -> str:
             lines.append(f"    layer {l:>3}  {a:.4f} | {b:.4f}")
     for r in s["failures"]:
         lines.append(f"  FAILED {r['id']}: {r['error']}")
+    if s.get("extraction_dir"):     # hpc/pilot_bundle.sh finds the run of a job by this line
+        lines.append(f"  report: {s['extraction_dir']}/smoke_report.json")
     return "\n".join(lines)

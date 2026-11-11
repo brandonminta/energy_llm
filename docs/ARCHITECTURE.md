@@ -71,7 +71,7 @@ energy_llm/                 the installed package (CLI: energy-llm, python -m en
     inspection.py           position table and per-layer reference tables of one id
 configs/                    qwen25_3b.yaml, llama32_3b.yaml (revisions pinned)
 hpc/                        env.sh (resources + helpers), submit.sh, *.sbatch,
-                            missing_shards.sh, prefetch_models.sh
+                            missing_shards.sh, prefetch_models.sh, pilot_bundle.sh
 tests/                      CPU-only; tiny random Qwen2 + Llama models built in conftest.py
 dev/                        verification only: 24 dev questions, 12 warm-up questions,
                             reference.py (naive float64, imports nothing from energy_llm)
@@ -633,6 +633,14 @@ Two hashes/contexts drive the guards:
   depending on the relaunched array **and** the still-active tasks.
 - `prefetch_models.sh` (login node): `snapshot_download` at the pinned
   revision into `HF_HOME`, then an offline load check.
+- `pilot_bundle.sh <verify_jobid> <smoke_jobid>` (login node: bash ≥ 4.2,
+  no Python packages): writes `~/pilot_bundle_<date>.txt` with `sacct` of
+  both jobs, head/tail of their `.out`, tail of their `.err`, and the
+  `verify_report.json` / `smoke_report.json` and `manifest.json` of the run
+  directories **those jobs** printed (`report: <dir>/<x>_report.json` line of
+  each log; never a `find`). JSON is pretty-printed with the stdlib's
+  `python3 -m json.tool` when available, else copied. `LOG_DIR`, `TAIL_N`
+  override the defaults (`logs/`, 150). Tested in `tests/test_hpc_scripts.py`.
 - The verification sequence on the cluster is in the README ("Verification
   on the cluster"). β\* values from `dev/` are verification-only.
 

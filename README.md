@@ -79,7 +79,7 @@ energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
     inspection.py        position table and per-layer reference tables of one id
 configs/                 qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
 hpc/                     env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
-                         merge, smoke, verify), missing_shards.sh
+                         merge, smoke, verify), missing_shards.sh, pilot_bundle.sh
 tests/                   CPU-only, tiny random Qwen2 + Llama models
 dev/                     verification only, never for the paper: dev questions, warm-up,
                          naive float64 reference implementation (reference.py)
@@ -349,6 +349,12 @@ prompt token (the assistant header) and `response_first` the first answer
 token; the other `response` rows are the answer tokens and the final
 `<|im_end|>` / `<|eot_id|>` is `template`, not response; each per-layer
 table has one row per layer with finite reference values.
+
+Bundle both jobs for review (login node, one line; prints the file path):
+
+```bash
+hpc/pilot_bundle.sh <verify_jobid> <smoke_jobid>     # -> ~/pilot_bundle_<date>.txt
+```
 
 #### 7. Requeue test with a very short walltime
 

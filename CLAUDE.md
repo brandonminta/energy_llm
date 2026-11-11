@@ -57,7 +57,7 @@ energy_llm/   cli.py config.py storage.py manifest.py
   pipeline/     signals calibrate extract merge smoke     everything under output_dir
   verification/ verify inspection                         never production outputs
 hpc/          env.sh (all resource values + run_requeueable), submit.sh, *.sbatch,
-              missing_shards.sh, prefetch_models.sh
+              missing_shards.sh, prefetch_models.sh, pilot_bundle.sh (login node)
 dev/          verification-only data + reference.py (imports nothing from energy_llm)
 ```
 

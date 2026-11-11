@@ -288,7 +288,7 @@ def retrieval_diagnostics(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], 
     rec = load_json(cfg.beta_star_path)
     target = float(rec["target_norm_entropy"])
     grid = cfg.calibration.beta_grid()
-    bank = build_bank(bundle.model, bundle.dims)
+    bank = build_bank(bundle.trace_model, bundle.dims)
     diag = gamma_diagnostic(bank)
     by_id = {it.id: it for it in sel}
     hooks = ResidualHooks(bundle.trace_model)

@@ -386,8 +386,8 @@ def test_trace_dtype_float32_traces_with_a_float32_instance(qwen_pair):
     from energy_llm.core.model import prepare_bundle
 
     model, tok = qwen_pair
-    fp32 = copy.deepcopy(model)
     bf16 = model.to(torch.bfloat16)
+    fp32 = copy.deepcopy(bf16).float()        # a float32 load of a bf16 checkpoint: same numbers
     bundle = prepare_bundle(bf16, tok, 6, trace_model=fp32)
     assert bundle.dtype == "bfloat16" and bundle.trace_dtype == "float32"
     ref = prepare_bundle(copy.deepcopy(bf16), tok, 6)       # bf16 only
@@ -413,3 +413,8 @@ def test_trace_dtype_float32_traces_with_a_float32_instance(qwen_pair):
             hooks.remove()
     with pytest.raises(RuntimeError, match="float32"):
         prepare_bundle(copy.deepcopy(bf16), tok, 6, trace_model=copy.deepcopy(bf16))
+    other = copy.deepcopy(fp32)
+    with torch.no_grad():
+        other.model.layers[1].mlp.gate_proj.weight[0, 0] += 1e-3
+    with pytest.raises(RuntimeError, match="not the same checkpoint"):
+        prepare_bundle(copy.deepcopy(bf16), tok, 6, trace_model=other)

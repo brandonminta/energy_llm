@@ -137,7 +137,7 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
         write_json_atomic(state_path, state)
 
     check_template(bundle.tokenizer, cfg.prompt.date_string)
-    bank = build_bank(bundle.model, bundle.dims)
+    bank = build_bank(bundle.trace_model, bundle.dims)
     ensure_bank_record(cfg, bank, bundle)
 
     failed_path = cal / "failed.jsonl"

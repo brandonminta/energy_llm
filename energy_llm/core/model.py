@@ -164,6 +164,12 @@ def prepare_bundle(model: nn.Module, tokenizer, max_new_tokens: int,
         if model_dims(trace_model) != dims or next(trace_model.parameters()).device != \
                 next(model.parameters()).device:
             raise RuntimeError("trace_model must be the same checkpoint on the same device")
+        # the bank (gate rows, FFN norm gain) must be the same numbers in both
+        for a, b in zip(decoder_layers(model), decoder_layers(trace_model)):
+            if not (torch.equal(a.mlp.gate_proj.weight.float(), b.mlp.gate_proj.weight)
+                    and torch.equal(ffn_norm(model, a).weight.float(), ffn_norm(trace_model, b).weight)):
+                raise RuntimeError("trace_model weights differ from the generating model "
+                                   "(not the same checkpoint)")
     stops = stop_token_ids(model, tokenizer)
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else stops[0]
     gen_cfg = clean_generation_config(max_new_tokens, stops, pad)

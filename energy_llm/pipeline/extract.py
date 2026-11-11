@@ -229,7 +229,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
     n_done = n_failed = 0
     if todo and not stopper.requested:
         check_template(bundle.tokenizer, cfg.prompt.date_string)
-        bank = build_bank(bundle.model, bundle.dims)
+        bank = build_bank(bundle.trace_model, bundle.dims)
         fingerprint = bank.fingerprint()
         if fingerprint != beta_rec["bank_fingerprint"] or \
                 read_bank_fingerprint(cfg.bank_h5_path) != fingerprint:

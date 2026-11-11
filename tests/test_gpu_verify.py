@@ -101,3 +101,29 @@ def test_smoke_diagnostics_on_cuda(gpu_run):
                 "layer_exclusion"} <= set(pv)
     assert len(s["query_gain"]["per_layer"]) == bundle.dims.n_layers
     assert "ablation dstar_zeroed" in format_summary(s)
+
+
+def test_verify_with_float32_traces_on_cuda(tmp_path):
+    """model.trace_dtype float32 on CUDA: bf16 generation, float32 trace pass;
+    verify runs every check for both variants, the gate (read from the trace
+    model) passes and the trace model is its own float32 reference."""
+    from energy_llm.core.model import prepare_bundle
+    from energy_llm.verification.verify import run_verify
+    from tests.conftest import make_pair
+
+    model, tok = make_pair("qwen2")
+    bf16 = model.to("cuda", torch.bfloat16)
+    bundle = prepare_bundle(bf16, tok, 8, trace_model=copy.deepcopy(bf16).float())
+    assert bundle.dtype == "bfloat16" and bundle.trace_dtype == "float32"
+    cfg = make_cfg(tmp_path / "run", "qwen2")
+    cfg.model.trace_dtype = "float32"
+    warm = write_jsonl(tmp_path / "warm.jsonl", make_questions(4, WARMUP_WORDS, 1), "warm")
+    assert run_calibrate(cfg, bundle, read_items(warm), warm) is not None
+    ev = write_jsonl(tmp_path / "eval.jsonl", make_questions(2, QUESTION_WORDS, 2), "q")
+    r = run_verify(cfg, bundle, read_items(ev), n=1, ref_n=1)
+    checks = {c["name"]: c for c in r["checks"]}
+    assert set(checks) == CHECKS and r["model"]["trace_dtype"] == "float32"
+    # tf_vs_cache compares the bf16 cache with float32 TF here: informative only
+    assert checks["gate"]["status"] == "PASS" and checks["reference"]["status"] == "PASS"
+    fp = checks["fp32_reference"]["detail"]
+    assert fp["separate_fp32_instance"] is False and fp["precision_rule"]["value"] == 0.0

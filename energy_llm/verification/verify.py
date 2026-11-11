@@ -774,7 +774,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     ids_min_jaccard = 1.0 if on_cpu else 0.98   # GPU: near-ties at the k-th score
 
     run_cfg, ext_dir, _, merged = run_single_process(cfg, bundle, sel, "verify", name)
-    bank = build_bank(bundle.model, bundle.dims)
+    bank = build_bank(bundle.trace_model, bundle.dims)
     hooks = ResidualHooks(bundle.trace_model)
     stops = set(int(t) for t in np.atleast_1d(bundle.generation_config.eos_token_id))
     if bundle.tokenizer.eos_token_id is not None:

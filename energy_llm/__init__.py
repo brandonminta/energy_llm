@@ -1,8 +1,9 @@
-"""energy_llm — energy-based hallucination detection via Modern Hopfield
-retrieval over SwiGLU memory banks.
+"""energy_llm — extraction of Modern-Hopfield retrieval metrics from the
+SwiGLU gate of Qwen2/Llama-style decoders (see README.md and
+docs/ARCHITECTURE.md).
 
-Implements the methodology chapter (docs/metodology-FINAL.tex, chap:methods)
-exactly; see docs/MAPPING.md for the statement-by-statement mapping.
+The module ends at the metrics: labelling, probes and statistics live in the
+analysis repository and are not part of this package.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.1.0"

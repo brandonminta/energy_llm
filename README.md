@@ -1,167 +1,483 @@
-# energy_llm
+# energy_llm — extraction module
 
-Hallucination detection in LLMs via Modern Hopfield retrieval over SwiGLU
-memory banks — the exact implementation of the thesis methodology chapter.
+Extracts Modern-Hopfield retrieval metrics from the SwiGLU gate of
+Qwen2.5-3B-Instruct and Llama-3.2-3B-Instruct, per question and per layer, for
+a hallucination-detection study. The module **ends at the metrics**: no
+labelling, judges, probes or statistics (those live in the analysis
+repository; the legacy E1–E3 code is in git at tag `thesis-e1e3`). It is dataset-agnostic: the input is a JSONL of
+`{"id", "question"}` records; every other field is ignored and never
+propagated. All outputs are indexed by `id`.
 
-**Ground truth:** `docs/fundamentals-FINAL.tex` (theory) and
-`docs/metodology-FINAL.tex` (methodology). `docs/MAPPING.md` maps every
-operational statement (equations, stages, `tab:hyperparameters`) to the
-module, function, and config key that implements it.
+Three documents describe it:
 
-## Pipeline
+| document | read it for |
+|---|---|
+| this README | setup, how to run on SLURM, what the output files are, verification on the cluster |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | what the code **actually does**, module by module, file by file, formula by formula, with the verification tolerances — plus an audit of its inconsistencies and of where it departs from the thesis |
+| [`docs/overview.md`](docs/overview.md) | why: the science the module serves |
 
-```
-Stage 1  banks        GPU/CPU  model weights        -> results/<exp>/banks.pt
-Calibr.  beta*        GPU      30 prefill passes    -> calibration.json + config_snapshot.yaml
-Stage 2  trajectories GPU      banks + dataset      -> trajectories/{id}.npz/.json (+ scores cache, E1)
-Stage 3  labeling     CPU+API  trajectories         -> labels/{id}_label.json
-Stage 4  features     CPU      trajectories+labels  -> features/features.csv
-         probe+stats  CPU      features             -> probe_results.json / notebook 02 figures
-```
+## What is computed
 
-Every stage writes typed artifacts and reads only earlier-stage artifacts;
-every stage is independently re-runnable. The per-sample artifact is the
-checkpoint unit: **all stages resume by default** (completed samples are
-skipped; all writes are atomic tmp+fsync+rename, so a kill leaves no corrupt
-partials, and rerunning a killed array task is a no-op for finished samples).
+Per layer, from the residual `x` at the input of the FFN RMSNorm
+(`post_attention_layernorm` in Qwen2 / Llama; float32): `x̂ = x/√(mean(x²)+eps)`,
+one gate pre-activation `z = W_g·(γ⊙x̂)` (one layer's `W_g` in float32 at a
+time; the bank is never materialised, only γ, `‖w_i‖` and `‖w̃_i‖` are kept)
+and **two score variants** from it:
 
-## Setup
+| variant | score | |
+|---|---|---|
+| `cos_gamma_query` (primary) | `c_i = z_i / (‖w_i‖·‖γ⊙x̂‖) = cos(w_i, γ⊙x̂)` | key without γ, query with γ |
+| `cos_gamma_key` (control) | `s_i = z_i / (‖w̃_i‖·√D) = cos(w̃_i, x̂)·‖x̂‖/√D` | γ folded into the key (the convention up to step 9) |
 
-```bash
-micromamba create -n hopfield-llm python=3.12 -y && micromamba activate hopfield-llm
-pip install -r requirements.txt && pip install -e .
-pytest                       # full suite runs on CPU with a tiny model
-```
+They differ by the query gain `g_t = ‖γ⊙x̂_t‖/√D`: `s_i = g_t·(‖w_i‖/‖w̃_i‖)·c_i`,
+a position-dependent temperature in the control (overview §6.0). Each variant
+has its own β\* and its own β grid **relative to it** (`β*_v·10^o`, 9 offsets
+from −0.8 to +0.8 decades in steps of 0.2, offset 0 included, `extraction.beta_grid_log10_offset`) **plus β\*_v
+last** (`n_beta = 10`). With `p_t = softmax(β · score_t)` the module stores,
+for every variant `v`, layer `l` and position `t` (prompt and response;
+`role_mask` separates them downstream):
 
-`bitsandbytes` (4-bit NF4) is a **local-dev path only** — never used for a
-reported run (reported runs: BF16 on a single A100). Set
-`OPENAI_API_KEY` for Stage 3. Never hardcode tokens; use `HF_TOKEN` env.
+| dataset | shape | dtype | β | definition |
+|---|---|---|---|---|
+| `<v>/energy` | `[L, T, n_beta]` | float16 | grid | `-(1/β)·logsumexp(β s)` |
+| `<v>/norm_entropy` | `[L, T, n_beta]` | float16 | grid | `H(p)/log D_ff` |
+| `<v>/topk_mass` | `[L, T, n_beta]` | float16 | grid | mass of the 10 largest `p` |
+| `<v>/mean_score` | `[L, T, n_beta]` | float16 | grid | `Σ p s` |
+| `<v>/var_score` | `[L, T, n_beta]` | float16 | grid | `Σ p (s − mean_score)²` |
+| `<v>/margin` | `[L, T]` | float16 | – | top1 − top2 of the scores |
+| `<v>/js/<ref>` | `[L, T, n_beta]` | float16 | grid | `JS(p_t, p_ref)` (nats) |
+| `<v>/dkl/<ref>` | `[L, T, n_beta]` | float16 | grid | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+| `cos_gamma_query/topk_ids` | `[L, T, 100]` | int32 | – | indices of the 100 largest scores, descending (not stored for the control: `control_topk_ids_k: 0`) |
+| `query_gain` | `[L, T]` | float16 | – | `g_t = ‖γ⊙x̂_t‖/√D` |
+| `xhat_top1_frac` | `[L, T]` | float16 | – | `max_j x̂_j² / D` |
 
-**Existing cluster env:** the `hopfield-llm` micromamba env predates this
-rebuild and is missing three packages the new pipeline needs — update it
-once with `pip install -r requirements-hpc.txt` (adds `scipy`,
-`scikit-learn`, `openai`; everything else is already pinned there).
+The traced teacher-forced pass runs in `model.trace_dtype` (bfloat16 by
+default; `float32` loads a second instance of the checkpoint, generation
+stays bf16; `verify` prints `RECOMMEND trace_dtype=float32` when the bf16
+traces are too far from float32).
 
-## E1 (primary): exact command sequence
+`<ref>` ∈ {`question_last`, `prompt_last`, `response_first`} (last question
+token, last prompt token, first response token). The row at a reference
+position is 0 for its own divergences; `response_first` datasets are NaN
+for an empty response. Everything is computed in float32 and stored as
+above; divergences in the log domain. There is no features table:
+aggregation over tokens is analysis.
 
-```bash
-# 0. on the cluster, from the repo root
-mkdir -p logs
+**Empty responses** (the model emits a stop token first) are valid samples,
+not failures: `empty_response = true`, traces computed, response-only
+values (`*/response_first` divergences, baselines, `hidden.h5:response_*`)
+NaN by design, counted as completed.
 
-# 1. banks (CPU-bound; reads gate_proj to float32, row-normalises, stores norms)
-sbatch hpc/banks.sbatch configs/e1.yaml
-
-# 2. beta* calibration (writes beta_star into results/e1/config_snapshot.yaml;
-#    every later stage reads the snapshot)
-sbatch --dependency=afterok:<JOB1> hpc/calibrate.sbatch configs/e1.yaml
-
-# 3. Stage 2 as an 8-shard array (resume-by-default; resubmit freely)
-sbatch --dependency=afterok:<JOB2> hpc/trajectories.sbatch configs/e1.yaml
-
-#    ... or submit 1-3 with dependencies in one go:
-./hpc/submit_pipeline.sh configs/e1.yaml
-
-# 4. labeling (CPU + OpenAI API; run where you keep the key)
-#    -> notebooks/01_labeling_openai.ipynb   (judge + label distribution + kappa)
-#    or headless:
-python scripts/label_samples.py --config configs/e1.yaml
-python scripts/label_samples.py --config configs/e1.yaml --make-human-csv
-#    fill results/e1/human_labels.csv by hand, then:
-python scripts/label_samples.py --config configs/e1.yaml --kappa results/e1/human_labels.csv
-
-# 5. Stage 4: features + probe + statistics
-sbatch hpc/features.sbatch configs/e1.yaml          # or locally:
-python scripts/build_features.py --config configs/e1.yaml
-python scripts/run_probe.py --config configs/e1.yaml
-
-# 6. analysis + thesis figures
-#    -> notebooks/02_results_analysis.ipynb  (per-layer folded AUROC profiles +
-#       permutation threshold, test AUROC CIs, paired-bootstrap dAUROC,
-#       beta sensitivity from cached scores, per-category table;
-#       figures saved to results/e1/figures/)
-```
-
-## E2 / E3
-
-- **E2 (replication, Llama-3.2-3B):** identical sequence with
-  `configs/e2.yaml`. beta* is **recalibrated** for the model (the calibrate
-  step does this automatically; per-model calibration is the rule).
-- **E3 (contingent, Qwen on TriviaQA rc.nocontext, 500 @ seed 42):** beta*
-  is **inherited from E1** (same model — do not recalibrate). After E1
-  calibration, copy `beta_star` from `results/e1/config_snapshot.yaml` into
-  `configs/e3.yaml` (`calibration.beta_star`); `bank.path` already points at
-  the E1 banks. Then run Stage 2 onward with `configs/e3.yaml`.
-
-## Dry run (`--limit 5`, exercises every stage locally)
-
-```bash
-python scripts/build_banks.py          --config configs/e1.yaml
-python scripts/calibrate_beta.py       --config configs/e1.yaml
-python scripts/capture_trajectories.py --config configs/e1.yaml --limit 5
-python scripts/label_samples.py        --config configs/e1.yaml --limit 5
-python scripts/build_features.py       --config configs/e1.yaml
-python scripts/run_probe.py            --config configs/e1.yaml   # <30 labelled -> smoke mode
-```
-
-On a small local GPU set `model.load_in_4bit: true` (dev only). With <30
-labelled samples `run_probe.py` enters an explicit smoke mode (exercises the
-code path, prints that the numbers are meaningless).
-
-## Resume semantics
-
-- A sample is *complete* iff its `{id}.json` exists and parses; the JSON is
-  always written **last** (after the npz files), so it is the commit marker.
-- Stage 2/3 scan the manifest at startup and process only missing samples.
-- SIGUSR1/SIGTERM (sent by SLURM 120 s before walltime via
-  `--signal=B:USR1@120`) are trapped: the current sample is finished,
-  flushed, and the process exits cleanly in a resumable state.
-- A failing sample is recorded in `trajectories/failures.jsonl` (with
-  traceback) and gets NaN rows — median imputation in the probe handles it —
-  then the run continues. One bad sample never kills a shard.
-- `--max-samples-per-job M` + `SELF_RESUBMIT=1` in `hpc/trajectories.sbatch`
-  chunk work across jobs on short-walltime partitions.
-- OOM defenses baked in: `torch.inference_mode()` everywhere, batch size 1,
-  scores moved to CPU inside the hook, per-sample artifact flush + release
-  (nothing accumulates across the run), `del` + `torch.cuda.empty_cache()`
-  per sample, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the
-  sbatch templates, GPU/RSS logged every `trajectory.log_memory_every`
-  samples.
-
-## Disk budget (E1: Qwen2.5-3B, L=36, K=11008, 817 samples, T_g <= 50)
-
-| Artifact | Per sample | E1 total | Notes |
-|---|---|---|---|
-| `{id}.npz` (scalars: [L] ref + [L,T_g] per-token) | ~100 KB | ~80 MB | always written |
-| `{id}.json` (metadata) | ~2 KB | ~2 MB | always written, commit marker |
-| `{id}_retrieval_scores.npz` (float16 [L,K] + [L,T_g,K]) | ~40 MB | **~33 GB** | E1 only (`cache_score_tensors: true`); feeds the beta sweep with zero forward passes |
-| `{id}_label.json` | ~1 KB | ~1 MB | Stage 3 |
-| `banks.pt` (float32 m_hat + norms) | — | ~3.3 GB | once per model |
-
-E2/E3 (no score cache): ~100 MB per run plus banks. Hidden states are never
-persisted.
+Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
 ## Layout
 
 ```
-energy_llm/        banks.py trajectory.py calibration.py labeling.py
-                   features.py probe.py stats.py metrics.py
-                   io_artifacts.py config.py models.py data.py
-configs/           e1.yaml e2.yaml e3.yaml
-scripts/           one CLI per stage (build_banks, calibrate_beta,
-                   capture_trajectories, label_samples, build_features, run_probe)
-hpc/               banks/calibrate/trajectories/features.sbatch + submit_pipeline.sh
-                   (resource directives preserved from the proven working jobs)
-notebooks/         01_labeling_openai.ipynb  02_results_analysis.ipynb
-tests/             pytest, CPU-only, tiny random Qwen2-style model
-docs/              fundamentals-FINAL.tex  metodology-FINAL.tex  MAPPING.md
-results/           per-experiment artifacts (gitignored)
+energy_llm/              the package (CLI: energy-llm / python -m energy_llm)
+  cli.py                 calibrate | extract | merge | status | smoke | verify | inspect
+  config.py              per-run YAML (model + revision, prompt, beta grid, shards, ...)
+  storage.py             atomic writes, JSONL logs, failure log, hashing, input items
+  manifest.py            provenance: git commit, library versions, hardware, seeds
+  core/                  what is computed (never touches the output dir)
+    model.py             loading at a pinned revision, bf16 check, clean greedy config
+    prompting.py         chat template, single system instruction, role mask
+    bank.py              gamma + row norms of W_g * gamma (bank never materialised), bank.h5
+    metrics.py           float32 primitives (E, H_bar, margin, mean/var score, top-k, KL, JS)
+    capture.py           greedy + teacher forcing + hooks + all metrics per question
+  pipeline/              how it runs (everything under <output_dir>)
+    signals.py           SIGUSR1/SIGTERM -> finish the current id, exit 75
+    calibrate.py         beta* on a warm-up JSONL
+    extract.py           one shard: identity, resume, per-id files, failure log
+    merge.py             shard status; final files + manifest
+    smoke.py             extract + merge on N questions in one process, summary
+  verification/          never production outputs
+    verify.py            checks vs the model and dev/reference.py
+    inspection.py        position table and per-layer reference tables of one id
+configs/                 qwen25_3b.yaml, llama32_3b.yaml (versioned, revisions pinned)
+hpc/                     env.sh, prefetch_models.sh, submit.sh, *.sbatch (calibrate, extract_array,
+                         merge, smoke, verify), missing_shards.sh, pilot_bundle.sh
+tests/                   CPU-only, tiny random Qwen2 + Llama models
+dev/                     verification only, never for the paper: dev questions, warm-up,
+                         naive float64 reference implementation (reference.py)
+docs/                    ARCHITECTURE.md, overview.md, CHANGES_v0.2.md (change log)
 ```
 
-## Naming convention (thesis-aligned, everywhere)
+## Setup
 
-`probe_point` (r), `gate_preactivations` (g), `retrieval_scores` (s),
-`memory_bank` / `m_hat` (M, row-normalised), `row_norms`, `beta_star`,
-`phi`, `delta_energy`, `delta_entropy` (diagnostic), `delta_norm_entropy`,
-`mean_js`, `mean_hellinger_sq`, `lse_term` + `quadratic_term` (energy stored
-decomposed). Layers are 0-indexed `l = 0..L-1` in code, artifact keys
-(`*_l{l}`), configs, and notebooks.
+```bash
+micromamba activate hopfield-llm          # cluster env name (hpc/env.sh: MAMBA_ENV); local dev: energy-lab
+pip install -r requirements.txt && pip install -e ".[dev]"
+pytest                                    # CPU only, ~55 s
+```
+
+`requirements.txt` is the single pinned dependency set. transformers ≥ 4.56
+is required (older releases ignore `dtype=` and load float32). Loading fails
+unless the parameters are bfloat16; the actual dtype is recorded in every
+manifest.
+
+Optional check against real tokenizers (Llama needs `HF_TOKEN`):
+`ENERGY_LLM_TOKENIZER_DIRS=<qwen_dir>:<llama_dir> pytest tests/test_real_tokenizer.py`.
+
+## Running on SLURM
+
+Every command runs from the repo root. `SCRATCH_ROOT` is **required**
+(no default); the HF cache and all outputs go under it.
+
+```bash
+export SCRATCH_ROOT=/path/to/your/scratch
+
+# 0. once, on a login node with internet (Llama is gated: export HF_TOKEN first)
+hpc/prefetch_models.sh configs/qwen25_3b.yaml configs/llama32_3b.yaml
+
+# 1. calibrate beta* (one per model) on your warm-up JSONL
+hpc/submit.sh calibrate configs/qwen25_3b.yaml data/warmup.jsonl
+#    -> $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/calibration/beta_star.json
+
+# 2. smoke test (one process, 20 questions, 30 min walltime): check the summary
+hpc/submit.sh smoke configs/qwen25_3b.yaml data/truthfulqa.jsonl 20
+#    -> logs/smoke_<job>.out: dtype, % TF == greedy, max ||x_hat|| deviation,
+#       peak GPU memory, s/question, mean H_bar per layer at beta*, empty / truncated
+
+# 3. extract: array job over shards + merge chained with afterok
+AFTER=<calibrate_job_id> hpc/submit.sh extract configs/qwen25_3b.yaml data/truthfulqa.jsonl truthfulqa
+#    (AFTER is optional; omit it once beta_star.json exists)
+
+# 4. progress / missing shards; relaunch only the unfinished ones (+ a new merge)
+hpc/missing_shards.sh configs/qwen25_3b.yaml data/truthfulqa.jsonl truthfulqa
+hpc/missing_shards.sh configs/qwen25_3b.yaml data/truthfulqa.jsonl truthfulqa --resubmit
+
+# 5. merge by hand (the chained merge job runs the same command)
+python -m energy_llm merge --config configs/qwen25_3b.yaml --input data/truthfulqa.jsonl --name truthfulqa
+```
+
+Resuming needs no special command: resubmitting (step 2 or 3) skips every id
+already in a shard's completion index. Interactive equivalents:
+
+```bash
+python -m energy_llm calibrate --config C --input warmup.jsonl
+python -m energy_llm extract   --config C --input eval.jsonl --name N --shard-index K
+python -m energy_llm status    --config C --input eval.jsonl --name N [--missing|--num-shards|--json]
+python -m energy_llm merge     --config C --input eval.jsonl --name N [--allow-incomplete]
+python -m energy_llm smoke     --config C --input eval.jsonl [--n 20]
+```
+
+Exit codes: 0 done; 75 work remains (signal or retryable failures: the
+batch script requeues); anything else is a crash.
+
+### Robustness (summary; details in ARCHITECTURE.md §7)
+
+- **Shards**: contiguous blocks of `extraction.samples_per_shard` ids; one
+  array task per shard, each writing only its own directory.
+- **Atomic, idempotent**: each id's outputs go to one file (tmp + fsync +
+  rename); the id is appended to `completed.jsonl` only afterwards.
+- **Failures** are real errors only (exception, OOM, unexpected NaN/inf):
+  `failed.jsonl` with the attempt number, retried by the next run up to
+  `extraction.max_attempts`, never marked complete. Empty responses are not
+  failures.
+- **Signals**: `--signal=B:USR1@120` and SIGTERM are trapped; Python finishes
+  the current id, closes its files and exits 75; the batch script then
+  `scontrol requeue`s the task (up to `MAX_REQUEUES`). That is the only retry
+  mechanism. Preemption is requeued by SLURM itself (`--requeue`).
+- **Guards**: a shard refuses to resume under a different input, config or
+  β*; `extract` refuses a β* calibrated under another model/prompt/generation
+  setting, and any evaluation question that is in the warm-up set.
+- **Offline compute nodes**: `HF_HUB_OFFLINE=1`; models pre-downloaded to
+  `$SCRATCH_ROOT/hf_cache`.
+- **Orphaned merge**: every submission is logged in
+  `<extraction_dir>/submissions.log`; `missing_shards.sh … --resubmit`
+  cancels the pending merge of earlier submissions, relaunches only the
+  unfinished shards with no task still active, and submits a new merge with
+  `afterok` on the relaunched array and on the still-active earlier tasks.
+- **Logs**: `logs/extract_<array>_<task>.out` (appended across requeues).
+  Peak GPU memory per shard run is in `runs.jsonl` and
+  `manifest.json:shard_runs[].peak_gpu_mem_gb`.
+- Batch size is 1 (padding changes bf16 results).
+
+### Shard sizing
+
+Target: ~2 h per shard including model load, inside the 3 h walltime. The
+default `samples_per_shard: 1000` is an unmeasured, conservative estimate.
+Run the smoke test first: its seconds/question and model load time give the
+size directly (`(7200 − load) / s_per_question`). After the first real shard,
+`hpc/missing_shards.sh …` prints the same suggestion from measured runs.
+Changing it changes the shard plan, so use it for a **new** extraction name.
+
+### MIG profile
+
+`GRES` is a variable in `hpc/env.sh`. For the `a100_2g.10gb` trial:
+`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …` first (check the exact name
+with `sinfo -o '%P %G'`) and read the peak-memory line. Beyond the bf16 model
+and activations, only one layer's `W_g` in float32 (~90 MB for Qwen2.5-3B) is
+resident at a time.
+
+## Verification (before fixing datasets or parameters)
+
+Goal: confirm on the real models that the extraction measures exactly what
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5 describes, **before**
+fixing datasets or parameters. The sequence on the cluster is below
+("Verification on the cluster").
+
+```bash
+python -m energy_llm verify  --config C --input dev/dev_questions.jsonl [--n 4] \
+                             [--reference-n 2] [--reference-layers 0,18,35] \
+                             [--tf-max-noise-ratio 0.1] [--no-fp32-reference]
+python -m energy_llm inspect --run <extraction_dir> --id dev-known-01 [--variant cos_gamma_key]
+hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 min walltime
+```
+
+`verify` runs the production extract + merge on the first N questions into
+`extract/verify-<time>/` and prints PASS/FAIL per check with the maximum
+observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`).
+The checks (`reference`, `gate`, `tf_vs_cache`, `alignment`, `hidden`,
+`files_vs_memory`, `permutation`, `limits`, `monotone`, `self_divergence`,
+`determinism`, `calibration`, plus `fp32_reference` as INFO) and their
+tolerances are tabulated in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+§9; every check involving the bank runs for both score variants and must
+pass for both. `inspect` reads a finished extraction (no model) and prints
+each position (token, role, reference position) and, per layer, E, H̄,
+margin, var_score and topk_mass at β\*_v of one variant (default the
+primary) and `query_gain`, at the three reference positions and averaged
+over the response.
+
+### Verification on the cluster
+
+> **The β\* obtained here from `dev/dev_warmup.jsonl` is for verification
+> only.** It must not be used for any reported result. The definitive
+> calibration is run once the datasets are fixed, on its own warm-up set and
+> into a fresh `output_dir`. Nothing derived from `dev/` goes in the paper.
+
+Run everything from the repo root. One-time setup for the session:
+
+```bash
+export SCRATCH_ROOT=/path/to/your/scratch      # required
+source hpc/env.sh && activate_env
+pip install -r requirements.txt && pip install -e ".[dev]"
+hpc/prefetch_models.sh configs/qwen25_3b.yaml configs/llama32_3b.yaml   # login node; export HF_TOKEN first (Llama)
+```
+
+Verification runs write under `$SCRATCH_ROOT/energy_llm/runs/<model>/`. To
+keep them apart from the definitive runs, point the configs at a separate
+root for this session, e.g. `export SCRATCH_ROOT=$SCRATCH_ROOT/verification`
+(prefetch first, or copy the HF cache, since `HF_HOME` follows `SCRATCH_ROOT`).
+
+
+#### 1. Environment: CUDA available and compatible
+
+```bash
+srun --partition="$PARTITION_GPU" --gres="$GRES" --cpus-per-task=2 --mem=16G --time=00:10:00 \
+  python -c "import torch, transformers; print(torch.__version__, 'cuda', torch.version.cuda, \
+  'avail', torch.cuda.is_available(), torch.cuda.get_device_name(0), 'tf', transformers.__version__); \
+  a=torch.randn(512,512,device='cuda',dtype=torch.bfloat16); print('bf16 matmul ok', (a@a).float().norm().item())"
+srun --partition="$PARTITION_GPU" --gres="$GRES" --time=00:05:00 nvidia-smi
+```
+
+Check: `avail True`, the GPU is the expected A100, `transformers 5.0.0`, and
+the driver's "CUDA Version" in `nvidia-smi` is >= `torch.version.cuda`
+(12.1 for torch 2.5.1+cu121). If not, install a torch wheel matching the
+driver before going on.
+
+#### 2. Chat templates on the real tokenizers (both models)
+
+```bash
+QWEN=$(python -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen2.5-3B-Instruct', revision='aa8e72537993ba99e69dfaafa59ed015b17504d1', local_files_only=True))")
+LLAMA=$(python -c "from huggingface_hub import snapshot_download as s; print(s('meta-llama/Llama-3.2-3B-Instruct', revision='0cb88a4f764b7a12671c53f0838cd831a0843b95', local_files_only=True))")
+ENERGY_LLM_TOKENIZER_DIRS="$QWEN:$LLAMA" pytest tests/test_real_tokenizer.py -v
+```
+
+Check: 2 passed (not skipped). It asserts the token ids equal the official
+`apply_chat_template`, no default Qwen system prompt, and the role mask
+isolates exactly the instruction and the question.
+
+#### 3. Calibrate on the dev warm-up set (each model)
+
+```bash
+hpc/submit.sh calibrate configs/qwen25_3b.yaml dev/dev_warmup.jsonl
+hpc/submit.sh calibrate configs/llama32_3b.yaml dev/dev_warmup.jsonl
+cat $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/calibration/beta_star.json | head -20
+```
+
+Check: the job ends without `not bracketed`; `failed_ids` is empty; for
+both variants `variants.<v>.mean_norm_entropy_curve` decreases from ~1 to
+~0 across the grid, and the log prints one `beta*[<variant>]` line each with
+its position on the grid and no `WARNING` (β\* within 0.5 decades of an end).
+(Verification-only β\*, see the note above.)
+
+#### 4. Verify (each model): everything PASS
+
+```bash
+hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4
+hpc/submit.sh verify configs/llama32_3b.yaml dev/dev_questions.jsonl 4
+cat logs/verify_<job>.out
+```
+
+Check: `=> ALL PASS` and exit code 0 (`sacct -j <job> -o State,ExitCode`).
+The table lists each check with its max observed error and tolerance; the
+full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
+
+| check | what it proves | what to look at |
+|---|---|---|
+| `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w‖·‖γ⊙x̂‖·c` and `‖w̃‖·√D·s` | error ≤ 4·u_bf16 for both variants; `no_gamma_control_min_error` ≫ tolerance |
+| `reference` | every per-token trace (all β, three references) == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1); `topk_ids` row Jaccard ≥ 0.98. The pure-Python reference over the β grid adds a few minutes per layer and question: watch the 45 min walltime |
+| `tf_vs_cache` | teacher-forced x == x during cached generation, judged on the traces | PASS: tokens equal and, for both variants and per layer, p99 of `|ΔH̄|`, `|ΔE|`, `JS(p_cache, p_tf)` at β\*_v ≤ 0.1 × σ_ℓ (spread of the metric over response positions × questions; `--tf-max-noise-ratio`) over the **analysis positions** (response + `question_last`, `prompt_last`, `response_first`). Reported apart, by role and special position (position 0 = attention sink): the same ratios with σ_ℓ per layer, `max_ratio_max`, the per-layer x error (median/p99/max) and its location (id, layer, position, role); the console line gives the template and position-0 ratios |
+| `fp32_reference` | how far the traced residuals (TF and cached) are from a float32 forward on the same tokens | INFO only: per-layer x distances and the same propagated ratios by position group; loads a second, float32 instance (~12 GB) and frees it; TF32 off during the check. If p99/σ_ℓ (TF vs float32, analysis positions) > 0.1 at any layer: `RECOMMEND trace_dtype=float32`. `--no-fp32-reference` skips it |
+| `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
+| `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
+| `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket; `permutation`: per-trace ratios ≤ 1, negative control > 1, β of the max (`dkl` is ill-conditioned at high β, ARCHITECTURE §13.5) |
+
+If `tf_vs_cache` fails while tokens are equal, compare its ratios with
+`fp32_reference`: if the TF and cached residuals are equally far from float32,
+the disagreement is bf16 rounding, not a pipeline error; report it before
+changing anything.
+
+#### 5. Smoke test on the dev questions (each model)
+
+```bash
+hpc/submit.sh smoke configs/qwen25_3b.yaml dev/dev_questions.jsonl 24
+hpc/submit.sh smoke configs/llama32_3b.yaml dev/dev_questions.jsonl 24
+cat logs/smoke_<job>.out
+```
+
+Check:
+- `model dtype bfloat16`;
+- `TF == greedy` % of tokens and answers, and `TF/greedy disagreements N: all margins < delta: True` (each disagreement listed with its margins; one above δ is an alignment problem: report it);
+- `max | ||x_hat||/sqrt(D) - 1 |` negligible (≲ 1e-3);
+- the two `beta*[<variant>]` lines: position on the calibration grid, no `WARNING`;
+- `topk_ids of cos_gamma_key not stored`: the MB/question saved;
+- mean H̄ per layer at β\*_v for both variants: not saturated (not ≈ 0 or ≈ 1 in most layers);
+- peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
+- empty / truncated counts: plausible for short factual answers; `empty responses by condition (id prefix)`: per `dev-known` / `dev-misc` / `dev-obscure`;
+- TF/greedy disagreements: each with its margins; `all margins < delta`
+  should be True (a disagreement above δ is not a numerical near-tie);
+- the query gain `g_t` per band at `question_last`, `prompt_last` and the
+  response (median [p10, p90]);
+- `layer exclusion (reported, NOT applied)`: the layers the rule proposes
+  (first layer + CI-backed γ-ablation sign flips at the re-matched β, from
+  `cos_gamma_query`);
+- per variant (`== cos_gamma_query (primary)`, `== cos_gamma_key`): mean
+  `H̄(prompt_last)` at β\*_v against the 0.55 ± 0.05 band and the
+  calibration bracket; β_ℓ min/max over layers; re-matched β; sign flips;
+  per band of relative depth (and without layer 0): `H̄(prompt_last)`, `ΔH̄`
+  vs `question_last`, `xhat_top1_frac` median/max at the three references,
+  `var_score` prompt vs response, γ top-5 fraction, criteria 3 and 4, and
+  the ablations (top-5 γ dims, outlier dim d\*): `ΔH̄` and JS at β\*_v and
+  at the re-matched β; per layer `H̄(prompt_last)`, `ΔH̄` intact / γ / d\*,
+  `ΔH̄` vs `question_last`, β_ℓ;
+- per layer (shared): d\* and its share, γ fraction, `xhat_top1_frac` at `prompt_last`.
+
+#### 6. Manual alignment review: 3 questions per model
+
+```bash
+RUN=$(ls -d $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/extract/smoke-* | tail -1)
+for ID in dev-known-01 dev-obscure-03 dev-misc-01; do
+  python -m energy_llm inspect --run "$RUN" --id "$ID"; done
+# same with runs/llama32_3b
+```
+
+Check by eye: `instruction` rows are exactly the system sentence, `question`
+rows exactly the question, chat-template tokens are `template`;
+`question_last` marks the last question token, `prompt_last` the last
+prompt token (the assistant header) and `response_first` the first answer
+token; the other `response` rows are the answer tokens and the final
+`<|im_end|>` / `<|eot_id|>` is `template`, not response; each per-layer
+table has one row per layer with finite reference values.
+
+Bundle both jobs for review (login node, one line; prints the file path):
+
+```bash
+hpc/pilot_bundle.sh <verify_jobid> <smoke_jobid>     # -> ~/pilot_bundle_<date>.txt
+```
+
+#### 7. Requeue test with a very short walltime
+
+```bash
+TIME_EXTRACT=00:06:00 SIGNAL_LEAD_S=240 hpc/submit.sh extract configs/qwen25_3b.yaml dev/dev_questions.jsonl requeue-test
+squeue -u $USER                       # watch the task go RUNNING -> PENDING (requeued) -> RUNNING
+grep -E "python exit|requeue|restart" logs/extract_<array>_0.out
+python -m energy_llm status --config configs/qwen25_3b.yaml --input dev/dev_questions.jsonl --name requeue-test
+```
+
+USR1 arrives 4 min after start (6 min walltime − 240 s). Check in the log:
+`python exit=75 signal=USR1`, `work left: scontrol requeue …`, a second run
+with `restart=1` that skips the completed ids, then exit 0; the chained merge
+job runs and `status` shows no missing shards. Confirm also that the merge
+waited for the requeued task (`sacct -j <merge> -o Start` after the second run).
+
+If the shard finishes before USR1 (fast GPU), send the warning by hand while
+it is processing: `scancel --batch --signal=USR1 <array>_0`.
+
+Caveat: if the walltime is shorter than model load + `SIGNAL_LEAD_S`, the
+warning arrives before any question is processed, every run exits 75 without
+progress and the task is requeued until `MAX_REQUEUES` (5), then left
+unfinished — never use such a walltime for real runs.
+
+Then try the MIG profile once (`GRES=gpu:a100_2g.10gb:1 hpc/submit.sh smoke …`)
+if it is wanted, and record its peak memory and seconds/question.
+
+## Outputs: the contract one cell delivers
+
+`$SCRATCH_ROOT/energy_llm/runs/<model>/`
+
+```
+calibration/
+  beta_star.json      beta* per score variant (+ grid position), calibration context, warm-up hash
+  bank.h5             gamma, ||w||, ||w_tilde|| per layer, gamma diagnostic, fingerprint
+extract/<name>/
+  manifest.json       config + hash, beta* per variant, commit, library versions, hardware,
+                      peak GPU memory per shard, model/trace dtype, checks, exhausted ids
+  answers.parquet     id, prompt, response, token ids, lengths, empty_response,
+                      truncated, stop_token_id, per-token logprob/entropy/logit,
+                      TF mismatches, xhat_norm_max_rel_dev
+  baselines.parquet   mean/min logprob, mean entropy, mean_neg_logit
+  traces.h5           /<id>/<variant>/{energy, norm_entropy, topk_mass, mean_score,
+                             var_score, margin, js/<ref>, dkl/<ref>, topk_ids (primary)},
+                      /<id>/{query_gain, xhat_top1_frac, role_mask};
+                      attrs variants, betas and beta_star per variant, reference_positions
+  hidden.h5           /<id>/{question_last, prompt_last, response_first, response_last}
+  bank.h5             copy of calibration/bank.h5
+```
+
+Six files per extraction. The analysis repository reads `manifest.json` for
+provenance, joins everything on `id`, and never needs the model.
+
+| File | Content |
+|---|---|
+| `manifest.json` | full config + hash, β\* per variant and calibration record (grid positions), code commit, library versions, hardware and peak GPU memory per shard run, actual model and trace dtypes, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
+| `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches (`tf_exact`, positions, TF tokens, top1 − top2 margins in TF and generation), per-step TF/decoding logit discrepancy (`tf_logit_diff`, `tf_logit_diff_max`, `tf_logit_diff_step0`), `xhat_norm_max_rel_dev` |
+| `baselines.parquet` | mean / min token log-probability, mean token entropy, `mean_neg_logit` (response tokens; NaN when empty) |
+| `traces.h5` | the datasets of "What is computed" per id, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions` (−1 = none); file attrs `variants` (primary first), `primary`, `beta_star [n_variants]`, `betas [n_variants, n_beta]` (β\*_v last), `topk_mass_k`, `topk_ids_k [n_variants]`, `reference_names`, `role_names`; gzip 4, one chunk per layer |
+| `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 (`response_*` NaN when empty) |
+| `bank.h5` | γ, `‖w_i‖` and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
+
+Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.
+
+## History
+
+- **v0.2, step 10**: two score variants (`cos_gamma_query` primary: γ on the
+  query; `cos_gamma_key` control: the former convention), `query_gain`, one
+  β\* per variant with its grid position, β grid relative to β\*_v,
+  `control_topk_ids_k`, architecture adapter (Qwen2/Llama; Gemma not
+  implemented), `model.trace_dtype`, verify per variant with the analysis-
+  position criterion and the float32 precision rule, smoke per variant with
+  `g_t`, relative-depth bands and the layer exclusion rule (reported only).
+
+- **v2.1.0 (v0.2 plan, `docs/CHANGES_v0.2.md`)**: per-token traces at an
+  absolute β grid + β\*, three reference positions, `topk_mass`,
+  `mean_score`, `var_score`, signed KL, `xhat_top1_frac`, top-100 ids, γ
+  diagnostic and smoke ablation, `token_logits` / `mean_neg_logit`.
+- **v0.2, step 0**: the features table (the long per-layer parquet, variants
+  `mean`/`first`, Hellinger², top-k Jaccard) removed — aggregation over
+  tokens is analysis; the per-token traces replace it (extended in step 4); `downstream/` and the thesis `.tex` removed
+  (tag `thesis-e1e3`); the spec-mapping document folded into
+  `docs/ARCHITECTURE.md`, the cluster runbook into this README.
+- **2026-10-27**: package split into `core/` (what is computed), `pipeline/`
+  (how it runs) and `verification/`; duplicated helpers merged (failure log,
+  CUDA release, item paths, shard-run reading); behaviour unchanged (same
+  106 tests). `docs/ARCHITECTURE.md` added.
+- **2026-10 restructure**: labelling, probe/CV/statistics, the old feature
+  table and β-sensitivity scripts, the TruthfulQA/TriviaQA loaders, all
+  notebooks, the E1–E3 configs and their jobs/tests moved to `downstream/`
+  (intact, not installed, written for the previous artefact format);
+  `scripts/*.py`, the old sbatch files, `requirements-hpc.txt` and
+  `.env.example` removed; bank (γ folded in), hook location, metrics,
+  prompting, calibration, runner and output format rewritten. Value/`w2`
+  banks and 4-bit loading dropped. Pre-restructure state: commit `28f00ce`.

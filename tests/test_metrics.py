@@ -1,116 +1,209 @@
-"""Unit tests for energy_llm.metrics: JS convention (eq:js_convention),
-Hellinger^2 (eq:hellinger_squared), entropy, and the separable energy
-decomposition (eq:modern_hopfield_energy)."""
+import math
 
 import numpy as np
 import pytest
+import torch
+from scipy.spatial.distance import jensenshannon
+from scipy.special import logsumexp
 
-from energy_llm import metrics
+from energy_llm.core import metrics
 
-RNG = np.random.default_rng(42)
-
-
-def random_dist(k: int) -> np.ndarray:
-    p = RNG.random(k) + 1e-3
-    return p / p.sum()
+K = 512
 
 
-class TestJSConvention:
-    def test_disjoint_supports_equal_log2(self):
-        p = np.array([1.0, 0.0])
-        q = np.array([0.0, 1.0])
-        assert metrics.js_nats(p, q) == pytest.approx(np.log(2), abs=1e-12)
-
-    def test_identical_is_zero(self):
-        p = random_dist(64)
-        assert metrics.js_nats(p, p.copy()) == pytest.approx(0.0, abs=1e-12)
-
-    def test_analytic_value(self):
-        # P=(1/2,1/2), Q=(1,0): M=(3/4,1/4);
-        # JS = H(M) - H(P)/2 - H(Q)/2 in nats
-        p = np.array([0.5, 0.5])
-        q = np.array([1.0, 0.0])
-        h_m = -(0.75 * np.log(0.75) + 0.25 * np.log(0.25))
-        expected = h_m - 0.5 * np.log(2)
-        assert metrics.js_nats(p, q) == pytest.approx(expected, rel=1e-10)
-
-    def test_symmetric(self):
-        p, q = random_dist(128), random_dist(128)
-        assert metrics.js_nats(p, q) == pytest.approx(metrics.js_nats(q, p), rel=1e-12)
-
-    def test_bounded_by_log2(self):
-        for _ in range(20):
-            p, q = random_dist(256), random_dist(256)
-            assert 0.0 <= metrics.js_nats(p, q) <= np.log(2) + 1e-12
-
-    def test_matches_scipy_convention_exactly(self):
-        from scipy.spatial.distance import jensenshannon
-        p, q = random_dist(64), random_dist(64)
-        expected = jensenshannon(p, q, base=2) ** 2 * np.log(2)
-        assert metrics.js_nats(p, q) == pytest.approx(expected, rel=0, abs=0)
-
-    def test_vectorized_axis(self):
-        p = np.stack([random_dist(32) for _ in range(5)])
-        q = random_dist(32)
-        vec = metrics.js_nats(p, q[None, :], axis=1)
-        for t in range(5):
-            assert vec[t] == pytest.approx(metrics.js_nats(p[t], q), rel=1e-12)
+def _dist(seed, beta=5.0):
+    g = torch.Generator().manual_seed(seed)
+    s = torch.rand(K, generator=g) * 2 - 1
+    return torch.softmax(beta * s, dim=-1), s
 
 
-class TestHellinger:
-    def test_disjoint_is_one(self):
-        assert metrics.hellinger_sq(np.array([1.0, 0.0]), np.array([0.0, 1.0])) == pytest.approx(1.0)
-
-    def test_identical_is_zero(self):
-        p = random_dist(64)
-        assert metrics.hellinger_sq(p, p) == pytest.approx(0.0, abs=1e-15)
-
-    def test_symmetric_and_bounded(self):
-        p, q = random_dist(128), random_dist(128)
-        h = metrics.hellinger_sq(p, q)
-        assert h == pytest.approx(metrics.hellinger_sq(q, p), rel=1e-14)
-        assert 0.0 <= h <= 1.0
-
-    def test_bhattacharyya_identity(self):
-        p, q = random_dist(64), random_dist(64)
-        bc = np.sum(np.sqrt(p * q))
-        assert metrics.hellinger_sq(p, q) == pytest.approx(1.0 - bc, rel=1e-12)
+@pytest.mark.parametrize("scale", [1e-2, 1.0, 1e3])
+def test_xhat_norm(scale):
+    """||x_hat||^2 = D * ms / (ms + eps): ~ sqrt(D) unless the residual RMS
+    approaches sqrt(eps), which is why extraction records the deviation."""
+    d, eps = 2048, 1e-6
+    x = torch.randn(16, d) * scale
+    x_hat = metrics.rms_normalise(x, eps=eps)
+    assert x_hat.dtype == torch.float32
+    ms = x.double().pow(2).mean(-1)
+    exact = torch.sqrt(d * ms / (ms + eps)).numpy()
+    np.testing.assert_allclose(x_hat.norm(dim=-1).numpy(), exact, rtol=1e-5)
+    if scale >= 1.0:
+        np.testing.assert_allclose(x_hat.norm(dim=-1).numpy(), math.sqrt(d), rtol=1e-5)
 
 
-class TestEntropy:
-    def test_uniform_max(self):
-        k = 100
-        p = np.full(k, 1.0 / k)
-        assert metrics.entropy(p) == pytest.approx(np.log(k), rel=1e-12)
-        assert metrics.norm_entropy(p) == pytest.approx(1.0, rel=1e-12)
-
-    def test_point_mass_zero(self):
-        p = np.zeros(10)
-        p[3] = 1.0
-        assert metrics.entropy(p) == pytest.approx(0.0, abs=1e-15)
-        assert metrics.norm_entropy(p) == pytest.approx(0.0, abs=1e-15)
+@pytest.mark.parametrize("beta", [1e-3, 1.0, 50.0, 1e4])
+def test_distribution_sums_to_one_and_entropy_bounded(beta):
+    _, s = _dist(0)
+    logp = metrics.log_distribution(s, beta)
+    assert abs(logp.exp().sum().item() - 1.0) < 1e-5
+    h = metrics.norm_entropy(logp).item()
+    assert -1e-6 <= h <= 1.0 + 1e-6
 
 
-class TestEnergyDecomposition:
-    def test_terms_sum_to_reference_energy(self):
-        s = RNG.normal(size=64)
-        r = RNG.normal(size=16)
-        beta = 7.0
-        naive = -np.log(np.sum(np.exp(beta * s))) / beta + 0.5 * np.sum(r**2)
-        lse = metrics.lse_term(s, beta)
-        quad = metrics.quadratic_term(r)
-        assert lse + quad == pytest.approx(naive, rel=1e-12)
-        assert metrics.energy(s, r, beta) == pytest.approx(naive, rel=1e-12)
+def test_entropy_extremes():
+    s = torch.zeros(K)
+    assert metrics.norm_entropy(metrics.log_distribution(s, 1.0)).item() == pytest.approx(1.0, abs=1e-6)
+    s[3] = 1.0
+    assert metrics.norm_entropy(metrics.log_distribution(s, 1e4)).item() == pytest.approx(0.0, abs=1e-6)
 
-    def test_lse_stable_at_large_beta(self):
-        s = RNG.normal(size=512) * 10
-        value = metrics.lse_term(s, beta=1e5)
-        assert np.isfinite(value)
-        # at huge beta, lse_term -> -max(s)
-        assert value == pytest.approx(-s.max(), rel=1e-4)
 
-    def test_retrieval_distribution_normalised(self):
-        s = RNG.normal(size=(5, 64))
-        p = metrics.retrieval_distribution(s, beta=15.0)
-        np.testing.assert_allclose(p.sum(axis=-1), 1.0, rtol=1e-12)
-        assert (p > 0).all()
+@pytest.mark.parametrize("beta", [0.5, 20.0, 3e3])
+def test_energy_matches_scipy_logsumexp(beta):
+    _, s = _dist(1)
+    ref = -logsumexp(beta * s.double().numpy()) / beta
+    assert metrics.energy(s, beta).item() == pytest.approx(ref, rel=1e-5, abs=1e-6)
+
+
+def test_js_symmetric_bounded_and_matches_scipy_convention():
+    p, _ = _dist(2)
+    q, _ = _dist(3)
+    js_pq = metrics.js_divergence(p.log(), q.log()).item()
+    assert js_pq == pytest.approx(metrics.js_divergence(q.log(), p.log()).item(), abs=1e-7)
+    assert 0.0 <= js_pq <= math.log(2)
+    ref = jensenshannon(p.double().numpy(), q.double().numpy(), base=2) ** 2 * math.log(2)
+    assert js_pq == pytest.approx(ref, rel=1e-4)
+    assert metrics.js_divergence(p.log(), p.log()).item() == 0.0
+
+
+@pytest.mark.parametrize("beta", [1.0, 72.776, 1e4])
+def test_self_divergences_are_exactly_zero(beta):
+    """JS(p, p) and KL(p || p) are 0 bit-exactly from one log_softmax(beta s)."""
+    _, s = _dist(11)
+    s = torch.stack([s, s.flip(0)])
+    lp = metrics.log_distribution(s, beta)
+    assert (metrics.js_divergence(lp, lp) == 0).all()
+    assert (metrics.kl_divergence(lp, lp) == 0).all()
+
+
+def test_js_with_zero_probabilities_follows_xlogy():
+    """log p = -inf (p_i = 0) contributes 0, never 0 * inf = NaN."""
+    ninf = float("-inf")
+    lp = torch.log(torch.tensor([0.5, 0.5, 0.0, 0.0]))
+    lq = torch.log(torch.tensor([0.5, 0.0, 0.5, 0.0]))
+    assert lp[2] == ninf and lq[1] == ninf
+    js = metrics.js_divergence(lp, lq).item()
+    p, q = np.array([0.5, 0.5, 0, 0]), np.array([0.5, 0, 0.5, 0])
+    ref = jensenshannon(p, q, base=2) ** 2 * math.log(2)
+    assert math.isfinite(js) and js == pytest.approx(ref, rel=1e-6)
+    assert metrics.js_divergence(lp, lp).item() == 0.0
+    # disjoint supports with -inf on both sides: exactly log 2 up to the clamp
+    a = torch.log(torch.tensor([1.0, 0.0])); b = torch.log(torch.tensor([0.0, 1.0]))
+    assert metrics.js_divergence(a, b).item() == pytest.approx(math.log(2), abs=1e-7)
+
+
+def test_js_reaches_log2_on_disjoint_supports():
+    s_p = torch.full((K,), -1.0); s_p[:4] = 1.0
+    s_q = torch.full((K,), -1.0); s_q[10:12] = 1.0
+    lp, lq = metrics.log_distribution(s_p, 200.0), metrics.log_distribution(s_q, 200.0)
+    assert metrics.js_divergence(lp, lq).item() == pytest.approx(math.log(2), abs=1e-6)
+
+
+def test_divergences_survive_float32_underflow():
+    """Regression: near-one-hot distributions (large beta) whose tails underflow
+    in float32 must still give the float64 values (found by dev/reference.py)."""
+    g = torch.Generator().manual_seed(7)
+    s = torch.rand(2, K, generator=g) * 0.4 - 0.2
+    s[1, 5] = s[0, 5] + 0.01        # shared near-top memory with different weights
+    for beta in (600.0, 5e3):
+        lp = metrics.log_distribution(s, beta)
+        l64 = torch.log_softmax(beta * s.double(), dim=-1)
+        p64, q64 = l64.exp()
+        m = 0.5 * (p64 + q64)
+        kl = lambda a: torch.where(a > 0, a * (a.log() - m.log()), torch.zeros_like(a)).sum()
+        js64 = (0.5 * kl(p64) + 0.5 * kl(q64)).item()
+        assert metrics.js_divergence(lp[0], lp[1]).item() == pytest.approx(js64, abs=1e-5)
+
+
+def test_margin():
+    s = torch.tensor([0.1, 0.9, 0.4, 0.7])
+    assert metrics.margin(s).item() == pytest.approx(0.2)
+
+
+def test_kl_zero_on_identical_and_dkl_antisymmetric():
+    lp = metrics.log_distribution(_dist(6)[1], 30.0)
+    lq = metrics.log_distribution(_dist(7)[1], 30.0)
+    assert metrics.kl_divergence(lp, lp).item() == 0.0
+    kl_pq, kl_qp = metrics.kl_divergence(lp, lq), metrics.kl_divergence(lq, lp)
+    assert kl_pq.item() > 0 and kl_qp.item() > 0
+    assert (kl_pq - kl_qp).item() == -(kl_qp - kl_pq).item()
+    ref = np.sum(lp.exp().double().numpy() * (lp.double().numpy() - lq.double().numpy()))
+    assert kl_pq.item() == pytest.approx(ref, rel=1e-4)
+
+
+def test_var_score_limits():
+    _, s = _dist(8)
+    lp0 = metrics.log_distribution(s, 1e-8)
+    assert metrics.mean_score(lp0, s).item() == pytest.approx(s.mean().item(), abs=1e-6)
+    assert metrics.var_score(lp0, s).item() == pytest.approx(np.var(s.double().numpy()), rel=1e-4)
+    b_inf = 50.0 / metrics.margin(s).item()
+    lp_inf = metrics.log_distribution(s, b_inf)
+    assert metrics.var_score(lp_inf, s).item() <= 1e-6
+    assert metrics.mean_score(lp_inf, s).item() == pytest.approx(s.max().item(), abs=1e-6)
+
+
+def test_var_score_is_centred():
+    """var_score = sum p (s - mean)^2, not E[s^2] - mean^2: with scores packed
+    near 0.9 (variance ~1e-8) the raw-moment form cancels catastrophically in
+    float32, the centred form matches float64."""
+    g = torch.Generator().manual_seed(5)
+    s = 0.9 + 1e-4 * torch.randn(K, generator=g)
+    lp = metrics.log_distribution(s, 1.0)
+    s64, lp64 = s.double(), torch.log_softmax(s.double(), dim=-1)
+    p64 = lp64.exp()
+    ref = (p64 * (s64 - (p64 * s64).sum()) ** 2).sum().item()
+    assert metrics.var_score(lp, s).item() == pytest.approx(ref, rel=1e-3)
+    p = lp.exp()
+    raw = ((p * s * s).sum() - (p * s).sum() ** 2).item()
+    assert abs(raw - ref) > 10 * abs(metrics.var_score(lp, s).item() - ref)
+
+
+def test_topk_mass_limits():
+    _, s = _dist(9)
+    b_inf = 50.0 / metrics.margin(s).item()
+    for k in (1, 10):
+        assert metrics.topk_mass(metrics.log_distribution(s, b_inf), k).item() == pytest.approx(1.0, abs=1e-6)
+        assert metrics.topk_mass(metrics.log_distribution(s, 1e-8), k).item() == pytest.approx(k / K, rel=1e-4)
+
+
+def test_topk_indices_sorted_unique_int32():
+    lp = metrics.log_distribution(torch.randn(4, K), 20.0)
+    idx = metrics.topk_indices(lp, 100)
+    assert idx.dtype == torch.int32 and idx.shape == (4, 100)
+    for row, l in zip(idx, lp):
+        assert len(set(row.tolist())) == 100
+        vals = l[row.long()]
+        assert (vals[:-1] >= vals[1:]).all()
+        assert vals[-1] >= torch.topk(l, 101).values[-1]
+
+
+def test_xhat_top1_frac_extremes():
+    d = 64
+    one_hot = torch.zeros(d); one_hot[5] = 3.0
+    assert metrics.xhat_top1_frac(metrics.rms_normalise(one_hot, 1e-12)).item() == pytest.approx(1.0, rel=1e-6)
+    const = metrics.rms_normalise(torch.full((d,), 2.0), 1e-12)
+    assert metrics.xhat_top1_frac(const).item() == pytest.approx(1.0 / d, rel=1e-6)
+
+
+def test_primitives_match_reference():
+    from energy_llm.verification.verify import load_reference
+
+    ref = load_reference()
+    _, s = _dist(10)
+    _, s2 = _dist(11)
+    x = torch.randn(K)
+    for beta in (1.0, 40.0, 600.0):
+        lp, lq = metrics.log_distribution(s, beta), metrics.log_distribution(s2, beta)
+        sl, s2l = [float(v) for v in s.double()], [float(v) for v in s2.double()]
+        p, lse = ref.softmax_and_lse(sl, beta)
+        _, lse2 = ref.softmax_and_lse(s2l, beta)
+        logp = [beta * v - lse for v in sl]
+        logq = [beta * v - lse2 for v in s2l]
+        assert metrics.mean_score(lp, s).item() == pytest.approx(ref.mean_score(p, sl), abs=1e-5)
+        assert metrics.var_score(lp, s).item() == pytest.approx(ref.var_score(p, sl), abs=1e-5)
+        assert metrics.topk_mass(lp, 10).item() == pytest.approx(ref.topk_mass(p, 10), abs=1e-5)
+        assert metrics.topk_indices(lp, 10).tolist() == ref.topk_indices(p, 10)
+        assert metrics.kl_divergence(lp, lq).item() == pytest.approx(ref.kl(logp, logq), rel=1e-4, abs=1e-5)
+    xh = metrics.rms_normalise(x, 1e-6)
+    assert metrics.xhat_top1_frac(xh).item() == pytest.approx(
+        ref.xhat_top1_frac(ref.x_hat([float(v) for v in x.double()], 1e-6)), rel=1e-5)

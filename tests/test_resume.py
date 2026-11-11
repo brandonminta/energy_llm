@@ -1,108 +1,475 @@
-"""Resume semantics (HPC robustness): run Stage 2 on 5 samples, stop after 2
-(simulated kill), rerun, and assert exactly 3 more are processed while the
-first 2 artifacts are untouched byte-for-byte."""
+"""Interrupted + resumed runs produce outputs identical to an uninterrupted
+run; failures are never marked complete and are retried up to max_attempts."""
 
+import json
+import shutil
+
+import h5py
+import numpy as np
+import pandas as pd
 import pytest
 
-from energy_llm.config import ExperimentConfig
-from energy_llm.io_artifacts import sha256_file
-from energy_llm.trajectory import run_trajectories
+from energy_llm.core.capture import compute_item
+from energy_llm.cli import main as cli_main
+from energy_llm.pipeline.extract import plan_shards, run_extract, shard_path, shard_state
+from energy_llm.pipeline.merge import run_merge, status_report
+from energy_llm.storage import item_key, read_items, read_jsonl
 
-from .conftest import make_tiny_samples
-
-
-@pytest.fixture()
-def cfg(tmp_path):
-    cfg = ExperimentConfig(name="resume_test", output_dir=str(tmp_path / "run"))
-    cfg.calibration.beta_star = 5.0
-    cfg.generation.max_new_tokens = 4
-    cfg.trajectory.cache_score_tensors = False
-    return cfg
+PARQUETS = ("answers.parquet", "baselines.parquet")
 
 
-class TestResume:
-    def test_kill_and_rerun_is_noop_for_finished_samples(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks
-    ):
-        samples = make_tiny_samples(5)
+def _run_all(cfg, bundle, ev, name, **kw):
+    items = read_items(ev)
+    reports = [run_extract(cfg, bundle, items, ev, name, k, **kw)
+               for k in range(len(plan_shards(items, cfg.extraction.samples_per_shard)))]
+    return items, reports
 
-        # first run "killed" after 2 samples (max_samples_per_job simulates
-        # the preemption boundary: stop cleanly between samples)
-        report1 = run_trajectories(
-            cfg, tiny_model, tiny_tokenizer, tiny_banks, samples,
-            max_samples_per_job=2,
-        )
-        assert report1["n_done"] == 2 and report1["n_failed"] == 0
 
-        done = sorted(p.name for p in cfg.trajectories_dir.glob("*.json"))
-        assert len(done) == 2
-        hashes_before = {
-            name: sha256_file(cfg.trajectories_dir / name) for name in done
-        }
-        npz_hashes_before = {
-            p.name: sha256_file(p) for p in cfg.trajectories_dir.glob("*.npz")
-        }
+def _h5_dict(path):
+    out = {}
+    with h5py.File(path) as f:
+        f.visititems(lambda k, v: out.__setitem__(k, v[()]) if isinstance(v, h5py.Dataset) else None)
+    return out
 
-        # rerun: exactly the 3 remaining are processed
-        report2 = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report2["n_done"] == 3
-        assert report2["n_skipped"] == 2
 
-        # finished artifacts are untouched (the rerun was a no-op for them)
-        for name, h in hashes_before.items():
-            assert sha256_file(cfg.trajectories_dir / name) == h
-        for name, h in npz_hashes_before.items():
-            assert sha256_file(cfg.trajectories_dir / name) == h
+def _assert_same_outputs(a, b):
+    for name in PARQUETS:
+        pd.testing.assert_frame_equal(pd.read_parquet(a / name), pd.read_parquet(b / name))
+    for name in ("traces.h5", "hidden.h5", "bank.h5"):
+        da, db = _h5_dict(a / name), _h5_dict(b / name)
+        assert da.keys() == db.keys()
+        for k in da:
+            np.testing.assert_array_equal(da[k], db[k])
 
-        # third run: everything skipped
-        report3 = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report3["n_done"] == 0 and report3["n_skipped"] == 5
 
-    def test_requires_calibrated_beta(self, cfg, tiny_model, tiny_tokenizer, tiny_banks):
-        cfg.calibration.beta_star = None
-        with pytest.raises(RuntimeError, match="beta_star is not calibrated"):
-            run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks,
-                             make_tiny_samples(1))
+def test_resume_after_interruption_is_identical_to_full_run(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items, reports = _run_all(cfg, bundle, ev, "full")
+    assert all(r["state"] == "done" for r in reports)
+    run_merge(cfg, items, ev, "full")
 
-    def test_failure_isolation_writes_nan_row_and_failures_jsonl(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks, monkeypatch
-    ):
-        import numpy as np
+    # interrupted run: shard 0 stops after one id, plus crash debris
+    r = run_extract(cfg, bundle, items, ev, "resumed", 0, stop_after=1)
+    assert r["state"] == "pending" and r["n_completed"] == 1
+    sdir = shard_path(cfg.extraction_dir("resumed"), 0)
+    (sdir / "items" / ".stale.h5.123.tmp").write_bytes(b"partial")
+    orphan = sdir / "items" / f"{item_key(items[1].id)}.h5"     # written, not indexed
+    shutil.copy(next((sdir / "items").glob("*.h5")), orphan)
+    assert items[1].id not in shard_state(sdir, 0, [items[1].id], 3).completed
+    with pytest.raises(RuntimeError, match="not finished"):
+        run_merge(cfg, items, ev, "resumed")
+    _, reports = _run_all(cfg, bundle, ev, "resumed")
+    assert all(r["state"] == "done" for r in reports)
+    run_merge(cfg, items, ev, "resumed")
 
-        import energy_llm.trajectory as traj_mod
-        from energy_llm.io_artifacts import load_json, read_jsonl
+    _assert_same_outputs(cfg.extraction_dir("full"), cfg.extraction_dir("resumed"))
+    # completion index has no duplicates; the rerun skipped finished ids
+    done = [r["id"] for r in read_jsonl(sdir / "completed.jsonl")]
+    assert len(done) == len(set(done)) == 3
 
-        samples = make_tiny_samples(3)
-        original = traj_mod.capture_sample
-        calls = {"n": 0}
 
-        def flaky(*args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise RuntimeError("simulated OOM")
-            return original(*args, **kwargs)
+def test_outputs_indexed_by_id_without_input_extras(calibrated):
+    cfg, bundle, ev, rec = calibrated
+    items, _ = _run_all(cfg, bundle, ev, "x")
+    m = run_merge(cfg, items, ev, "x")
+    d = cfg.extraction_dir("x")
+    ans = pd.read_parquet(d / "answers.parquet")
+    assert list(ans["id"]) == [it.id for it in items]
+    assert "gold" not in ans.to_json() and "category" not in ans.columns
+    with h5py.File(d / "traces.h5") as f:
+        assert set(f.keys()) == {it.id for it in items}
+        vs = list(f.attrs["variants"])
+        assert vs == ["cos_gamma_query", "cos_gamma_key"] and f.attrs["primary"] == "cos_gamma_query"
+        stars = [rec["variants"][v]["beta_star"] for v in vs]
+        assert f.attrs["beta_star"].tolist() == stars
+        assert f.attrs["betas"].tolist() == [cfg.extraction.betas(b) for b in stars]
+        assert f.attrs["topk_ids_k"].tolist() == [8, 0]
+        g = f[items[0].id]
+        for v in vs:
+            assert g[f"{v}/energy"].shape[-1] == 10 and g[f"{v}/energy"].dtype == np.float16
+            assert g[f"{v}/js/question_last"].dtype == np.float16
+        assert g["cos_gamma_query/topk_ids"].dtype == np.int32 and "topk_ids" not in g["cos_gamma_key"]
+        assert g["query_gain"].dtype == np.float16 and g["query_gain"].shape == g["xhat_top1_frac"].shape
+    with h5py.File(d / "hidden.h5") as f:
+        assert set(f[items[0].id]) == {"question_last", "prompt_last", "response_first", "response_last"}
+    assert m["counts"] == {"completed": 7, "exhausted": 0, "pending": 0}
+    assert m["beta_star"] == {v: r["beta_star"] for v, r in rec["variants"].items()}
+    assert m["model_dtype"] == ["float32"]
+    g = m["gamma_diagnostic"]
+    assert g["k"] == 5 and len(g["fraction"]) == bundle.dims.n_layers
+    assert all(0.0 <= f <= 1.0 for f in g["fraction"])
+    assert json.loads((d / "manifest.json").read_text())["config_sha256"] == cfg.sha256()
 
-        monkeypatch.setattr(traj_mod, "capture_sample", flaky)
-        report = run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples)
-        assert report["n_done"] == 2 and report["n_failed"] == 1
 
-        failures = read_jsonl(cfg.trajectories_dir / "failures.jsonl")
-        assert len(failures) == 1
-        failed_id = failures[0]["sample_id"]
-        assert "simulated OOM" in failures[0]["error"]
-        assert "traceback" in failures[0]
+def test_merge_of_two_shards(calibrated):
+    from energy_llm.core.capture import REFERENCES
 
-        meta = load_json(cfg.trajectories_dir / f"{failed_id}.json")
-        assert meta["failed"] is True
-        with np.load(cfg.trajectories_dir / f"{failed_id}.npz") as npz:
-            assert np.isnan(npz["ref_lse_term"]).all()
+    cfg, bundle, ev, rec = calibrated
+    items = read_items(ev)
+    for k in (0, 2):
+        run_extract(cfg, bundle, items, ev, "two", k)
+    m = run_merge(cfg, items, ev, "two", allow_incomplete=True)
+    ids = [it.id for it in items[:3] + items[6:]]
+    assert m["counts"]["completed"] == 4 and m["incomplete_shards"] == [1]
+    d = cfg.extraction_dir("two")
+    ans = pd.read_parquet(d / "answers.parquet").set_index("id")
+    base = pd.read_parquet(d / "baselines.parquet").set_index("id")
+    assert list(ans.index) == ids
+    with h5py.File(d / "traces.h5") as f:
+        assert list(f) == sorted(ids)
+        assert f.attrs["betas"][1].tolist() == cfg.extraction.betas(rec["variants"]["cos_gamma_key"]["beta_star"])
+        assert f.attrs["topk_mass_k"] == 4 and f.attrs["topk_ids_k"].tolist() == [8, 0]
+        assert list(f.attrs["reference_names"]) == list(REFERENCES)
+        worst = dict.fromkeys(REFERENCES, 0.0)
+        for i in ids:
+            g, a = f[i], ans.loc[i]
+            pos = g.attrs["reference_positions"].tolist()
+            assert pos[1] == a["n_prompt_tokens"] - 1
+            assert pos[2] == (-1 if a["empty_response"] else a["n_prompt_tokens"])
+            assert g["cos_gamma_query/energy"].chunks == (1, g["cos_gamma_query/energy"].shape[1], 10)
+            for r, p in zip(REFERENCES, pos):
+                if p >= 0:
+                    worst[r] = max(worst[r], float(g["xhat_top1_frac"][:, p].max()))
+            resp = np.asarray(a["token_logits"])[:a["n_response_tokens"]]
+            if len(resp):
+                assert base.loc[i, "mean_neg_logit"] == pytest.approx(-resp.mean(), rel=1e-6)
+    assert m["checks"]["max_xhat_top1_frac"] == pytest.approx(worst)
+    g = m["checks"]["gamma_top_fraction_max"]
+    assert g["k"] == 5 and g["value"] == max(m["gamma_diagnostic"]["fraction"])
 
-    def test_shard_runs_populate_one_directory(
-        self, cfg, tiny_model, tiny_tokenizer, tiny_banks
-    ):
-        samples = make_tiny_samples(5)
-        for k in range(2):
-            run_trajectories(cfg, tiny_model, tiny_tokenizer, tiny_banks, samples,
-                             shard_index=k, num_shards=2)
-        done = sorted(p.stem for p in cfg.trajectories_dir.glob("*.json"))
-        assert done == sorted(s.sample_id for s in samples)
+
+def test_merge_refuses_items_with_different_betas(calibrated):
+    from energy_llm.pipeline.extract import item_path
+
+    cfg, bundle, ev, _ = calibrated
+    items, _ = _run_all(cfg, bundle, ev, "b")
+    with h5py.File(item_path(shard_path(cfg.extraction_dir("b"), 1), items[3].id), "r+") as f:
+        f["traces/cos_gamma_key"].attrs["betas"] = f["traces/cos_gamma_key"].attrs["betas"] * 2
+    with pytest.raises(RuntimeError, match="betas"):
+        run_merge(cfg, items, ev, "b")
+
+
+def _flaky(fail_ids, times):
+    calls = {}
+
+    def compute(bundle, bank, trace, item_id, *a):
+        calls[item_id] = calls.get(item_id, 0) + 1
+        if item_id in fail_ids and calls[item_id] <= times:
+            raise RuntimeError("CUDA out of memory (simulated)")
+        return compute_item(bundle, bank, trace, item_id, *a)
+    return compute
+
+
+def test_failures_are_retried_and_not_marked_complete(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    bad = items[0].id
+    compute = _flaky({bad}, times=2)
+    sdir = shard_path(cfg.extraction_dir("f"), 0)
+    for attempt in (1, 2):
+        r = run_extract(cfg, bundle, items, ev, "f", 0, compute=compute)
+        assert r["state"] == "pending"
+        st = shard_state(sdir, 0, [it.id for it in items[:3]], 3)
+        assert bad not in st.completed and st.attempts[bad] == attempt
+    r = run_extract(cfg, bundle, items, ev, "f", 0, compute=compute)
+    assert r["state"] == "done" and r["n_completed"] == 3
+    recs = read_jsonl(sdir / "failed.jsonl")
+    assert [x["attempt"] for x in recs] == [1, 2] and "out of memory" in recs[0]["error"]
+
+
+def test_exhausted_ids_end_the_shard_and_are_reported(calibrated):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    bad = items[1].id
+    compute = _flaky({bad}, times=99)
+    states = [run_extract(cfg, bundle, items, ev, "e", 0, compute=compute)["state"]
+              for _ in range(3)]
+    assert states == ["pending", "pending", "done"]
+    for k in (1, 2):
+        run_extract(cfg, bundle, items, ev, "e", k)
+    m = run_merge(cfg, items, ev, "e")
+    assert list(m["exhausted_ids"]) == [bad] and m["counts"]["completed"] == 6
+    ans = pd.read_parquet(cfg.extraction_dir("e") / "answers.parquet")
+    assert bad not in set(ans["id"])
+
+
+@pytest.mark.parametrize("key, value", [
+    ("topk_ids_k", 4), ("beta_grid_log10_offset", {"min": -0.5, "max": 0.5, "num": 7})])
+def test_changed_config_refuses_to_resume(calibrated, key, value):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    run_extract(cfg, bundle, items, ev, "c", 0, stop_after=1)
+    setattr(cfg.extraction, key, value)
+    with pytest.raises(RuntimeError, match="differs"):
+        run_extract(cfg, bundle, items, ev, "c", 0)
+
+
+def test_status_reports_missing_shards(calibrated, tmp_path, capsys):
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    run_extract(cfg, bundle, items, ev, "s", 1)
+    rep = status_report(cfg, items, "s", ev)
+    assert rep["num_shards"] == 3 and rep["missing_shards"] == [0, 2]
+    assert rep["throughput"]["suggested_samples_per_shard"] >= 1
+
+    import yaml
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg.to_dict()))
+    args = ["--config", str(cfg_path), "--input", str(ev), "--name", "s"]
+    assert cli_main(["status", *args, "--missing"]) == 0
+    assert capsys.readouterr().out.strip() == "0,2"
+    assert cli_main(["status", *args, "--num-shards"]) == 0
+    assert capsys.readouterr().out.strip() == "3"
+
+
+def test_sigusr1_stops_after_current_id_and_resume_completes(calibrated):
+    import os
+    import signal
+
+    from energy_llm.pipeline.signals import GracefulStop
+
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    stopper = GracefulStop()
+
+    def compute(*a):
+        res = compute_item(*a)
+        os.kill(os.getpid(), signal.SIGUSR1)   # SLURM's pre-walltime warning
+        return res
+
+    try:
+        r = run_extract(cfg, bundle, items, ev, "sig", 0, stopper=stopper, compute=compute)
+    finally:
+        signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    assert r["stopped_by_signal"] and r["signal"] == "SIGUSR1"
+    assert r["state"] == "pending" and r["n_completed"] == 1   # the in-flight id was finished
+    r = run_extract(cfg, bundle, items, ev, "sig", 0)
+    assert r["state"] == "done" and r["n_done_this_run"] == 2
+
+
+def test_cli_extract_skips_finished_shard_without_loading_model(calibrated, tmp_path, capsys):
+    import yaml
+
+    cfg, bundle, ev, _ = calibrated
+    run_extract(cfg, bundle, read_items(ev), ev, "k", 2)
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg.to_dict()))
+    # the tiny model id does not exist on the hub: reaching the loader would raise
+    code = cli_main(["extract", "--config", str(cfg_path), "--input", str(ev),
+                     "--name", "k", "--shard-index", "2"])
+    assert code == 0 and '"skipped_model_load": true' in capsys.readouterr().out
+
+
+def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
+    from energy_llm.core.capture import ResidualHooks, forward_item
+    from energy_llm.core.prompting import build_prompt
+
+    cfg, bundle, ev, _ = calibrated
+    items = read_items(ev)
+    hooks = ResidualHooks(bundle.trace_model)
+    first = forward_item(bundle, hooks, build_prompt(
+        bundle.tokenizer, cfg.prompt.system, items[0].question, None)).gen_ids[0]
+    hooks.remove()
+    stops = sorted(set(bundle.stop_token_ids) | {first})     # items[0] now stops at once
+    bundle.stop_token_ids = stops
+    bundle.generation_config.eos_token_id = stops
+
+    _, reports = _run_all(cfg, bundle, ev, "empty")
+    assert all(r["state"] == "done" for r in reports)
+    for k in range(len(reports)):
+        assert read_jsonl(shard_path(cfg.extraction_dir("empty"), k) / "failed.jsonl") == []
+    m = run_merge(cfg, items, ev, "empty")
+    assert m["exhausted_ids"] == {} and m["counts"]["completed"] == len(items)
+    assert m["checks"]["n_empty_response"] >= 1
+    d = cfg.extraction_dir("empty")
+    ans = pd.read_parquet(d / "answers.parquet").set_index("id")
+    assert ans.loc[items[0].id, "empty_response"] and ans.loc[items[0].id, "n_response_tokens"] == 0
+    base = pd.read_parquet(d / "baselines.parquet").set_index("id")
+    assert np.isnan(base.loc[items[0].id, "mean_logprob"])
+    with h5py.File(d / "traces.h5") as f, h5py.File(d / "hidden.h5") as h:
+        assert np.isnan(h[items[0].id]["response_last"][()]).all()
+        for v in ("cos_gamma_query", "cos_gamma_key"):
+            g = f[items[0].id][v]
+            assert np.isfinite(g["energy"][()]).all()
+            assert np.isnan(g["dkl/response_first"][()]).all()
+            assert np.isfinite(g["dkl/prompt_last"][()]).all()
+
+
+def test_smoke_summary(calibrated, capsys):
+    from energy_llm.pipeline.smoke import format_summary, run_smoke
+
+    cfg, bundle, ev, rec = calibrated
+    variants = ["cos_gamma_query", "cos_gamma_key"]
+    s = run_smoke(cfg, bundle, read_items(ev), n=5, name="smoke-test")
+    assert s["n_questions"] == 5 and s["n_completed"] == 5 and s["n_failed"] == 0
+    assert s["model_dtype"] == "float32" and s["trace_dtype"] == "float32"
+    assert s["beta_star"] == {v: rec["variants"][v]["beta_star"] for v in variants}
+    assert s["primary"] == "cos_gamma_query" and set(s["variants"]) == set(variants)
+    assert set(s["calibration"]["grid_position"]) == set(variants)
+    assert s["tf_token_match_pct"] == 100.0 and s["tf_exact_answers_pct"] == 100.0
+    assert s["sec_per_question"] > 0 and s["peak_gpu_mem_gb"] is None   # CPU
+    assert {"n_empty_response", "n_truncated", "xhat_norm_max_rel_dev"} <= set(s)
+    assert s["empty_response_by_condition"] == {"q": {"n": 5, "n_empty": s["n_empty_response"]}}
+    assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
+    L = bundle.dims.n_layers
+    # topk_ids of the control variant are not stored: the saving is reported
+    ts = s["topk_ids_storage"]
+    assert ts["control_topk_ids_k"] == 0 and ts["would_be_k"] == 8
+    T_mean = np.mean([a + b for a, b in zip(*[pd.read_parquet(cfg.extraction_dir("smoke-test") / "answers.parquet")[c]
+                                               for c in ("n_prompt_tokens", "n_generated_tokens")])])
+    assert ts["saved_mb_per_question_uncompressed"] == pytest.approx(L * T_mean * 8 * 4 / 1e6)
+    assert 0 < ts["saved_mb_per_question_gzip_estimate"]
+    # bands by relative depth, with the shared per-layer diagnostics
+    assert [b["layers"] for b in s["depth_bands"]] == [[0, 0], [1, 1], [2, 2]]     # L = 3: l/L thirds
+    assert len(s["per_layer_shared"]) == L
+    for r in s["per_layer_shared"]:
+        assert 0 <= r["dstar"] < bundle.dims.d_model and 0 < r["dstar_share"] <= 1
+    qg = s["query_gain"]
+    assert len(qg["per_layer"]) == L and len(qg["bands"]) == 3
+    for row in qg["per_layer"]:
+        for r in ("question_last", "prompt_last", "response"):
+            st = row[r]
+            assert 0 < st["min"] <= st["p10"] <= st["median"] <= st["p90"] <= st["max"]
+    ex = s["layer_exclusion"]
+    assert ex["applied"] is False and ex["proposed_from"] == "cos_gamma_query"
+    assert ex["proposed_excluded_layers"] is None or ex["proposed_excluded_layers"][0] == 0
+    text = format_summary(s)
+    assert "TF == greedy" in text and "layer   0" in text
+    assert s["tf_disagreements"]["n"] == 0 and s["tf_disagreements"]["all_below_delta"] is True
+    assert "TF/greedy disagreements 0" in text
+    assert f"report: {cfg.extraction_dir('smoke-test')}/smoke_report.json" in text
+    assert "ablation top_gamma_zeroed" in text and "ablation dstar_zeroed" in text
+    assert "without layer 0" in text and "beta_l" in text and "re-matched beta" in text
+    assert "beta*[cos_gamma_query] (primary)" in text and "beta*[cos_gamma_key]" in text
+    assert "== cos_gamma_query (primary)" in text and "== cos_gamma_key" in text
+    assert "NOT applied" in text and "query gain g_t" in text and "MB/question" in text
+    assert "empty responses by condition (id prefix): q " in text
+    d = cfg.extraction_dir("smoke-test")
+    ans = pd.read_parquet(d / "answers.parquet")
+    for v in variants:
+        pv = s["variants"][v]
+        assert pv["beta_star"] == rec["variants"][v]["beta_star"]
+        assert len(pv["per_layer"]) == L
+        for r in pv["per_layer"]:
+            assert set(r["delta_norm_entropy"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
+            assert set(r["delta_norm_entropy_question_last"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
+            assert set(r["js_beta_star"]) == {"question_last", "prompt_last"}
+            assert set(r["criteria"]) == {"criterion3_xhat_prompt_last_median_gt_0.5",
+                                          "criterion4_gamma_fraction_gt_0.5_or_sign_flip",
+                                          "gamma_ablation_sign_flip"}
+        assert pv["bands_excluding_layer0"][0] is None          # the first third is layer 0 alone
+        assert pv["bands_excluding_layer0"][1:] == pv["bands"][1:]
+        ab = pv["ablation_betas"]
+        assert ab["beta_matched"]["intact"] == rec["variants"][v]["beta_star"]
+        for k in ("top_gamma_zeroed", "dstar_zeroed"):
+            bm = ab["beta_matched"][k]
+            assert bm is None or bm > 0
+            blk = pv["bands"][0]["ablation"][k]
+            assert (blk["beta_matched"] is None) == (bm is None)
+        assert pv["bands"][0]["ablation"]["intact"]["beta_matched"] == pv["bands"][0]["ablation"]["intact"]["beta_star"]
+        bl = pv["beta_per_layer"]
+        assert len(bl["per_layer"]) == L and bl["target"] == rec["target_norm_entropy"]
+        assert bl["min"] is None or bl["min"] <= bl["max"]
+        pl = pv["prompt_last_entropy"]
+        assert pl["target_band"] == pytest.approx([rec["target_norm_entropy"] - 0.05,
+                                                   rec["target_norm_entropy"] + 0.05])
+        lo, hi = pl["calibration_bracket"]
+        assert lo <= hi and pl["in_calibration_bracket"] == (lo <= pl["mean_h_prompt_last_beta_star"] <= hi)
+        le = pv["layer_exclusion"]
+        assert len(le["beta_star_not_counted"]["per_layer"]) == L
+        assert le["beta_matched"] is None or le["beta_matched"]["excluded"][0] == 0
+        # the intact branch of the ablation equals the production traces (float16 storage)
+        deltas, deltas_q = [], []
+        with h5py.File(d / "traces.h5") as f:
+            for i, n_p in zip(ans["id"], ans["n_prompt_tokens"]):
+                g = f[i]
+                h, resp = g[f"{v}/norm_entropy"][..., -1].astype(np.float64), g["role_mask"][()] == 3
+                q = g.attrs["reference_positions"][0]
+                if resp.any():
+                    deltas.append(h[:, resp].mean(1) - h[:, n_p - 1])
+                    deltas_q.append(h[:, resp].mean(1) - h[:, q])
+        for b in pv["bands"]:
+            lo, hi = b["layers"]
+            got = b["delta_norm_entropy_response_minus_prompt_last"]
+            assert got["intact"] == pytest.approx(np.mean(np.asarray(deltas)[:, lo:hi + 1]), abs=2e-3)
+            gq = b["delta_norm_entropy_response_minus_question_last"]
+            assert gq["intact"] == pytest.approx(np.mean(np.asarray(deltas_q)[:, lo:hi + 1]), abs=2e-3)
+            assert np.isfinite(got["top_gamma_zeroed"]) and np.isfinite(got["dstar_zeroed"])
+            assert 0.0 <= b["gamma_top_fraction"] <= 1.0
+            for r in ("question_last", "prompt_last", "response_first"):
+                x = b["xhat_top1_frac"][r]
+                assert 0.0 < x["median"] <= x["max"] <= 1.0
+    # the two variants are different numbers
+    assert s["variants"]["cos_gamma_query"]["per_layer"] != s["variants"]["cos_gamma_key"]["per_layer"]
+
+
+def test_empty_responses_by_condition():
+    from energy_llm.pipeline.smoke import empty_by_condition, id_condition
+
+    assert [id_condition(i) for i in ("dev-known-01", "dev-obscure-3", "q_000", "tqa.17", "abc", "7")] == \
+        ["dev-known", "dev-obscure", "q", "tqa", "abc", "7"]
+    ans = pd.DataFrame({"id": ["dev-known-01", "dev-known-02", "dev-misc-01"],
+                        "empty_response": [True, False, True]})
+    assert empty_by_condition(ans) == {"dev-known": {"n": 2, "n_empty": 1}, "dev-misc": {"n": 1, "n_empty": 1}}
+
+
+def test_depth_bands_are_relative():
+    from energy_llm.pipeline.smoke import depth_bands
+
+    for L in (3, 28, 36):
+        bands = depth_bands(L)
+        assert np.concatenate(bands).tolist() == list(range(L))
+        for k, b in enumerate(bands):
+            assert all(k / 3 <= l / L < (k + 1) / 3 for l in b)
+    assert [len(b) for b in depth_bands(36)] == [12, 12, 12]
+    assert [len(b) for b in depth_bands(28)] == [10, 9, 9]
+
+
+def test_layer_exclusion_rule():
+    """A flip counts only with |dH| > 0.02 on both sides and both bootstrap
+    CIs excluding 0 with opposite signs; the first layer is always excluded."""
+    from energy_llm.pipeline.smoke import exclusion_layers
+
+    rng = np.random.default_rng(0)
+    n = 30
+    intact = np.stack([rng.normal(0.05, 0.01, n),        # l0: no flip (first layer anyway)
+                       rng.normal(0.05, 0.01, n),        # l1: clear flip
+                       rng.normal(0.01, 0.01, n),        # l2: flip but |dH| < 0.02 intact
+                       rng.normal(0.05, 0.30, n),        # l3: flip in mean, CI includes 0
+                       rng.normal(0.05, 0.01, n)], 1)    # l4: no flip
+    ablated = np.stack([rng.normal(0.05, 0.01, n), rng.normal(-0.05, 0.01, n),
+                        rng.normal(-0.05, 0.01, n), rng.normal(-0.05, 0.30, n),
+                        rng.normal(0.04, 0.01, n)], 1)
+    intact[0, 4] = np.nan                                # empty response dropped
+    out = exclusion_layers(intact, ablated, seed=42)
+    assert out["flip_layers"] == [1] and out["excluded"] == [0, 1]
+    l1 = out["per_layer"][1]
+    assert l1["ci_intact"][0] > 0 and l1["ci_ablated"][1] < 0 and l1["flip_counts"]
+    assert out["per_layer"][4]["n"] == n - 1
+    assert not out["per_layer"][3]["flip_counts"]
+    assert exclusion_layers(intact, ablated, seed=42) == out          # fixed seed: reproducible
+
+
+def test_tf_disagreements_delta_rule():
+    import pandas as pd
+
+    from energy_llm.pipeline.smoke import bf16_ulp, tf_disagreements
+
+    assert bf16_ulp(1.0) == 2.0 ** -7 and bf16_ulp(-20.0) == 2.0 ** -3 and bf16_ulp(0.0) == 0.0
+    ans = pd.DataFrame([
+        {"id": "a", "generated_token_ids": [5, 6, 7], "tf_mismatch_positions": [1],
+         "tf_mismatch_tf_tokens": [9], "tf_mismatch_margin_tf": [0.01], "tf_mismatch_margin_gen": [0.02],
+         "tf_mismatch_top_logit": [20.0], "tf_logit_diff": [0.05, 0.9, 0.05], "tf_logit_diff_step0": 0.05},
+        {"id": "b", "generated_token_ids": [1, 2], "tf_mismatch_positions": [1],
+         "tf_mismatch_tf_tokens": [3], "tf_mismatch_margin_tf": [0.5], "tf_mismatch_margin_gen": [0.4],
+         "tf_mismatch_top_logit": [1.0], "tf_logit_diff": [0.1, 0.6], "tf_logit_diff_step0": 0.1},
+    ])
+    d = tf_disagreements(ans)
+    # non-divergent steps: 0.05, 0.05, 0.1 -> p99 (linear) 0.099; the 0.9 / 0.6 steps are excluded
+    assert d["p99_logit_diff_non_divergent"] == pytest.approx(0.099)
+    assert d["max_logit_diff_step0"] == 0.1
+    a, b = d["list"]
+    assert a["delta"] == 3 * 2.0 ** -3 and a["below_delta"]                # 3 ulp at |20| = 0.375
+    assert b["token_gen"] == 2 and b["token_tf"] == 3 and not b["below_delta"]
+    assert d["n"] == 2 and d["all_below_delta"] is False

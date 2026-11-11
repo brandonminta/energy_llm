@@ -28,6 +28,33 @@ OUT="$HOME/pilot_bundle_$(date +%Y%m%d_%H%M%S).txt"
 
 section() { printf '\n==================== %s ====================\n' "$*"; }
 
+git_info() {   # commit + status of the repository; never silent about why it failed
+    # --git-dir/--work-tree instead of `git -C` (absent before git 1.8.5, e.g.
+    # CentOS 7's 1.8.3); -c safe.directory for repositories owned by another uid
+    local g=(git --git-dir="$REPO_ROOT/.git" --work-tree="$REPO_ROOT" -c safe.directory="$REPO_ROOT")
+    local out head ref sha
+    if ! command -v git >/dev/null 2>&1; then
+        echo "(git not on PATH)"
+    elif out="$("${g[@]}" log -1 --format='commit %H %ad %s' 2>&1)"; then
+        echo "$out"
+        "${g[@]}" status --short 2>&1 | head -n 20
+        return 0
+    else
+        echo "(git log failed: $(printf '%s' "$out" | head -n 2 | tr '\n' ' '))"
+    fi
+    # fallback without git: HEAD and its ref read from .git
+    head="$(cat "$REPO_ROOT/.git/HEAD" 2>/dev/null)" || { echo "(no $REPO_ROOT/.git/HEAD)"; return 0; }
+    case "$head" in
+        ref:*)
+            ref="${head#ref: }"
+            sha="$(cat "$REPO_ROOT/.git/$ref" 2>/dev/null)"
+            [ -n "$sha" ] || sha="$(grep " $ref\$" "$REPO_ROOT/.git/packed-refs" 2>/dev/null | cut -d' ' -f1)"
+            echo "commit ${sha:-unknown} ($ref, read from .git; working-tree status unknown)" ;;
+        *)
+            echo "commit $head (detached HEAD, read from .git; working-tree status unknown)" ;;
+    esac
+}
+
 show_file() {   # show_file PATH [tail|head|all] [N]
     local path="$1" mode="${2:-all}" n="${3:-$TAIL_N}"
     if [ ! -f "$path" ]; then
@@ -89,8 +116,7 @@ job_block() {   # job_block KIND JOBID REPORT_NAME
 {
     section "pilot bundle $(date -Is) host=$(hostname) user=${USER:-?}"
     echo "repo: $REPO_ROOT"
-    git -C "$REPO_ROOT" log -1 --format='commit %H %ad %s' 2>/dev/null || echo "(git log unavailable)"
-    git -C "$REPO_ROOT" status --short 2>/dev/null | head -n 20
+    git_info
     section "sacct -j $VJOB,$SJOB"
     if command -v sacct >/dev/null 2>&1; then
         sacct -j "$VJOB,$SJOB" \

@@ -40,6 +40,27 @@ def test_pilot_bundle_uses_the_runs_of_the_given_jobs(tmp_path):
         assert f"{kind}-old" not in text
     assert "(missing: " in text and "smoke_22.err" in text      # absent .err reported, not fatal
     assert "sacct" in text
+    head = subprocess.run(["git", "-C", str(SCRIPT.parents[1]), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    assert f"commit {head}" in text and "unavailable" not in text
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_pilot_bundle_records_the_commit_when_git_fails(tmp_path):
+    """An old git (no -C, 'Unknown option') or any git error: the error is
+    shown and the commit is read from .git/HEAD."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "git").write_text("#!/bin/sh\necho 'Unknown option: -C' >&2\nexit 129\n")
+    (fake / "git").chmod(0o755)
+    head = subprocess.run(["git", "-C", str(SCRIPT.parents[1]), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    env = dict(os.environ, HOME=str(tmp_path), LOG_DIR=str(tmp_path), PATH=f"{fake}:/usr/bin:/bin")
+    r = subprocess.run(["bash", str(SCRIPT), "1", "2"], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    text = next(tmp_path.glob("pilot_bundle_*.txt")).read_text()
+    assert "(git log failed: Unknown option: -C" in text
+    assert f"commit {head} (" in text and "read from .git" in text
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")

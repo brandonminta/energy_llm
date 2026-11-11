@@ -277,8 +277,9 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[dict[str, float]
     the no-gamma control, and the tolerance. In the model g = W_g (gamma * x_hat)
     involves three roundings in the model dtype (x_hat, gamma * x_hat, the
     output), each <= u relative to the scale |g| + ||w_tilde ⊙ x_hat||_2;
-    tol = 4u (one u of margin), floored at F32_FLOOR for float32 models."""
-    model = bundle.model
+    tol = 4u (one u of margin), floored at F32_FLOOR for float32 models. The
+    gate is read from the trace model (where the traced residuals come from)."""
+    model = bundle.trace_model
     cap = _Capture(model, gate=True)
     full = torch.tensor([trace.prompt.input_ids + trace.gen_ids], device=bundle.device)
     try:
@@ -300,7 +301,7 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[dict[str, float]
             err[v] = max(err[v], ((g - gr).abs() / scale).max().item())
         ctrl = max(ctrl, ((g - g_ctrl).abs() / scale).max().item())
         del w
-    tol = max(4 * UNIT_ROUNDOFF[bundle.dtype], F32_FLOOR)
+    tol = max(4 * UNIT_ROUNDOFF[bundle.trace_dtype], F32_FLOOR)
     return err, ctrl, tol
 
 
@@ -488,7 +489,8 @@ def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[
     ``signal[v]``: the per-variant sigma samples of tf_vs_cache. The float32
     instance is loaded separately from the cache (never an in-place cast of
     the production model) and freed afterwards; a float32 bundle (tests) is
-    its own reference. Full float32 matmul precision is forced during the
+    its own reference, and so is a float32 trace model (trace_dtype float32).
+    Full float32 matmul precision is forced during the
     check (no TF32) and restored after. Precision rule: if max over variants,
     layers and metrics of p99/sigma (TF vs float32, analysis positions) exceeds
     RECOMMEND_FP32_RATIO, the report recommends trace_dtype=float32."""
@@ -499,10 +501,10 @@ def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    separate = bundle.dtype != "float32"
+    separate = bundle.trace_dtype != "float32"
     x32 = []
     try:
-        model = load_fp32_model(cfg, bundle.device) if separate else bundle.model
+        model = load_fp32_model(cfg, bundle.device) if separate else bundle.trace_model
         for rec in saved:
             cap = _Capture(model, gate=False)
             try:
@@ -773,7 +775,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
     run_cfg, ext_dir, _, merged = run_single_process(cfg, bundle, sel, "verify", name)
     bank = build_bank(bundle.model, bundle.dims)
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     stops = set(int(t) for t in np.atleast_1d(bundle.generation_config.eos_token_id))
     if bundle.tokenizer.eos_token_id is not None:
         stops.add(int(bundle.tokenizer.eos_token_id))
@@ -850,7 +852,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             del x_cache
             full = torch.tensor([trace.prompt.input_ids + trace.gen_ids], device=bundle.device)
             with torch.inference_mode():
-                tf_logits = bundle.model(input_ids=full, use_cache=False,
+                tf_logits = bundle.trace_model(input_ids=full, use_cache=False,
                                          logits_to_keep=len(trace.gen_ids) + 1).logits[0, 0].float()
             n_p = trace.n_prompt
             indep_resp = [n_p + j for j, t in enumerate(trace.gen_ids) if t not in stops]
@@ -976,7 +978,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                "reconstruction": {PRIMARY: "||w_i|| ||gamma * x_hat|| c_i",
                                   CONTROL: "||w_tilde_i|| sqrt(D) s_i"},
                "no_gamma_control_min_error": gate_ctrl,
-               "control_must_exceed": 10 * gtol, "model_dtype": bundle.dtype}),
+               "control_must_exceed": 10 * gtol, "trace_dtype": bundle.trace_dtype}),
         Check("tf_vs_cache", _status(max(tf_w.values()) <= tf_max_noise_ratio and tokens_equal),
               max(tf_w.values()), tf_max_noise_ratio,
               {"metric": "per variant, max over layers and traces of p99(|delta|) / sigma_l at beta*_v "
@@ -1047,7 +1049,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     report = {
         "extraction_dir": str(ext_dir),
         "model": {"id": cfg.model.id, "revision": cfg.model.revision, "dtype": bundle.dtype,
-                  "device": str(bundle.device)},
+                  "trace_dtype": bundle.trace_dtype, "device": str(bundle.device)},
         "beta_star": beta_star,
         "primary": PRIMARY,
         "n_questions": len(sel),
@@ -1069,7 +1071,7 @@ def _calibration_check(cfg: RunConfig, bundle: ModelBundle, bank: Bank, rec: dic
     if not path.exists() or sha256_file(path) != rec["input_sha256"]:
         return Check("calibration", "SKIP", None, None, {"reason": f"warm-up file {path} not available"})
     grid = np.asarray(rec["beta_grid"])
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     vals = {v: [] for v in VARIANTS}
     try:
         for it in read_items(path):
@@ -1102,7 +1104,8 @@ def _calibration_check(cfg: RunConfig, bundle: ModelBundle, bank: Bank, rec: dic
 
 def format_report(r: dict) -> str:
     stars = "  ".join(f"{v}={b:.6g}" for v, b in r["beta_star"].items())
-    lines = [f"verify {r['model']['id']} ({r['model']['dtype']} on {r['model']['device']}), "
+    lines = [f"verify {r['model']['id']} ({r['model']['dtype']}, traces {r['model']['trace_dtype']} "
+             f"on {r['model']['device']}), "
              f"beta* {stars}, {r['n_questions']} questions, {r['elapsed_s']} s",
              f"  {'check':<17} {'status':<6} {'max error':>12} {'tolerance':>12}"]
     fmt = lambda v: "-" if v is None else f"{v:.3e}"

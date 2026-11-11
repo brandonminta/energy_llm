@@ -144,7 +144,7 @@ def run_calibrate(cfg: RunConfig, bundle: ModelBundle, items: list[Item],
     attempts, _ = read_failures(failed_path)
     max_attempts = cfg.extraction.max_attempts
 
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     try:
         for it in items:
             if stopper.requested:

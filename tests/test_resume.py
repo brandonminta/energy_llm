@@ -267,7 +267,7 @@ def test_empty_responses_are_completed_flagged_and_not_failures(calibrated):
 
     cfg, bundle, ev, _ = calibrated
     items = read_items(ev)
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     first = forward_item(bundle, hooks, build_prompt(
         bundle.tokenizer, cfg.prompt.system, items[0].question, None)).gen_ids[0]
     hooks.remove()

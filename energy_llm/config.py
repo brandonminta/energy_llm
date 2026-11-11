@@ -31,7 +31,8 @@ class ConfigError(ValueError):
 class ModelConfig:
     id: str = ""
     revision: str = ""               # exact hub commit hash
-    dtype: str = "bfloat16"          # the only accepted value
+    dtype: str = "bfloat16"          # the only accepted value (generation)
+    trace_dtype: str = "bfloat16"    # teacher-forced trace pass: bfloat16 (same model) | float32 (second instance)
     device: str = "auto"             # auto | cuda | cpu
 
 
@@ -158,6 +159,8 @@ class RunConfig:
             raise ConfigError("model.revision must be a 40-hex hub commit hash")
         if self.model.dtype != "bfloat16":
             raise ConfigError("model.dtype must be bfloat16")
+        if self.model.trace_dtype not in ("bfloat16", "float32"):
+            raise ConfigError("model.trace_dtype must be bfloat16|float32")
         if self.model.device not in ("auto", "cuda", "cpu"):
             raise ConfigError("model.device must be auto|cuda|cpu")
         if not self.prompt.system.strip():

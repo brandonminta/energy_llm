@@ -8,6 +8,7 @@ model:
   id: meta-llama/Llama-3.2-3B-Instruct
   revision: 0cb88a4f764b7a12671c53f0838cd831a0843b95   # hub commit, resolved 2026-10-26
   dtype: bfloat16            # enforced: loading fails if parameters are not bf16
+  trace_dtype: bfloat16      # teacher-forced trace pass; float32 = second instance (verify RECOMMEND rule)
   device: auto
 
 prompt:

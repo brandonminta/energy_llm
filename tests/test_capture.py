@@ -20,7 +20,7 @@ def _date(tok):
 
 
 def _trace(bundle, question=Q):
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     try:
         prompt = build_prompt(bundle.tokenizer, SYSTEM, question, _date(bundle.tokenizer))
         return forward_item(bundle, hooks, prompt)
@@ -361,3 +361,55 @@ def test_non_finite_values_raise(qwen_pair, monkeypatch):
     monkeypatch.setattr(capture.metrics, "energy", lambda s, b: torch.full(s.shape[:-1], float("nan")))
     with pytest.raises(NonFiniteError):
         compute_item(bundle, bank, tr, "x", both([5.0]), [0], K_MASS, both(K_IDS))
+
+
+# ------------------------------------------------------------ trace dtype
+
+def test_trace_dtype_bfloat16_uses_the_generating_model(qwen_pair):
+    """Default (model.trace_dtype: bfloat16): one model; the traced residuals
+    are in the model dtype."""
+    from energy_llm.core.model import prepare_bundle
+
+    model, tok = qwen_pair
+    bundle = prepare_bundle(model.to(torch.bfloat16), tok, 6)
+    assert bundle.trace_model is bundle.model and bundle.trace_dtype == "bfloat16"
+    tr = _trace(bundle)
+    assert all(x.dtype == torch.bfloat16 for x in tr.residuals.values())
+
+
+def test_trace_dtype_float32_traces_with_a_float32_instance(qwen_pair):
+    """model.trace_dtype: float32: generation stays in the bf16 model, the
+    teacher-forced pass (residuals, TF logits) runs on the float32 instance
+    and reproduces a direct float32 forward of the same tokens."""
+    import copy
+
+    from energy_llm.core.model import prepare_bundle
+
+    model, tok = qwen_pair
+    fp32 = copy.deepcopy(model)
+    bf16 = model.to(torch.bfloat16)
+    bundle = prepare_bundle(bf16, tok, 6, trace_model=fp32)
+    assert bundle.dtype == "bfloat16" and bundle.trace_dtype == "float32"
+    ref = prepare_bundle(copy.deepcopy(bf16), tok, 6)       # bf16 only
+    tr, tr_ref = _trace(bundle), _trace(ref)
+    assert tr.gen_ids == tr_ref.gen_ids                     # generation: the bf16 model
+    assert all(x.dtype == torch.float32 for x in tr.residuals.values())
+    ids = torch.tensor([tr.prompt.input_ids + tr.gen_ids])
+    xs = {}
+    hs = [layer.post_attention_layernorm.register_forward_pre_hook(
+        lambda m, a, l=l: xs.__setitem__(l, a[0][0].clone())) for l, layer in enumerate(fp32.model.layers)]
+    with torch.no_grad():
+        fp32(input_ids=ids)
+    for h in hs:
+        h.remove()
+    for l, x in tr.residuals.items():
+        torch.testing.assert_close(x, xs[l], rtol=0, atol=0)
+    # the hooks must sit on the trace model
+    with pytest.raises(RuntimeError, match="trace_model"):
+        hooks = ResidualHooks(bundle.model)
+        try:
+            forward_item(bundle, hooks, tr.prompt)
+        finally:
+            hooks.remove()
+    with pytest.raises(RuntimeError, match="float32"):
+        prepare_bundle(copy.deepcopy(bf16), tok, 6, trace_model=copy.deepcopy(bf16))

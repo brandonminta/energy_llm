@@ -23,7 +23,7 @@ Q = "what is the capital of france"
 def setup(pair):
     bundle = make_bundle(*pair)
     bank = build_bank(bundle.model, bundle.dims)
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     date = DATE if "date_string" in bundle.tokenizer.chat_template else None
     tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, Q, date))
     hooks.remove()
@@ -115,7 +115,7 @@ def test_two_identical_runs_are_bit_identical_on_cpu(pair):
     for _ in range(2):
         bundle = make_bundle(*pair)
         bank = build_bank(bundle.model, bundle.dims)
-        hooks = ResidualHooks(bundle.model)
+        hooks = ResidualHooks(bundle.trace_model)
         date = DATE if "date_string" in bundle.tokenizer.chat_template else None
         tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, Q, date))
         hooks.remove()

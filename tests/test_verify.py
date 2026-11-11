@@ -144,7 +144,7 @@ def test_fp32_reference_loads_a_separate_instance_and_restores_precision(run, mo
         return m
 
     monkeypatch.setattr(v, "load_fp32_model", fake_load)
-    fake = dataclasses.replace(bundle, dtype="bfloat16")
+    fake = dataclasses.replace(bundle, dtype="bfloat16", trace_dtype="bfloat16")
     bank = build_bank(bundle.model, bundle.dims)
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     ids = list(range(1, 9))

@@ -236,7 +236,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
             raise RuntimeError("model weights differ from the calibrated bank")
         layers_h = cfg.hidden_layer_indices(bundle.dims.n_layers)
         betas, k_ids = variant_betas(cfg, beta_rec), variant_topk_ids(cfg)
-        hooks = ResidualHooks(bundle.model)
+        hooks = ResidualHooks(bundle.trace_model)
         t_items = time.time()
         try:
             for it in todo:
@@ -279,6 +279,7 @@ def run_extract(cfg: RunConfig, bundle: ModelBundle, items: list[Item], input_pa
         "model_load_s": model_load_s,
         "sec_per_item": round(items_s / (n_done + n_failed), 3) if n_done + n_failed else None,
         "model_dtype": bundle.dtype,
+        "trace_dtype": bundle.trace_dtype,
         "peak_gpu_mem_gb": manifest.peak_gpu_memory_gb(bundle.device),
         "hardware": manifest.hardware(),
         "code": manifest.code_version(),

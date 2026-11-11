@@ -43,6 +43,19 @@ def test_invalid_extraction_values(tmp_path, extraction, match):
         make_cfg(tmp_path, **extraction)
 
 
+def test_trace_dtype(tmp_path):
+    cfg = make_cfg(tmp_path)
+    assert cfg.model.trace_dtype == "bfloat16"
+    raw = cfg.to_dict()
+    raw["model"]["trace_dtype"] = "float32"
+    f32 = RunConfig.from_dict(raw)
+    # beta* depends on it: part of the calibration context and the config hash
+    assert f32.calibration_context() != cfg.calibration_context() and f32.sha256() != cfg.sha256()
+    raw["model"]["trace_dtype"] = "float16"
+    with pytest.raises(ConfigError, match="trace_dtype"):
+        RunConfig.from_dict(raw)
+
+
 @pytest.mark.parametrize("old_key", ["beta_multipliers", "jaccard_top_k", "beta_grid_log10"])
 def test_removed_keys_are_rejected(tmp_path, old_key):
     raw = make_cfg(tmp_path).to_dict()

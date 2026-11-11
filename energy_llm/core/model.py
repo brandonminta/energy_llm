@@ -27,14 +27,25 @@ class ModelDims:
 
 @dataclass
 class ModelBundle:
-    """Everything extraction needs about a loaded model."""
+    """Everything extraction needs about a loaded model. ``model`` generates;
+    ``trace_model`` runs the teacher-forced pass whose residuals are traced:
+    the same module by default, a separate float32 instance of the same
+    checkpoint when ``model.trace_dtype`` is float32."""
     model: nn.Module
     tokenizer: object
     dims: ModelDims
     stop_token_ids: list[int]
     generation_config: object
     device: torch.device
-    dtype: str           # actual parameter dtype, recorded in the manifest
+    dtype: str           # actual parameter dtype of ``model``, recorded in the manifest
+    trace_model: nn.Module | None = None
+    trace_dtype: str = ""
+
+    def __post_init__(self):
+        if self.trace_model is None:
+            self.trace_model = self.model
+        if not self.trace_dtype:
+            self.trace_dtype = str(next(self.trace_model.parameters()).dtype).replace("torch.", "")
 
 
 def decoder_layers(model: nn.Module) -> nn.ModuleList:
@@ -134,15 +145,25 @@ def clean_generation_config(max_new_tokens: int, stop_ids: list[int], pad_id: in
 
 
 def prepare_bundle(model: nn.Module, tokenizer, max_new_tokens: int,
-                   require_bf16: bool = True) -> ModelBundle:
-    """Validate a loaded model and install the clean greedy config."""
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+                   require_bf16: bool = True, trace_model: nn.Module | None = None) -> ModelBundle:
+    """Validate a loaded model and install the clean greedy config.
+    ``trace_model``: optional float32 instance of the same checkpoint for the
+    teacher-forced trace pass (``model.trace_dtype: float32``)."""
+    for m in (model, trace_model):
+        if m is not None:
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
     dtype = next(model.parameters()).dtype
     if require_bf16 and dtype != torch.bfloat16:
         raise RuntimeError(f"model loaded as {dtype}, expected torch.bfloat16")
     dims = model_dims(model)
+    if trace_model is not None:
+        if next(trace_model.parameters()).dtype != torch.float32:
+            raise RuntimeError("trace_model must be float32")
+        if model_dims(trace_model) != dims or next(trace_model.parameters()).device != \
+                next(model.parameters()).device:
+            raise RuntimeError("trace_model must be the same checkpoint on the same device")
     stops = stop_token_ids(model, tokenizer)
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else stops[0]
     gen_cfg = clean_generation_config(max_new_tokens, stops, pad)
@@ -150,7 +171,7 @@ def prepare_bundle(model: nn.Module, tokenizer, max_new_tokens: int,
     return ModelBundle(
         model=model, tokenizer=tokenizer, dims=dims, stop_token_ids=stops,
         generation_config=gen_cfg, device=next(model.parameters()).device,
-        dtype=str(dtype).replace("torch.", ""),
+        dtype=str(dtype).replace("torch.", ""), trace_model=trace_model,
     )
 
 

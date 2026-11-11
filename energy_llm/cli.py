@@ -28,8 +28,11 @@ def _cfg_items(args):
 
 
 def _load(args):
-    """Config, items and the model bundle (bf16 enforced). Returns the model
-    load time too, which the shard run records."""
+    """Config, items and the model bundle (bf16 enforced; with
+    model.trace_dtype float32 a second, float32 instance runs the trace pass).
+    Returns the model load time too, which the shard run records."""
+    import torch
+
     from energy_llm.core.model import load_model, prepare_bundle
     from energy_llm.manifest import set_determinism
 
@@ -37,7 +40,10 @@ def _load(args):
     set_determinism(cfg.seed)
     t0 = time.time()
     model, tok = load_model(cfg.model.id, cfg.model.revision, cfg.model.device)
-    bundle = prepare_bundle(model, tok, cfg.generation.max_new_tokens, require_bf16=True)
+    trace = (load_model(cfg.model.id, cfg.model.revision, cfg.model.device, dtype=torch.float32)[0]
+             if cfg.model.trace_dtype == "float32" else None)
+    bundle = prepare_bundle(model, tok, cfg.generation.max_new_tokens, require_bf16=True,
+                            trace_model=trace)
     return cfg, items, bundle, time.time() - t0
 
 

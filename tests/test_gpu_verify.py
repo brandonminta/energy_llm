@@ -73,7 +73,7 @@ def test_fp32_reference_separate_instance_on_cuda(gpu_run, monkeypatch):
 
     cfg, bundle, _ = gpu_run
     monkeypatch.setattr(v, "load_fp32_model", lambda cfg_, device: copy.deepcopy(bundle.model).to(device))
-    fake = dataclasses.replace(bundle, dtype="bfloat16")
+    fake = dataclasses.replace(bundle, dtype="bfloat16", trace_dtype="bfloat16")
     bank = build_bank(bundle.model, bundle.dims)
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     g = torch.Generator().manual_seed(0)

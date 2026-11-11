@@ -18,7 +18,7 @@ def _run(device):
     bundle = make_bundle(model.to(device), tok)
     bank = build_bank(bundle.model, bundle.dims)
     assert bank.device.type == device
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     tr = forward_item(bundle, hooks, build_prompt(tok, SYSTEM, "who wrote hamlet", None))
     hooks.remove()
     return tr, compute_item(bundle, bank, tr, "g", both([1.0, 6.0]), list(range(bundle.dims.n_layers)), 10, both(20))

@@ -65,6 +65,7 @@ class ResidualHooks:
     copy the input tensor; the computation graph is untouched."""
 
     def __init__(self, model):
+        self.model = model
         self.enabled = False
         self.x: dict[int, torch.Tensor] = {}
         self._handles = [
@@ -136,6 +137,10 @@ class ForwardTrace:
 
 @torch.inference_mode()
 def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> ForwardTrace:
+    """Greedy generation with ``bundle.model``; the teacher-forced pass (hooks,
+    TF logits) with ``bundle.trace_model`` (``model.trace_dtype``)."""
+    if hooks.model is not bundle.trace_model:
+        raise RuntimeError("ResidualHooks must be installed on bundle.trace_model")
     model, dev = bundle.model, bundle.device
     stops = set(bundle.stop_token_ids)
     ids = torch.tensor([prompt.input_ids], device=dev)
@@ -169,8 +174,8 @@ def forward_item(bundle: ModelBundle, hooks: ResidualHooks, prompt: Prompt) -> F
     hooks.x = {}
     hooks.enabled = True
     try:
-        tf = model(input_ids=full, attention_mask=torch.ones_like(full),
-                   use_cache=False, logits_to_keep=len(gen) + 1)
+        tf = bundle.trace_model(input_ids=full, attention_mask=torch.ones_like(full),
+                                use_cache=False, logits_to_keep=len(gen) + 1)
     finally:
         hooks.enabled = False
     tf_logits = tf.logits[0, : len(gen)].float()                # [T_g, V]

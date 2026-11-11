@@ -36,7 +36,7 @@ def _ref(bundle, tr, betas):
 
 
 def _both(bundle, bank, question, betas):
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     date = DATE if "date_string" in bundle.tokenizer.chat_template else None
     tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, question, date))
     hooks.remove()
@@ -89,7 +89,7 @@ def test_reference_detects_a_wrong_pipeline(qwen_pair, monkeypatch):
 
     bundle = make_bundle(*qwen_pair)
     bank = build_bank(bundle.model, bundle.dims)
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     tr = forward_item(bundle, hooks, build_prompt(bundle.tokenizer, SYSTEM, "who wrote hamlet", None))
     hooks.remove()
 

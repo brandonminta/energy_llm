@@ -173,7 +173,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
         shutil.copyfile(cfg.bank_h5_path, tmp)
 
     run_keys = ("shard_index", "started", "elapsed_s", "model_load_s", "sec_per_item",
-                "model_dtype", "peak_gpu_mem_gb", "n_done_this_run", "n_failed_this_run",
+                "model_dtype", "trace_dtype", "peak_gpu_mem_gb", "n_done_this_run", "n_failed_this_run",
                 "stopped_by_signal", "hardware", "code")
     runs = [{k: r.get(k) for k in run_keys} for r in _shard_runs(ext_dir, states)]
     dtypes = sorted({r["model_dtype"] for r in runs if r.get("model_dtype")})
@@ -207,6 +207,7 @@ def run_merge(cfg: RunConfig, items: list[Item], input_path: str | Path, name: s
         },
         "gamma_diagnostic": gamma_diag,
         "model_dtype": dtypes,
+        "trace_dtype": sorted({r["trace_dtype"] for r in runs if r.get("trace_dtype")}),
         "role_names": ROLE_NAMES,
         "code": manifest.code_version(),
         "libraries": manifest.library_versions(),

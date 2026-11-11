@@ -176,7 +176,7 @@ def retrieval_diagnostics(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], 
     bank = build_bank(bundle.model, bundle.dims)
     diag = gamma_diagnostic(bank)
     by_id = {it.id: it for it in sel}
-    hooks = ResidualHooks(bundle.model)
+    hooks = ResidualHooks(bundle.trace_model)
     traces = []
     try:
         for item_id in ids:
@@ -317,6 +317,7 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
         "n_failed": len({r["id"] for r in failed}),
         "failures": [{"id": r["id"], "error": r["error"]} for r in failed],
         "model_dtype": bundle.dtype,
+        "trace_dtype": bundle.trace_dtype,
         "beta_star": m["beta_star"][CONTROL],      # per variant from C6
         "model_load_s": model_load_s,
         "sec_per_question": run.get("sec_per_item"),
@@ -372,7 +373,7 @@ def format_summary(s: dict) -> str:
     peak = s.get("peak_gpu_mem_gb") or {}
     lines = [
         f"smoke {s['name']}: {s['n_completed']}/{s['n_questions']} completed, {s['n_failed']} failed",
-        f"  model dtype            {s['model_dtype']}",
+        f"  model dtype            {s['model_dtype']} (generation), {s.get('trace_dtype')} (traces)",
         f"  beta*                  {s['beta_star']:.6g}",
         f"  TF == greedy           {f(s.get('tf_token_match_pct'), '.2f')} % of tokens, "
         f"{f(s.get('tf_exact_answers_pct'), '.1f')} % of answers",

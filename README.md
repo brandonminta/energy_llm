@@ -32,7 +32,7 @@ and **two score variants** from it:
 They differ by the query gain `g_t = ‖γ⊙x̂_t‖/√D`: `s_i = g_t·(‖w_i‖/‖w̃_i‖)·c_i`,
 a position-dependent temperature in the control (overview §6.0). Each variant
 has its own β\* and its own β grid **relative to it** (`β*_v·10^o`, 9 offsets
-from −0.7 to +0.9 decades, `extraction.beta_grid_log10_offset`) **plus β\*_v
+from −0.8 to +0.8 decades in steps of 0.2, offset 0 included, `extraction.beta_grid_log10_offset`) **plus β\*_v
 last** (`n_beta = 10`). With `p_t = softmax(β · score_t)` the module stores,
 for every variant `v`, layer `l` and position `t` (prompt and response;
 `role_mask` separates them downstream):
@@ -345,7 +345,7 @@ Check:
 - `topk_ids of cos_gamma_key not stored`: the MB/question saved;
 - mean H̄ per layer at β\*_v for both variants: not saturated (not ≈ 0 or ≈ 1 in most layers);
 - peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
-- empty / truncated counts: plausible for short factual answers;
+- empty / truncated counts: plausible for short factual answers; `empty responses by condition (id prefix)`: per `dev-known` / `dev-misc` / `dev-obscure`;
 - TF/greedy disagreements: each with its margins; `all margins < delta`
   should be True (a disagreement above δ is not a numerical near-tie);
 - the query gain `g_t` per band at `question_last`, `prompt_last` and the

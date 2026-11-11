@@ -26,6 +26,7 @@ import copy
 import datetime
 import json
 import math
+import re
 
 import numpy as np
 import torch
@@ -58,6 +59,24 @@ def run_single_process(cfg: RunConfig, bundle: ModelBundle, sel: list[Item], pre
     report = run_extract(cfg, bundle, sel, inp, name, 0, stopper=stopper, model_load_s=model_load_s)
     m = run_merge(cfg, sel, inp, name, allow_incomplete=True)
     return cfg, ext_dir, report, m
+
+
+def id_condition(item_id: str) -> str:
+    """Condition of an id for report grouping: the id without its trailing
+    counter (``dev-known-01`` -> ``dev-known``). The input carries only
+    {id, question}, so the id prefix is the only condition information; in
+    production one extraction is one condition."""
+    return re.sub(r"[-_.]?\d+$", "", item_id) or item_id
+
+
+def empty_by_condition(ans) -> dict:
+    """Per id_condition: number of answers and of empty responses."""
+    out: dict = {}
+    for item_id, empty in zip(ans["id"], ans["empty_response"]):
+        c = out.setdefault(id_condition(item_id), {"n": 0, "n_empty": 0})
+        c["n"] += 1
+        c["n_empty"] += int(bool(empty))
+    return dict(sorted(out.items()))
 
 
 def bf16_ulp(x: float) -> float:
@@ -511,6 +530,7 @@ def run_smoke(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 2
             "tf_disagreements": tf_disagreements(ans),
             "xhat_norm_max_rel_dev": float(ans["xhat_norm_max_rel_dev"].max()),
             "n_empty_response": int(ans["empty_response"].sum()),
+            "empty_response_by_condition": empty_by_condition(ans),
             "n_truncated": int(ans["truncated"].sum()),
             "mean_response_tokens": float(ans["n_response_tokens"].mean()),
             "topk_ids_storage": savings,
@@ -549,6 +569,9 @@ def format_summary(s: dict) -> str:
         f"{f(s.get('model_load_s'), '.0f')} s)",
         f"  empty / truncated      {s.get('n_empty_response', 'n/a')} / {s.get('n_truncated', 'n/a')}",
     ]
+    if s.get("empty_response_by_condition"):
+        lines.append("  empty responses by condition (id prefix): " + "   ".join(
+            f"{c} {v['n_empty']}/{v['n']}" for c, v in s["empty_response_by_condition"].items()))
     ts = s.get("topk_ids_storage")
     if ts:
         lines.append(f"  topk_ids of {CONTROL} not stored (control_topk_ids_k = {ts['control_topk_ids_k']}): "

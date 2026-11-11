@@ -279,7 +279,7 @@ bundled with `hpc/pilot_bundle.sh`.
 
 ## Step 10: score variants, relative β grid, portability, trace dtype
 
-Pilot evidence (Qwen2.5-3B, A100):
+Pilot evidence (Qwen2.5-3B, A100; figures as reported by Brandon, pending verification against the 33014/33019 reports):
 
 - **Smoke 33014.** The dominant dimension of `x̂` is d\* = 1874, with γ_d\* ≈ 0 in layers 7–11 and 32–34. Under the former score `s_i = cos(γ⊙w_i, x̂)` this gives a position-dependent effective temperature `β·g_t`, `g_t = ‖γ⊙x̂_t‖/√D` (overview §6.0).
 - **Verify 33019.**
@@ -304,7 +304,7 @@ Decisions (Brandon, 2026-11-11):
 | task | change | file(s) |
 |---|---|---|
 | C1 | architecture adapter (`ffn_norm`, `effective_gain`: Qwen2/Llama; Gemma `NotImplementedError`); one pre-activation per layer serves `cos_gamma_query` `c = z/(‖w‖‖γ⊙x̂‖)` and `cos_gamma_key` `s = z/(‖w̃‖√D)`; `query_gain`; `bank.h5` stores `key_norms`, fingerprint covers them | `core/model.py`, `core/bank.py` |
-| C2 | `extraction.beta_grid_log10_offset {min: -0.7, max: 0.9, num: 9}` (β\*_v·10^o, β\* last); `beta_grid_log10` rejected; `extraction.control_topk_ids_k` (default 0) | `config.py`, `configs/*.yaml` |
+| C2 | `extraction.beta_grid_log10_offset {min: -0.8, max: 0.8, num: 9}` (β\*_v·10^o, offset 0 included; first draft −0.7…0.9 had no 0, corrected before the HPC run; β\* last); `beta_grid_log10` rejected; `extraction.control_topk_ids_k` (default 0) | `config.py`, `configs/*.yaml` |
 | C3 | one β\* per variant (`beta_star.json: variants`), grid position and `near_edge` (< 0.5 decades), printed by calibrate; extract refuses a record missing a variant | `pipeline/calibrate.py`, `pipeline/extract.py`, `cli.py` |
 | C4 | traces of both variants (`<variant>/<name>`), `query_gain` and `xhat_top1_frac` once; item files and `traces.h5` per variant group, file attrs per variant; `inspect --variant` | `core/capture.py`, `pipeline/extract.py`, `pipeline/merge.py`, `verification/inspection.py` |
 | C5a/b | `dev/reference.py` computes both variants independently; verify: every bank check per variant (gate `‖w‖‖γ⊙x̂‖c`), `tf_vs_cache` / `fp32_reference` broken down by role and special position with σ_ℓ per layer, PASS on the analysis positions only; precision rule `RECOMMEND trace_dtype=float32` (p99/σ > 0.1) | `dev/reference.py`, `verification/verify.py` |
@@ -327,7 +327,7 @@ Criteria **revised after the pilot** (overview §8):
   - Before: an absolute 10⁰…10⁴ grid shared by every model.
   - Reason: two variants with different β\*.
 
-Acceptance: `pytest` 191 passed + 1 skipped with CUDA (182 + 10 skipped
+Acceptance: `pytest` 192 passed + 1 skipped with CUDA (183 + 10 skipped
 without); on the cluster: calibrate in a clean `SCRATCH_ROOT`, then verify
 and smoke, bundled with `hpc/pilot_bundle.sh`.
 

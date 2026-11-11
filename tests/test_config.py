@@ -15,12 +15,13 @@ def test_round_trip_keeps_values_and_hash(tmp_path):
 
 def test_betas_are_the_relative_grid_plus_beta_star(tmp_path):
     e = make_cfg(tmp_path).extraction
-    assert e.beta_grid_log10_offset == {"min": -0.7, "max": 0.9, "num": 9}
+    assert e.beta_grid_log10_offset == {"min": -0.8, "max": 0.8, "num": 9}
     assert e.control_topk_ids_k == 0
     for b_star in (123.4, 7.0):
         betas = e.betas(b_star)
         assert len(betas) == 10 and betas[-1] == b_star
-        assert betas[:-1] == pytest.approx([b_star * 10 ** (-0.7 + 0.2 * k) for k in range(9)])
+        assert betas[:-1] == pytest.approx([b_star * 10 ** (-0.8 + 0.2 * k) for k in range(9)])
+        assert betas[4] == b_star            # offset 0 is on the grid exactly
 
 
 def test_shipped_configs_use_the_relative_grid():
@@ -28,7 +29,7 @@ def test_shipped_configs_use_the_relative_grid():
 
     for name in ("qwen25_3b.yaml", "llama32_3b.yaml"):
         raw = yaml.safe_load((REPO_ROOT / "configs" / name).read_text())
-        assert raw["extraction"]["beta_grid_log10_offset"] == {"min": -0.7, "max": 0.9, "num": 9}
+        assert raw["extraction"]["beta_grid_log10_offset"] == {"min": -0.8, "max": 0.8, "num": 9}
         assert raw["extraction"]["control_topk_ids_k"] == 0
 
 

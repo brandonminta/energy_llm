@@ -310,6 +310,7 @@ def test_smoke_summary(calibrated, capsys):
     assert s["tf_token_match_pct"] == 100.0 and s["tf_exact_answers_pct"] == 100.0
     assert s["sec_per_question"] > 0 and s["peak_gpu_mem_gb"] is None   # CPU
     assert {"n_empty_response", "n_truncated", "xhat_norm_max_rel_dev"} <= set(s)
+    assert s["empty_response_by_condition"] == {"q": {"n": 5, "n_empty": s["n_empty_response"]}}
     assert (cfg.extraction_dir("smoke-test") / "smoke_report.json").exists()
     L = bundle.dims.n_layers
     # topk_ids of the control variant are not stored: the saving is reported
@@ -343,6 +344,7 @@ def test_smoke_summary(calibrated, capsys):
     assert "beta*[cos_gamma_query] (primary)" in text and "beta*[cos_gamma_key]" in text
     assert "== cos_gamma_query (primary)" in text and "== cos_gamma_key" in text
     assert "NOT applied" in text and "query gain g_t" in text and "MB/question" in text
+    assert "empty responses by condition (id prefix): q " in text
     d = cfg.extraction_dir("smoke-test")
     ans = pd.read_parquet(d / "answers.parquet")
     for v in variants:
@@ -400,6 +402,16 @@ def test_smoke_summary(calibrated, capsys):
                 assert 0.0 < x["median"] <= x["max"] <= 1.0
     # the two variants are different numbers
     assert s["variants"]["cos_gamma_query"]["per_layer"] != s["variants"]["cos_gamma_key"]["per_layer"]
+
+
+def test_empty_responses_by_condition():
+    from energy_llm.pipeline.smoke import empty_by_condition, id_condition
+
+    assert [id_condition(i) for i in ("dev-known-01", "dev-obscure-3", "q_000", "tqa.17", "abc", "7")] == \
+        ["dev-known", "dev-obscure", "q", "tqa", "abc", "7"]
+    ans = pd.DataFrame({"id": ["dev-known-01", "dev-known-02", "dev-misc-01"],
+                        "empty_response": [True, False, True]})
+    assert empty_by_condition(ans) == {"dev-known": {"n": 2, "n_empty": 1}, "dev-misc": {"n": 1, "n_empty": 1}}
 
 
 def test_depth_bands_are_relative():

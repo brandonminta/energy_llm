@@ -66,8 +66,9 @@ def log_grid(log10_min: float, log10_max: float, num: int) -> list[float]:
 @dataclass
 class ExtractionConfig:
     # betas relative to each variant's beta*: beta* * 10^o for o on a linear
-    # grid of log10 offsets; beta* is always appended: betas(beta*)[-1] == beta*
-    beta_grid_log10_offset: dict = field(default_factory=lambda: {"min": -0.7, "max": 0.9, "num": 9})
+    # grid of log10 offsets (the default, steps of 0.2 in [-0.8, 0.8], contains
+    # o = 0 exactly); beta* is always appended: betas(beta*)[-1] == beta*
+    beta_grid_log10_offset: dict = field(default_factory=lambda: {"min": -0.8, "max": 0.8, "num": 9})
     topk_mass_k: int = 10
     topk_ids_k: int = 100              # topk_ids of the primary variant (cos_gamma_query)
     control_topk_ids_k: int = 0        # topk_ids of the control variant; 0 = not stored

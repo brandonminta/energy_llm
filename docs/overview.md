@@ -139,7 +139,7 @@ Bajo $\mathrm{softmax}(\beta s)$, esa convención introduce:
 - una **temperatura efectiva $\beta\,g_t$ que depende de la posición**;
 - un peso por memoria $\|w_i\|/\|\tilde w_i\|$.
 
-$g_t$ no es recuperación: mide cuánta masa de $\hat x_t$ cae en dimensiones con $|\gamma|$ grande. El residual tiene una dimensión con activación masiva, y la RMSNorm la anula. En el smoke del piloto (job 33014, Qwen2.5-3B), $d^\star = 1874$ es la dimensión dominante de $\hat x$, con $\gamma_{d^\star}\approx 0$ en las capas 7–11 y 32–34. Donde $\hat x_t$ concentra su masa en $d^\star$, $\|\gamma\odot\hat x_t\|$ cae, $g_t$ cae y $\bar H$ sube por ganancia, no por un cambio en la competencia entre memorias.
+$g_t$ no es recuperación: mide cuánta masa de $\hat x_t$ cae en dimensiones con $|\gamma|$ grande. El residual tiene una dimensión con activación masiva, y la RMSNorm la anula. En el smoke del piloto (job 33014, Qwen2.5-3B), $d^\star = 1874$ es la dimensión dominante de $\hat x$, con $\gamma_{d^\star}\approx 0$ en las capas 7–11 y 32–34 *(pendiente de verificar contra 33014/33019)*. Donde $\hat x_t$ concentra su masa en $d^\star$, $\|\gamma\odot\hat x_t\|$ cae, $g_t$ cae y $\bar H$ sube por ganancia, no por un cambio en la competencia entre memorias.
 
 La variante principal `cos_gamma_query` usa la consulta que el FFN recibe realmente, $\gamma\odot\hat x$, la normaliza y compara con claves sin $\gamma$: un coseno exacto, sin esa temperatura. La convención anterior se conserva como control (`cos_gamma_key`), con las mismas trazas y su propio $\beta^\star$. $g_t$ se guarda como traza (`query_gain`) para separar ambos efectos en el análisis.
 
@@ -203,7 +203,7 @@ flowchart LR
 ```
 
 - Generación en bfloat16. El forward con teacher forcing de las trazas va en `trace_dtype` (bfloat16 por defecto). Métricas en float32 tras upcast; almacenamiento float16 salvo ids.
-- Grilla de $\beta$, **relativa al $\beta^\star$ de cada variante**: $\beta^\star_v\cdot 10^{o}$, con 9 desplazamientos $o$ equiespaciados entre $-0{,}7$ y $+0{,}9$ décadas (pasos de 0,2; `extraction.beta_grid_log10_offset`), más $\beta^\star_v$ al final: $n_\beta = 10$. Toda métrica dependiente de $\beta$ se guarda para cada valor. *(Revisado en el paso 10: la grilla absoluta $10^0$…$10^4$ ya no tiene sentido con dos variantes de $\beta^\star$ distinto; la relativa da la misma resolución alrededor de cada punto de trabajo.)*
+- Grilla de $\beta$, **relativa al $\beta^\star$ de cada variante**: $\beta^\star_v\cdot 10^{o}$, con 9 desplazamientos $o$ equiespaciados entre $-0{,}8$ y $+0{,}8$ décadas (pasos de 0,2, $o = 0$ incluido; `extraction.beta_grid_log10_offset`), más $\beta^\star_v$ al final: $n_\beta = 10$. Toda métrica dependiente de $\beta$ se guarda para cada valor. *(Revisado en el paso 10: la grilla absoluta $10^0$…$10^4$ ya no tiene sentido con dos variantes de $\beta^\star$ distinto; la relativa da la misma resolución alrededor de cada punto de trabajo.)*
 - No se guardan vectores de scores completos ($K_l\times L\times T\times N$ supera los 40 GB). Los ids top-100 bastan para Jaccard e inspección cualitativa.
 - Esquema (`$SCRATCH_ROOT/energy_llm/runs/<modelo>/extract/<nombre>/`): `traces.h5` con `/<id>/<variante>/{energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>}` de forma $(L,T,n_\beta)$, `/<id>/<variante>/margin` $(L,T)$, `/<id>/cos_gamma_query/topk_ids` $(L,T,100)$ int32, `/<id>/{query_gain, xhat_top1_frac}` $(L,T)$, `/<id>/role_mask` $(T)$ y atributos `variants`, `betas` y `beta_star` por variante y `reference_positions`; `hidden.h5` con `/<id>/{question_last, prompt_last, response_first, response_last}` $(L,D)$; tokens, logprob, entropía y logit en `answers.parquet`; procedencia en `manifest.json`.
 - Coste (Qwen 3B, $L=36$, $T\approx 90$, $n_\beta = 10$): unos 4 MB por pregunta antes de gzip, con dos variantes. No guardar `topk_ids` del control ahorra $L\cdot T\cdot 100\cdot 4$ bytes ≈ 1,3 MB por pregunta antes de gzip; el smoke mide el ahorro real.
@@ -216,12 +216,12 @@ Todos los criterios que pasan por el banco se exigen en las dos variantes de sco
 
 1. **Estados con teacher forcing equivalentes a los de generación**, juzgados por su efecto en las trazas.
    - Criterio: en cada capa $\ell$, el p99 sobre preguntas y **posiciones de análisis** de $|\Delta\bar H|$, $|\Delta E_{\mathrm{lse}}|$ y $D_{\mathrm{JS}}(p_{\mathrm{cache}}\|p_{\mathrm{tf}})$, a $\beta^\star_v$, no supera $0{,}1\,\sigma_\ell$ (ruido/señal $\le 0{,}1$).
-   - $\sigma_\ell$ es la desviación estándar de la métrica entre posiciones de respuesta y preguntas. Se reporta junto al cociente, para distinguir un ruido grande de un $\sigma$ pequeño (capas 26–27 del piloto).
+   - $\sigma_\ell$ es la desviación estándar de la métrica entre posiciones de respuesta y preguntas. Se reporta junto al cociente, para distinguir un ruido grande de un $\sigma$ pequeño (capas 26–27 del piloto; *pendiente de verificar contra 33014/33019*).
    - Posiciones de análisis = tokens de respuesta ∪ {`question_last`, `prompt_last`, `response_first`}.
    - Los tokens deben coincidir.
    - Desglose informativo: por rol (plantilla, instrucción, pregunta, respuesta) y por posición especial (posición 0 y las tres referencias), con mediana, p99, máximo y cociente por capa. También se reportan $\|\Delta x\|/\|x\|$ y la distancia de ambos estados a un forward en float32.
    - *Revisado tras el piloto, primera vez:* en bfloat16 $\|\Delta x\|/\|x\|$ llegó a 0,09 con tokens idénticos; lo relevante es si ese ruido mueve las métricas frente a su dispersión entre preguntas.
-   - *Revisado tras el piloto, segunda vez (verify 33019):*
+   - *Revisado tras el piloto, segunda vez (verify 33019; cifras pendientes de verificar contra 33014/33019):*
      - TF y caché bf16 quedan a la misma distancia de float32 en todas las capas (cociente ≈ 1): el 9 % es el piso de bf16 y el TF es canónico.
      - El exceso aparece en las capas ≥ 30, con p99 ≈ máximo.
      - El máximo de `tf_vs_cache` está en la posición 0, de rol plantilla (probable sumidero de atención), que el análisis no lee. Por eso el criterio se evalúa solo sobre las posiciones de análisis; plantilla y posición 0 se reportan aparte.

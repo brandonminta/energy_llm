@@ -331,8 +331,10 @@ reduction over tokens is done in the module (aggregation is analysis).
 - β, **per variant**: `betas[v] = ExtractionConfig.betas(β*_v)` = the grid
   **relative to that variant's β\***, `β*_v · 10^o` for `num` offsets `o`
   linearly spaced in `[min, max]` (`extraction.beta_grid_log10_offset`,
-  default `{min: -0.7, max: 0.9, num: 9}`: steps of 0.2 decades), **plus
-  β\*_v appended last**, so `n_beta = num + 1` and `betas[v][-1] == β*_v`
+  default `{min: -0.8, max: 0.8, num: 9}`: steps of 0.2 decades, symmetric,
+  offset 0 exactly on the grid so `betas[v][4] == β*_v`), **plus β\*_v
+  appended last** (β\*_v therefore appears twice; the last column is the
+  conventional "at β\*" column), so `n_beta = num + 1` and `betas[v][-1] == β*_v`
   (`extract.variant_betas`). The grid is looped inside the layer (one
   `log_softmax` of `[T, D_ff]` per β and variant).
 
@@ -558,7 +560,10 @@ median s per item` (a 2 h target inside the 3 h walltime).
   criterion "every disagreement has max(margin_tf, margin_gen) < δ"
   (`smoke.tf_disagreements`; the step-0 maximum is reported as information),
   max `‖x̂‖` deviation, peak GPU memory, s/question, empty and truncated
-  counts, the **topk_ids storage saved** by not storing them for the control
+  counts, **empty responses per condition** (`empty_by_condition`; the
+  condition is the id without its trailing counter, `id_condition`:
+  `dev-known-01` → `dev-known`, since the input carries only `{id, question}`;
+  in production one extraction is one condition), the **topk_ids storage saved** by not storing them for the control
   variant (`topk_ids_savings`: MB/question uncompressed `L·T·k·4` bytes, and
   a gzip estimate from the stored primary `topk_ids`), and the report-only
   diagnostics of `smoke.retrieval_diagnostics`, from residuals captured
@@ -679,7 +684,7 @@ calibration:
   log10_beta_max: 4.0                # > min
   num_grid: 81                       # >= 2
 extraction:
-  beta_grid_log10_offset: {min: -0.7, max: 0.9, num: 9}   # beta*_v * 10^o per variant; exactly these keys;
+  beta_grid_log10_offset: {min: -0.8, max: 0.8, num: 9}   # beta*_v * 10^o per variant (o = 0 included); exactly these keys;
                                      # num >= 2, max > min; beta*_v appended (the absolute beta_grid_log10 is rejected)
   topk_mass_k: 10                    # >= 1
   topk_ids_k: 100                    # >= 1, topk_ids of cos_gamma_query
@@ -957,6 +962,20 @@ Facts introduced by step 10 that a reader deciding what to change should know:
 7. **The topk_ids saving's gzip figure is an estimate** (storage size of the
    primary `topk_ids`, same shape and comparable entropy), not a measurement
    of the control.
+8. **`tf_exact` and the TF/greedy criterion under `trace_dtype: float32`.**
+   The TF logits then come from the float32 trace model while the greedy
+   tokens come from the bf16 model, so a mismatch (`tf_exact = false`,
+   `tf_mismatch_*`) measures bf16-vs-float32 precision of the whole forward,
+   not a TF/decoding misalignment of one model. `tf_logit_diff` is the
+   bf16-generation vs float32-TF logit gap. In the smoke `δ`, the p99 term is
+   measured on that same pair (self-consistent), but the floor `3 bf16
+   ulp(|top1|)` and the reference experience (pilot: 99.64 % of tokens equal,
+   every margin < δ) were established with both passes in bf16. Expect more
+   disagreements and a larger δ; `tf_exact` / `tf_token_match_pct` from a
+   float32-trace run are not comparable with bf16-trace runs, and the
+   criterion "every margin < δ" there has not been validated on the pilot.
+   An alignment error would still show as a disagreement with a margin far
+   above δ.
 
 ## 14. Glossary
 

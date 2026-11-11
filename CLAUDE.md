@@ -39,9 +39,9 @@ pytest                             # ~80-115 s; tiny random Qwen2 + Llama models
 micromamba run -n energy-lab python -m pytest -q
 ```
 
-Run the tests after every change; with a CUDA device 191 pass + 1 skipped
+Run the tests after every change; with a CUDA device 192 pass + 1 skipped
 (real tokenizers, opt-in) is the baseline (v2.1.0 + step 10); without CUDA,
-182 pass + 10 skipped (`test_gpu.py`, `test_gpu_verify.py`).
+183 pass + 10 skipped (`test_gpu.py`, `test_gpu_verify.py`).
 
 ## CLI and layout
 
@@ -119,7 +119,7 @@ pinned). `output_dir` uses `${SCRATCH_ROOT}`, which is mandatory.
   built from it). Part of the calibration context. transformers >= 4.56.
 - Extraction betas, per variant: grid RELATIVE to beta*_v,
   `beta*_v * 10^o` for `extraction.beta_grid_log10_offset`
-  ({min: -0.7, max: 0.9, num: 9}), beta*_v appended last; the absolute
+  ({min: -0.8, max: 0.8, num: 9}: offset 0 included), beta*_v appended last; the absolute
   `beta_grid_log10` is rejected; `merge` asserts identical per-variant
   (betas, topk_mass_k, topk_ids_k) across items.
 - Gamma diagnostic (top-5 |gamma| dims per layer and their share of

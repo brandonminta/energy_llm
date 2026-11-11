@@ -27,7 +27,7 @@ calibration:
   num_grid: 81               # 20 points per decade
 
 extraction:
-  beta_grid_log10_offset: {min: -0.7, max: 0.9, num: 9}   # beta*_v * 10^o per variant; beta* appended last
+  beta_grid_log10_offset: {min: -0.8, max: 0.8, num: 9}   # beta*_v * 10^o per variant (o = 0 included); beta* appended last
   topk_mass_k: 10                     # topk_mass: share of p in the 10 largest memories
   topk_ids_k: 100                     # topk_ids (cos_gamma_query): indices of the 100 largest memories
   control_topk_ids_k: 0               # topk_ids of cos_gamma_key: 0 = not stored

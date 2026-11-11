@@ -37,23 +37,43 @@ def test_verify_all_pass_on_tiny_models(run):
     assert r["options"] == {"n": 3, "reference_n": 2, "reference_layers": [0, 1, 2],
                             "tf_max_noise_ratio": 0.1, "fp32_reference": True}
     checks = {c["name"]: c for c in r["checks"]}
+    variants = {"cos_gamma_query", "cos_gamma_key"}
+    assert set(r["beta_star"]) == variants and r["primary"] == "cos_gamma_query"
+    groups = {"analysis", "role/template", "role/instruction", "role/question", "role/response",
+              "position/position_0", "position/question_last", "position/prompt_last",
+              "position/response_first"}
     tf = checks["tf_vs_cache"]["detail"]
     L = bundle.dims.n_layers
-    assert len(tf["per_layer"]) == L and len(tf["x_rel_informative"]["per_layer"]) == L
+    assert set(tf["per_variant"]) == variants and "analysis" in tf["pass_positions"]
+    for pv in tf["per_variant"].values():
+        assert set(pv["groups"]) == groups
+        assert pv["max_ratio_p99"] == pv["groups"]["analysis"]["max_ratio_p99"]
+        for row in pv["groups"]["analysis"]["per_layer"]:
+            assert set(row) == {"layer", "norm_entropy", "energy", "js"}
+            assert row["norm_entropy"]["sigma"] > 0 and "ratio_p99" in row["norm_entropy"]
+    assert set(tf["x_rel_informative"]["groups"]) == groups
+    assert all(len(x) == L for x in tf["x_rel_informative"]["groups"].values())
     assert set(tf["x_rel_informative"]["max_at"]) == {"id", "layer", "position", "role"}
-    for row in tf["per_layer"]:
-        assert set(row) == {"layer", "norm_entropy", "energy", "js"}
-        assert row["norm_entropy"]["sigma"] > 0
+    for name in ("gate", "limits", "monotone", "self_divergence"):
+        assert set(checks[name]["detail"]["per_variant"]) == variants, name
+    assert set(checks["calibration"]["detail"]["per_variant"]) == variants
+    assert checks["gate"]["detail"]["reconstruction"]["cos_gamma_query"] == "||w_i|| ||gamma * x_hat|| c_i"
     pm = checks["permutation"]["detail"]
-    assert pm["c"] == 2.0 and "tree" in pm["reduction_model"]
-    assert set(pm["worst"]) >= {"ratio", "trace", "layer", "position"}
-    assert pm["negative_control"]["worst"]["ratio"] > 1.0
-    assert all(set(v) == {"max_error", "max_ratio", "at", "tolerance_at_max"} for v in pm["per_trace"].values())
+    assert pm["c"] == 2.0 and "tree" in pm["reduction_model"] and set(pm["per_variant"]) == variants
+    for v, p in pm["per_variant"].items():
+        assert set(p["worst"]) >= {"ratio", "trace", "layer", "position"}
+        assert p["negative_control"]["worst"]["ratio"] > 1.0
+        assert all(set(x) == {"max_error", "max_ratio", "at", "tolerance_at_max"} for x in p["per_trace"].values())
+        assert "query_gain" in p["per_trace"]
+    assert pm["per_variant"]["cos_gamma_query"]["topk_ids_min_row_jaccard"] == 1.0
+    assert pm["per_variant"]["cos_gamma_key"]["topk_ids_min_row_jaccard"] is None   # not stored
     fp = checks["fp32_reference"]["detail"]
     assert fp["separate_fp32_instance"] is False          # tiny models are float32
     assert fp["precision"]["cuda_matmul_allow_tf32"] is False
-    # a float32 model is its own reference: TF residuals identical
-    assert max(d["max"] for d in fp["x_rel_tf_vs_fp32"]) == 0.0
+    # a float32 model is its own reference: TF residuals identical, no recommendation
+    assert max(d["max"] for d in fp["x_rel_tf_vs_fp32"]["analysis"]) == 0.0
+    assert fp["precision_rule"]["value"] == 0.0 and fp["precision_rule"]["recommend"] is None
+    assert r["recommend"] is None and "RECOMMEND" not in format_report(r)
     saved = json.loads(open(f"{r['extraction_dir']}/verify_report.json").read())
     assert saved["passed"] is True
     assert "ALL PASS" in format_report(r)
@@ -79,7 +99,29 @@ def test_noise_to_signal_ratios():
     assert out["per_layer"][0]["m"]["sigma"] == pytest.approx(0.5)
     assert out["per_layer"][0]["m"]["ratio_p99"] == pytest.approx(0.02)
     assert out["per_layer"][1]["m"]["ratio_p99"] == 0.0            # zero noise, zero sigma
-    assert out["max_ratio_p99"] == pytest.approx(0.02) and out["worst_p99_at"] == {"layer": 0, "metric": "m"}
+    assert out["max_ratio_p99"] == pytest.approx(0.02)
+    assert out["worst_p99_at"] == {"layer": 0, "metric": "m", "sigma": pytest.approx(0.5)}
+
+
+def test_position_groups_and_analysis_criterion():
+    """analysis = response + the three references; template and position 0 are
+    separate groups; the criterion ignores noise outside the analysis set."""
+    from energy_llm.verification.verify import ANALYSIS, grouped_noise, position_groups
+
+    roles = [0, 1, 2, 2, 0, 3, 3, 0]          # template, instruction, question x2, template, response x2, stop
+    refs = {"question_last": 3, "prompt_last": 4, "response_first": 5}
+    g = position_groups(roles, refs, 7)       # last position not compared
+    assert g[ANALYSIS].tolist() == [False, False, False, True, True, True, True]
+    assert g["role/template"].tolist() == [True, False, False, False, True, False, False]
+    assert g["position/position_0"].tolist() == [True] + [False] * 6
+    assert g["position/response_first"].nonzero()[0].tolist() == [5]
+    assert not position_groups(roles, refs | {"response_first": None}, 7)["position/response_first"].any()
+    noise = {"m": [[np.array([5.0, 0.0, 0.0, 0.01, 0.01, 0.01, 0.01])]]}   # a sink at position 0
+    signal = {"m": [[np.array([0.0, 1.0])]]}
+    out = grouped_noise(noise, signal, [g])
+    assert out[ANALYSIS]["max_ratio_p99"] == pytest.approx(0.02)
+    assert out["position/position_0"]["max_ratio_p99"] == pytest.approx(10.0)
+    assert out["role/template"]["max_ratio_max"] == pytest.approx(10.0)
 
 
 def test_fp32_reference_loads_a_separate_instance_and_restores_precision(run, monkeypatch):
@@ -108,17 +150,26 @@ def test_fp32_reference_loads_a_separate_instance_and_restores_precision(run, mo
     ids = list(range(1, 9))
     g = torch.Generator().manual_seed(0)
     x = {l: torch.randn(8, D, generator=g) for l in range(L)}
-    saved = [{"ids": ids, "x_tf": x, "x_cache": {l: v_[:7] for l, v_ in x.items()}}]
-    signal = {m: [[np.array([0.0, 1.0])] for _ in range(L)] for m in v.PROPAGATED}
+    roles = [0, 1, 2, 2, 0, 3, 3, 3]
+    refs = {"question_last": 3, "prompt_last": 4, "response_first": 5}
+    saved = [{"ids": ids, "x_tf": x, "x_cache": {l: v_[:7] for l, v_ in x.items()},
+              "roles": roles, "refs": refs}]
+    signal = {var: {m: [[np.array([0.0, 1.0])] for _ in range(L)] for m in v.PROPAGATED}
+              for var in ("cos_gamma_query", "cos_gamma_key")}
     torch.set_float32_matmul_precision("high")
     try:
-        out = v.fp32_reference(cfg, fake, bank, saved, 5.0, signal)
+        out = v.fp32_reference(cfg, fake, bank, saved, {"cos_gamma_query": 5.0, "cos_gamma_key": 3.0}, signal)
         assert torch.get_float32_matmul_precision() == "high"
     finally:
         torch.set_float32_matmul_precision("highest")
     assert len(loaded) == 1 and out["separate_fp32_instance"] is True
-    assert len(out["x_rel_tf_vs_fp32"]) == L and len(out["x_rel_cache_vs_fp32"]) == L
-    assert set(out["traces_cache_vs_fp32"]["per_layer"][0]) == {"layer", *v.PROPAGATED}
+    assert len(out["x_rel_tf_vs_fp32"]["analysis"]) == L and len(out["x_rel_cache_vs_fp32"]["analysis"]) == L
+    for var in ("cos_gamma_query", "cos_gamma_key"):
+        assert set(out["traces_cache_vs_fp32"][var]["analysis"]["per_layer"][0]) == {"layer", *v.PROPAGATED}
+    # x_tf are random vectors, not the model's residuals: far from float32 -> recommendation
+    rule = out["precision_rule"]
+    assert rule["value"] > rule["threshold"] == v.RECOMMEND_FP32_RATIO == 0.1
+    assert rule["recommend"] == "trace_dtype=float32" and rule["at"]["variant"] in signal
 
 
 def test_verify_fails_when_gamma_is_ignored(run, monkeypatch):
@@ -127,10 +178,9 @@ def test_verify_fails_when_gamma_is_ignored(run, monkeypatch):
     cfg, bundle, items = run
 
     def no_gamma(self, l, x_hat):
-        w = self.gate_weights[l].float()
-        return (x_hat @ w.T) / (w.norm(dim=1) * self.d_model ** 0.5)
+        return x_hat @ self.gate_weights[l].float().T
 
-    monkeypatch.setattr(bank_mod.Bank, "scores", no_gamma)
+    monkeypatch.setattr(bank_mod.Bank, "preactivation", no_gamma)
     r = run_verify(cfg, bundle, items, n=1)
     status = {c["name"]: c["status"] for c in r["checks"]}
     assert not r["passed"]

@@ -49,8 +49,9 @@ def test_rel_err_and_propagate_accept_mixed_devices():
     w = torch.randn(16, 8, generator=g)
     bank = Bank(gate_weights=[w.cuda()], gamma=[torch.ones(8, device="cuda")],
                 key_norms=[w.norm(dim=1).cuda()], row_norms=[w.norm(dim=1).cuda()], d_model=8)
-    out = propagate(bank, 1e-6, 0, a, b.cuda(), 3.0)
-    assert set(out) == {"norm_entropy", "energy", "js"} and all(v.dtype == np.float64 for v in out.values())
+    out = propagate(bank, 1e-6, 0, a, b.cuda(), {"cos_gamma_query": 3.0, "cos_gamma_key": 2.0})
+    for d in out.values():
+        assert set(d) == {"norm_entropy", "energy", "js"} and all(v.dtype == np.float64 for v in d.values())
 
 
 def test_verify_runs_every_check_on_cuda(gpu_run):
@@ -77,10 +78,13 @@ def test_fp32_reference_separate_instance_on_cuda(gpu_run, monkeypatch):
     L, D = bundle.dims.n_layers, bundle.dims.d_model
     g = torch.Generator().manual_seed(0)
     x = {l: torch.randn(8, D, generator=g) for l in range(L)}
-    saved = [{"ids": list(range(1, 9)), "x_tf": x, "x_cache": {l: t[:7] for l, t in x.items()}}]
-    signal = {m: [[np.array([0.0, 1.0])] for _ in range(L)] for m in v.PROPAGATED}
-    out = v.fp32_reference(cfg, fake, bank, saved, 5.0, signal)
-    assert out["separate_fp32_instance"] is True and len(out["x_rel_tf_vs_fp32"]) == L
+    saved = [{"ids": list(range(1, 9)), "x_tf": x, "x_cache": {l: t[:7] for l, t in x.items()},
+              "roles": [0, 1, 2, 2, 0, 3, 3, 3],
+              "refs": {"question_last": 3, "prompt_last": 4, "response_first": 5}}]
+    signal = {var: {m: [[np.array([0.0, 1.0])] for _ in range(L)] for m in v.PROPAGATED}
+              for var in ("cos_gamma_query", "cos_gamma_key")}
+    out = v.fp32_reference(cfg, fake, bank, saved, {"cos_gamma_query": 5.0, "cos_gamma_key": 3.0}, signal)
+    assert out["separate_fp32_instance"] is True and len(out["x_rel_tf_vs_fp32"]["analysis"]) == L
 
 
 def test_smoke_diagnostics_on_cuda(gpu_run):

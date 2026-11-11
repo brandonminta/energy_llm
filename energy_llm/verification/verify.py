@@ -5,10 +5,12 @@ On a few questions it runs the production extract + merge, then checks:
 
   reference      every per-token trace vs dev/reference.py (naive float64,
                  explicit loops), at every beta and reference position
-  gate           real gate pre-activation g == ||w_tilde|| * sqrt(D) * s, with a
+  gate           real gate pre-activation g == ||w|| ||gamma x_hat|| c
+                 (cos_gamma_query) == ||w_tilde|| sqrt(D) s (cos_gamma_key), with a
                  no-gamma negative control that must fail by a wide margin
   tf_vs_cache    residual x captured during cached token-by-token generation
-                 vs the teacher-forced pass, position by position
+                 vs the teacher-forced pass, propagated to the traces; PASS on
+                 the analysis positions, broken down by role and special position
   alignment      last prompt position emits the first generated token; response
                  positions are exactly the generated non-stop tokens
   hidden         hidden.h5 / traces.h5 hold the same x and values the metrics
@@ -22,8 +24,10 @@ On a few questions it runs the production extract + merge, then checks:
   self           JS(p, p) = KL(p || p) = 0
   determinism    two identical runs agree (bit-exact on CPU)
 
-Every tolerance is explicit and justified next to its definition; the report
-gives the maximum observed error and the tolerance for each check.
+Every check that involves the bank runs for BOTH score variants
+(cos_gamma_query, cos_gamma_key; core.bank) and must pass for both. Every
+tolerance is explicit and justified next to its definition; the report gives
+the maximum observed error and the tolerance for each check.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ import torch
 
 from energy_llm.config import RunConfig
 from energy_llm.core import metrics
-from energy_llm.core.bank import CONTROL, PRIMARY, Bank, build_bank
+from energy_llm.core.bank import CONTROL, PRIMARY, VARIANTS, Bank, build_bank
 from energy_llm.core.capture import (
     REFERENCES, SHARED, ResidualHooks, compute_item, forward_item, norm_entropy_curve, variant_traces,
 )
@@ -133,14 +137,15 @@ def reference_tolerances(delta_s: float, beta: float, s_range: float, k_mass: in
               the per-element weight A = sum p|log p - log q| + sum q|log q - log p|
               is computed by compare_with_reference from the float64 reference
               scores: 2 beta delta_s A + 8 beta delta_s (here only the 8 beta delta_s term)
-      xhat_top1_frac: from x_hat only, within score_tolerance
+      xhat_top1_frac, query_gain: from x_hat (and gamma) only, within score_tolerance
     ``s_range`` = max_t (max s_t - min s_t). compare_with_reference adds a
     float32 reduction floor F32_FLOOR * max(1, |value|) per element (dkl
     reaches hundreds at beta ~ 1e4). topk_ids are compared as sets."""
     b, d = beta, delta_s
     tol = {"energy": d, "margin": 2 * d, "norm_entropy": 2 * b * d,
            "mean_score": 2 * b * d * s_range + d, "var_score": 2 * b * d * s_range + 2 * d * s_range,
-           "topk_mass": max(k_mass, 2) * b * d, "xhat_top1_frac": score_tolerance(d_model)}
+           "topk_mass": max(k_mass, 2) * b * d, "xhat_top1_frac": score_tolerance(d_model),
+           "query_gain": score_tolerance(d_model)}
     for r in REFERENCES:
         tol[f"js/{r}"] = 4 * b * d
         tol[f"dkl/{r}"] = 8 * b * d
@@ -186,20 +191,26 @@ def view(traces: dict, variant: str) -> dict:
 
 
 def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, traces: dict, ref, layers: list[int],
-                           betas: list[float], k_mass: int) -> dict:
+                           betas: list[float], k_mass: int, variant: str) -> dict:
+    """``traces``: one variant's production traces plus the shared ones
+    (``view``); ``ref``: the full dev/reference.py record (both variants)."""
     eps = bundle.dims.rms_norm_eps
+    scores = ref["scores"][variant]
+    ref_traces = ref["traces"][variant] | {"xhat_top1_frac": ref["xhat_top1_frac"],
+                                           "query_gain": ref["query_gain"]}
     ds = 0.0
     for l in layers:
-        s = bank.scores(l, metrics.rms_normalise(trace.residuals[l].to(bank.device), eps)).double().cpu().numpy()
-        ds = max(ds, float(np.abs(s - np.asarray(ref["scores"][l])).max()))
-    s_range = max(float(np.ptp(np.asarray(ref["scores"][l]), axis=-1).max()) for l in layers)
+        s = bank.scores(l, metrics.rms_normalise(trace.residuals[l].to(bank.device), eps),
+                        variant).double().cpu().numpy()
+        ds = max(ds, float(np.abs(s - np.asarray(scores[l])).max()))
+    s_range = max(float(np.ptp(np.asarray(scores[l]), axis=-1).max()) for l in layers)
     tol_s = score_tolerance(bundle.dims.d_model)
     tols = [reference_tolerances(ds, b, s_range, k_mass, bundle.dims.d_model) for b in betas]
     # dkl: add the data-dependent term 2 beta ds A (see reference_tolerances)
-    T = len(ref["scores"][layers[0]])
+    T = len(scores[layers[0]])
     dkl_tol = {r: np.zeros((len(layers), T, len(betas))) for r in REFERENCES}
     for li, l in enumerate(layers):
-        sc = torch.as_tensor(np.asarray(ref["scores"][l], dtype=np.float64))
+        sc = torch.as_tensor(np.asarray(scores[l], dtype=np.float64))
         for bi, b in enumerate(betas):
             lp = torch.log_softmax(b * sc, dim=-1)
             for r, pos in ref["reference_positions"].items():
@@ -207,7 +218,7 @@ def compare_with_reference(bundle: ModelBundle, bank: Bank, trace, traces: dict,
                     a = divergence_scale(lp, lp[pos]).numpy()
                     dkl_tol[r][li, :, bi] = 2 * b * ds * a + tols[bi][f"dkl/{r}"]
     ratio, nan_ok, per = 0.0, True, {}
-    for name, r in ref["traces"].items():
+    for name, r in ref_traces.items():
         if name not in traces:          # topk_ids not stored for this variant
             continue
         p = traces[name][layers]
@@ -259,13 +270,14 @@ class _Capture:
 
 
 @torch.inference_mode()
-def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[float, float, float]:
-    """Max normalised error e = |g - ||w_tilde|| sqrt(D) s| / (|g| + ||w_tilde ⊙ x_hat||_2)
-    over layers, positions, memories, the same for the no-gamma control, and
-    the tolerance. In the model g = W_g (gamma * x_hat) involves three roundings
-    in the model dtype (x_hat, gamma * x_hat, the output), each <= u relative to
-    the scale |g| + ||w_tilde ⊙ x_hat||_2; tol = 4u (one u of margin), floored
-    at F32_FLOOR for float32 models."""
+def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[dict[str, float], float, float]:
+    """Per variant, max normalised error e = |g - g_rec| / (|g| + ||w_tilde ⊙ x_hat||_2)
+    over layers, positions, memories, with g_rec = ||w|| ||gamma * x_hat|| c
+    (cos_gamma_query) and ||w_tilde|| sqrt(D) s (cos_gamma_key); the same for
+    the no-gamma control, and the tolerance. In the model g = W_g (gamma * x_hat)
+    involves three roundings in the model dtype (x_hat, gamma * x_hat, the
+    output), each <= u relative to the scale |g| + ||w_tilde ⊙ x_hat||_2;
+    tol = 4u (one u of margin), floored at F32_FLOOR for float32 models."""
     model = bundle.model
     cap = _Capture(model, gate=True)
     full = torch.tensor([trace.prompt.input_ids + trace.gen_ids], device=bundle.device)
@@ -274,16 +286,18 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[float, float, fl
     finally:
         cap.remove()
     eps, d = bundle.dims.rms_norm_eps, bundle.dims.d_model
-    err = ctrl = 0.0
+    err, ctrl = dict.fromkeys(VARIANTS, 0.0), 0.0
     for l in range(bundle.dims.n_layers):
         x_hat = metrics.rms_normalise(cap.x[l][0].to(bank.device), eps)
-        s = bank.scores(l, x_hat)
-        g_rec = s * bank.row_norms[l] * math.sqrt(d)
-        g = cap.g[l]
+        g_rec = {CONTROL: bank.scores(l, x_hat, CONTROL) * bank.row_norms[l] * math.sqrt(d),
+                 PRIMARY: bank.scores(l, x_hat, PRIMARY) * bank.key_norms[l]
+                 * bank.query_norm(l, x_hat)[:, None]}
+        g = cap.g[l].to(bank.device)
         w = bank.gate_weights[l].float()
         scale = g.abs() + torch.sqrt((x_hat * bank.gamma[l]).pow(2) @ w.pow(2).T)
         g_ctrl = x_hat @ w.T                      # gamma omitted: must NOT reconstruct g
-        err = max(err, ((g - g_rec).abs() / scale).max().item())
+        for v, gr in g_rec.items():
+            err[v] = max(err[v], ((g - gr).abs() / scale).max().item())
         ctrl = max(ctrl, ((g - g_ctrl).abs() / scale).max().item())
         del w
     tol = max(4 * UNIT_ROUNDOFF[bundle.dtype], F32_FLOOR)
@@ -319,28 +333,83 @@ PROPAGATED = {"norm_entropy": "norm_entropy", "energy": "energy", "js": "js/ques
 
 @torch.inference_mode()
 def propagate(bank: Bank, eps: float, l: int, x_a: torch.Tensor, x_b: torch.Tensor,
-              beta: float) -> dict[str, np.ndarray]:
-    """Per position at one beta: |H_bar(a) - H_bar(b)|, |E(a) - E(b)| and
-    JS(p_a, p_b), with p = softmax(beta s) from the residuals x_a, x_b of layer l.
-    Each path's scores and log p are computed as in production (float32 on the
-    bank device); the comparison (differences, JS) runs on CPU in float64 (cpu64)."""
-    side = []
+              beta_star: dict[str, float]) -> dict[str, dict[str, np.ndarray]]:
+    """Per variant v and position at beta*_v: |H_bar(a) - H_bar(b)|,
+    |E(a) - E(b)| and JS(p_a, p_b), with p = softmax(beta s_v) from the
+    residuals x_a, x_b of layer l. Each path's scores and log p are computed as
+    in production (float32 on the bank device, one preactivation per path);
+    the comparison (differences, JS) runs on CPU in float64 (cpu64)."""
+    side = {v: [] for v in VARIANTS}
     for x in (x_a, x_b):
-        s = bank.scores(l, metrics.rms_normalise(x.to(bank.device), eps))
-        lp = metrics.log_distribution(s, beta)
-        side.append((cpu64(metrics.norm_entropy(lp)), cpu64(metrics.energy(s, beta)), cpu64(lp)))
-        del s, lp
-    (h_a, e_a, la), (h_b, e_b, lb) = side
-    out = {"norm_entropy": (h_a - h_b).abs(), "energy": (e_a - e_b).abs(),
-           "js": metrics.js_divergence(la, lb)}
-    return {k: v.numpy() for k, v in out.items()}
+        x_hat = metrics.rms_normalise(x.to(bank.device), eps)
+        z = bank.preactivation(l, x_hat)
+        for v in VARIANTS:
+            s = bank.from_preactivation(l, z, x_hat, v)
+            lp = metrics.log_distribution(s, beta_star[v])
+            side[v].append((cpu64(metrics.norm_entropy(lp)), cpu64(metrics.energy(s, beta_star[v])),
+                            cpu64(lp)))
+            del s, lp
+        del x_hat, z
+    out = {}
+    for v, ((h_a, e_a, la), (h_b, e_b, lb)) in side.items():
+        out[v] = {"norm_entropy": (h_a - h_b).abs().numpy(), "energy": (e_a - e_b).abs().numpy(),
+                  "js": metrics.js_divergence(la, lb).numpy()}
+    return out
+
+
+# Positions on which TF-vs-cache and TF-vs-fp32 noise is judged: the ones the
+# analysis reads (response tokens and the three references). Template tokens
+# and position 0 (attention sink: the pilot's max of ||x_cache - x_tf||) are
+# reported apart and do not enter the PASS criterion.
+ANALYSIS = "analysis"
+
+
+def position_groups(roles: list[int], refs: dict, n: int) -> dict[str, np.ndarray]:
+    """Boolean masks over positions 0..n-1: ``analysis`` (response ∪
+    references), ``role/<name>`` per role and ``position/<name>`` for
+    position 0 and the references (empty when outside 0..n-1)."""
+    from energy_llm.core.prompting import ROLE_NAMES
+
+    r = np.asarray(roles[:n])
+
+    def at(p):
+        m = np.zeros(n, dtype=bool)
+        if p is not None and p < n:
+            m[p] = True
+        return m
+
+    special = {"position_0": at(0)} | {k: at(p) for k, p in refs.items()}
+    analysis = r == ROLE_RESPONSE
+    for k in REFERENCES:
+        analysis = analysis | special[k]
+    return ({ANALYSIS: analysis} | {f"role/{ROLE_NAMES[c]}": r == c for c in sorted(ROLE_NAMES)}
+            | {f"position/{k}": m for k, m in special.items()})
+
+
+def _masked(per_layer: list, masks: list[dict], key: str) -> list:
+    """per_layer[l]: list over questions of per-position arrays -> the same
+    restricted to the positions of group ``key``."""
+    return [[a[m[key]] for a, m in zip(qs, masks)] for qs in per_layer]
+
+
+def grouped_noise(noise: dict, signal: dict, masks: list[dict]) -> dict:
+    """noise_to_signal per position group (same sigma_l: the signal is the
+    response spread of the trace at beta*)."""
+    return {k: noise_to_signal({m: _masked(noise[m], masks, k) for m in noise}, signal) for k in masks[0]}
+
+
+def grouped_dist(per_layer: list, masks: list[dict]) -> dict:
+    """dist_stats per layer and position group."""
+    return {k: [dist_stats(qs) for qs in _masked(per_layer, masks, k)] for k in masks[0]}
 
 
 def noise_to_signal(noise: dict, signal: dict) -> dict:
     """noise[metric][l], signal[metric][l]: lists of per-question arrays.
     sigma_l = std over (response positions x questions) of the metric at beta*;
     ratio = p99(|delta|) / sigma_l (the PASS statistic) and max(|delta|) / sigma_l
-    (reported apart). sigma_l = 0 gives ratio 0 when the noise is 0, else inf."""
+    (reported apart), both next to sigma_l per layer (a large ratio can be a
+    small sigma, not a large noise). sigma_l = 0 gives ratio 0 when the noise
+    is 0, else inf."""
     def ratio(x, sd):
         return 0.0 if x == 0 else (float("inf") if sd == 0 else x / sd)
 
@@ -354,7 +423,7 @@ def noise_to_signal(noise: dict, signal: dict) -> dict:
             rp, rm = ratio(st["p99"] or 0.0, sd), ratio(st["max"] or 0.0, sd)
             row[m] = st | {"sigma": sd, "ratio_p99": rp, "ratio_max": rm}
             if rp > worst_p99:
-                worst_p99, where = rp, {"layer": l, "metric": m}
+                worst_p99, where = rp, {"layer": l, "metric": m, "sigma": sd}
             worst_max = max(worst_max, rm)
         per_layer.append(row)
     return {"max_ratio_p99": worst_p99, "max_ratio_max": worst_max, "worst_p99_at": where,
@@ -402,17 +471,27 @@ def load_fp32_model(cfg: RunConfig, device: torch.device):
     return model
 
 
+# Pre-registered precision rule (pilot): if the TF bf16 traces are farther
+# from float32 than this fraction of sigma_l on the analysis positions at any
+# layer, the traces should be computed in float32 (model.trace_dtype).
+RECOMMEND_FP32_RATIO = 0.1
+
+
 @torch.inference_mode()
 def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[dict],
-                   beta: float, signal: dict) -> dict:
+                   beta_star: dict[str, float], signal: dict) -> dict:
     """Recompute x with a float32 model on the same tokens (one teacher-forced
-    pass per question) and compare the bf16 residuals with it, per layer:
+    pass per question) and compare the traced residuals with it, per layer:
     d(x_tf, x_fp32) at every position, d(x_cache, x_fp32) at the cached
-    positions, and both propagated to the traces at beta (noise_to_signal).
-    The float32 instance is loaded separately from the cache (never an in-place
-    cast of the production model) and freed afterwards; a float32 bundle (tests)
-    is its own reference. Full float32 matmul precision is forced during the
-    check (no TF32) and restored after."""
+    positions, and both propagated to the traces of each variant at beta*_v
+    (noise_to_signal), all broken down by position group (position_groups).
+    ``signal[v]``: the per-variant sigma samples of tf_vs_cache. The float32
+    instance is loaded separately from the cache (never an in-place cast of
+    the production model) and freed afterwards; a float32 bundle (tests) is
+    its own reference. Full float32 matmul precision is forced during the
+    check (no TF32) and restored after. Precision rule: if max over variants,
+    layers and metrics of p99/sigma (TF vs float32, analysis positions) exceeds
+    RECOMMEND_FP32_RATIO, the report recommends trace_dtype=float32."""
     from energy_llm.core.model import release_cuda
 
     prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
@@ -443,25 +522,39 @@ def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[
     L, eps = bundle.dims.n_layers, bundle.dims.rms_norm_eps
     d_tf = [[] for _ in range(L)]
     d_cache = [[] for _ in range(L)]
-    n_tf = {m: [[] for _ in range(L)] for m in PROPAGATED}
-    n_cache = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    n_tf = {v: {m: [[] for _ in range(L)] for m in PROPAGATED} for v in VARIANTS}
+    n_cache = {v: {m: [[] for _ in range(L)] for m in PROPAGATED} for v in VARIANTS}
+    m_tf, m_cache = [], []
     for rec, x in zip(saved, x32):
+        n = rec["x_cache"][0].shape[0]
+        m_tf.append(position_groups(rec["roles"], rec["refs"], len(rec["ids"])))
+        m_cache.append(position_groups(rec["roles"], rec["refs"], n))
         for l in range(L):
-            n = rec["x_cache"][l].shape[0]
             d_tf[l].append(rel_err(rec["x_tf"][l], x[l]))
             d_cache[l].append(rel_err(rec["x_cache"][l], x[l][:n]))
-            for m, v in propagate(bank, eps, l, rec["x_tf"][l], x[l], beta).items():
-                n_tf[m][l].append(v)
-            for m, v in propagate(bank, eps, l, rec["x_cache"][l], x[l][:n], beta).items():
-                n_cache[m][l].append(v)
+            for v, d in propagate(bank, eps, l, rec["x_tf"][l], x[l], beta_star).items():
+                for m, a in d.items():
+                    n_tf[v][m][l].append(a)
+            for v, d in propagate(bank, eps, l, rec["x_cache"][l], x[l][:n], beta_star).items():
+                for m, a in d.items():
+                    n_cache[v][m][l].append(a)
+    tr_tf = {v: grouped_noise(n_tf[v], signal[v], m_tf) for v in VARIANTS}
+    tr_cache = {v: grouped_noise(n_cache[v], signal[v], m_cache) for v in VARIANTS}
+    worst = max(((tr_tf[v][ANALYSIS]["max_ratio_p99"], v) for v in VARIANTS), key=lambda t: t[0])
+    rule = {"statistic": "max over variants, layers and metrics of p99(|trace(x_tf) - trace(x_fp32)|) / "
+                         "sigma_l on the analysis positions",
+            "threshold": RECOMMEND_FP32_RATIO, "value": worst[0],
+            "at": {"variant": worst[1]} | (tr_tf[worst[1]][ANALYSIS]["worst_p99_at"] or {}),
+            "recommend": "trace_dtype=float32" if worst[0] > RECOMMEND_FP32_RATIO else None}
     return {
         "separate_fp32_instance": separate,
         "precision": {"float32_matmul_precision": "highest", "cuda_matmul_allow_tf32": False,
                       "cudnn_allow_tf32": False, "restored_after": True},
-        "x_rel_tf_vs_fp32": [dist_stats(d) for d in d_tf],
-        "x_rel_cache_vs_fp32": [dist_stats(d) for d in d_cache],
-        "traces_tf_vs_fp32": noise_to_signal(n_tf, signal),
-        "traces_cache_vs_fp32": noise_to_signal(n_cache, signal),
+        "x_rel_tf_vs_fp32": grouped_dist(d_tf, m_tf),
+        "x_rel_cache_vs_fp32": grouped_dist(d_cache, m_cache),
+        "traces_tf_vs_fp32": tr_tf,
+        "traces_cache_vs_fp32": tr_cache,
+        "precision_rule": rule,
     }
 
 
@@ -501,7 +594,8 @@ def gamma_shuffled_bank(base: Bank, seed: int = 1) -> Bank:
 
 @torch.inference_mode()
 def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank", trace, tr: dict,
-                           betas: list[float], k_mass: int, c: float = PERM_C) -> dict[str, np.ndarray]:
+                           betas: list[float], k_mass: int, variant: str,
+                           c: float = PERM_C) -> dict[str, np.ndarray]:
     """Per-element tolerance of every float trace under a permutation of the
     memories (derivation: ARCHITECTURE section 13.5). The scores are the same
     numbers in another order; what changes is the order of every reduction over
@@ -535,7 +629,8 @@ def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank
                     of p multiplies the signed sum KL(p||m) <= 2 JS)
       dkl/<ref>     (delta_t + delta_r)(2 + A) + u (2 H_t + 2 H_r + A)
                     + u A2 + g_n A        (+ 2 beta ds A)
-      margin        2 ds;   xhat_top1_frac 0 (independent of the bank).
+      margin        2 ds;   xhat_top1_frac, query_gain 0 (independent of the memories).
+    ``tr``: one variant's traces (``view``), ``variant`` its score variant.
     dkl is the worst-conditioned trace: its terms add up to A (hundreds of
     nats at beta ~ 1e4) while |dkl| can be small."""
     dims = bundle.dims
@@ -552,7 +647,7 @@ def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank
     ds, srange, srow = np.zeros(L), np.zeros(L), np.zeros((L, T))
     for l in range(L):
         x_hat = metrics.rms_normalise(trace.residuals[l].to(bank.device), eps)
-        s, sp = bank.scores(l, x_hat), pbank.scores(l, x_hat)
+        s, sp = bank.scores(l, x_hat, variant), pbank.scores(l, x_hat, variant)
         ds[l] = (sp - s[:, pbank.perm[l]]).abs().max().item()
         srow[l] = (s.max(-1).values - s.min(-1).values).cpu().numpy()
         srange[l] = srow[l].max()
@@ -585,6 +680,7 @@ def permutation_tolerances(bundle: ModelBundle, bank: Bank, pbank: "PermutedBank
         "topk_mass": c * (delta + u * lam + gn) * f64["topk_mass"] + lip["topk_mass"],
         "margin": np.broadcast_to(2 * ds[:, None], (L, T)).copy(),
         "xhat_top1_frac": np.zeros((L, T)),
+        "query_gain": np.zeros((L, T)),
     }
     for r, pos in refs.items():
         if pos is None:
@@ -651,9 +747,11 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                name: str | None = None, tf_max_noise_ratio: float = TF_MAX_NOISE_RATIO,
                fp32_check: bool = True) -> dict:
     """``ref_n`` questions x ``ref_layers`` go through the float64 reference
-    (~75 s per layer and question at Qwen2.5-3B size on one CPU core); every
-    other check runs on all ``n`` questions and all layers. ``tf_max_noise_ratio``
-    is the tf_vs_cache PASS threshold; ``fp32_check`` runs fp32_reference."""
+    (~75 s per layer, question and variant at Qwen2.5-3B size on one CPU core);
+    every other check runs on all ``n`` questions and all layers. Every check
+    involving the bank runs for both score variants and must pass for both.
+    ``tf_max_noise_ratio`` is the tf_vs_cache PASS threshold (analysis
+    positions); ``fp32_check`` runs fp32_reference."""
     from energy_llm.core.prompting import ROLE_NAMES
 
     from energy_llm.pipeline.smoke import run_single_process
@@ -661,11 +759,11 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     started = time.time()
     reference = load_reference()
     beta_rec = load_beta_star(cfg, items)
-    beta_star = float(beta_rec["variants"][CONTROL]["beta_star"])   # both variants from C5
+    beta_star = {v: float(beta_rec["variants"][v]["beta_star"]) for v in VARIANTS}
     all_betas, k_ids = variant_betas(cfg, beta_rec), variant_topk_ids(cfg)
-    betas = all_betas[CONTROL]
     k_mass = cfg.extraction.topk_mass_k
     L = bundle.dims.n_layers
+    eps = bundle.dims.rms_norm_eps
     ref_layers = ref_layers if ref_layers is not None else sorted({0, L // 2, L - 1})
     hidden_layers = cfg.hidden_layer_indices(L)
     sel = items[:n]
@@ -680,38 +778,46 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     if bundle.tokenizer.eos_token_id is not None:
         stops.add(int(bundle.tokenizer.eos_token_id))
 
-    acc = {key: [] for key in ("reference", "gate", "gate_ctrl", "tf_cache", "align",
-                               "hidden", "files", "perm", "limits", "monotone", "self", "det_tokens")}
+    acc = {key: [] for key in ("reference", "gate", "gate_ctrl", "tf_tokens", "align",
+                               "hidden", "files", "limits", "monotone", "self", "det_tokens")}
     ref_details = []
+    perm = None
     # tf_vs_cache: x relative error per layer, its argmax location, the error
-    # propagated to the traces at beta* (noise) and the trace spread (signal)
+    # propagated to the traces of each variant at beta*_v (noise), the trace
+    # spread (signal) and the position groups of each question
     x_rel = [[] for _ in range(L)]
     x_worst = {"value": -1.0}
-    tf_noise = {m: [[] for _ in range(L)] for m in PROPAGATED}
-    tf_signal = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    tf_noise = {v: {m: [[] for _ in range(L)] for m in PROPAGATED} for v in VARIANTS}
+    tf_signal = {v: {m: [[] for _ in range(L)] for m in PROPAGATED} for v in VARIANTS}
+    tf_masks = []
     saved = []                                   # residuals kept for fp32_reference
+    grid = cfg.calibration.beta_grid()
     try:
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
             prod = compute_item(bundle, bank, trace, it.id, all_betas, hidden_layers, k_mass, k_ids)
-            pv = view(prod.traces, CONTROL)
 
-            # reference (float64, naive)
+            # reference (float64, naive), both variants
             if qi < ref_n:
                 q_last = max(i for i, r in enumerate(trace.prompt.roles) if r == ROLE_QUESTION)
                 ref = reference.reference_item(
                     bundle.model, {l: trace.residuals[l].float().cpu().numpy() for l in ref_layers},
-                    trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, betas, q_last,
-                    k_mass, k_ids[PRIMARY])
-                cmp = compare_with_reference(bundle, bank, trace, pv, ref, ref_layers, betas, k_mass)
-                cmp["reference_positions_equal"] = ref["reference_positions"] == prod.reference_positions
-                cmp["ok"] &= cmp["reference_positions_equal"]
-                ref_details.append({"id": it.id} | {k_: v for k_, v in cmp.items() if k_ != "ok"})
-                acc["reference"].append((cmp["max_error_over_tolerance"], cmp["ok"]))
+                    trace.n_prompt, trace.gen_ids, sorted(stops), ref_layers, all_betas, q_last,
+                    k_mass, max(k_ids.values()))
+                pos_ok = ref["reference_positions"] == prod.reference_positions
+                per_v = {}
+                for v in VARIANTS:
+                    cmp = compare_with_reference(bundle, bank, trace, view(prod.traces, v), ref,
+                                                 ref_layers, all_betas[v], k_mass, v)
+                    cmp["ok"] &= pos_ok
+                    per_v[v] = cmp
+                ref_details.append({"id": it.id, "reference_positions_equal": pos_ok}
+                                   | {v: {k_: x for k_, x in c.items() if k_ != "ok"} for v, c in per_v.items()})
+                acc["reference"].append({v: (c["max_error_over_tolerance"], c["ok"]) for v, c in per_v.items()})
                 del ref
 
-            # (a) gate reconstruction
+            # (a) gate reconstruction, both variants
             err, ctrl, gtol = check_gate(bundle, bank, trace)
             acc["gate"].append(err)
             acc["gate_ctrl"].append(ctrl)
@@ -721,6 +827,7 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             n_cmp = info["positions_compared"]
             roles_all = trace.roles
             resp = trace.response_positions
+            tf_masks.append(position_groups(roles_all, trace.reference_positions, n_cmp))
             for l in range(L):
                 x_tf = trace.residuals[l][:n_cmp]
                 rel = rel_err(x_cache[l], x_tf)
@@ -729,15 +836,17 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                 if rel[j] > x_worst["value"]:
                     x_worst = {"value": float(rel[j]), "id": it.id, "layer": l, "position": j,
                                "role": ROLE_NAMES[roles_all[j]]}
-                for m, v in propagate(bank, bundle.dims.rms_norm_eps, l, x_cache[l], x_tf,
-                                      beta_star).items():
-                    tf_noise[m][l].append(v)
-                for m, ds_name in PROPAGATED.items():
-                    tf_signal[m][l].append(pv[ds_name][l, resp, -1])
-            acc["tf_cache"].append((max(float(np.max(r[-1])) for r in x_rel), info["tokens_equal"]))
+                for v, d in propagate(bank, eps, l, x_cache[l], x_tf, beta_star).items():
+                    for m, a in d.items():
+                        tf_noise[v][m][l].append(a)
+                for v in VARIANTS:
+                    for m, ds_name in PROPAGATED.items():
+                        tf_signal[v][m][l].append(prod.traces[f"{v}/{ds_name}"][l, resp, -1])
+            acc["tf_tokens"].append(info["tokens_equal"])
             if fp32_check:
                 saved.append({"ids": trace.prompt.input_ids + trace.gen_ids, "x_cache": x_cache,
-                              "x_tf": {l: v.cpu() for l, v in trace.residuals.items()}})
+                              "x_tf": {l: v.cpu() for l, v in trace.residuals.items()},
+                              "roles": roles_all, "refs": trace.reference_positions})
             del x_cache
             full = torch.tensor([trace.prompt.input_ids + trace.gen_ids], device=bundle.device)
             with torch.inference_mode():
@@ -766,10 +875,10 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                          "response_first": indep_resp[0] if indep_resp else None,
                          "response_last": indep_resp[-1] if indep_resp else None}
             h_err = 0.0
-            for name, pos in positions.items():
+            for name_, pos in positions.items():
                 x = (torch.stack([trace.residuals[l][pos].float().cpu() for l in hidden_layers]).half().numpy()
                      if pos is not None else np.full_like(prod.hidden["prompt_last"], np.nan))
-                h_err = max(h_err, _nan_aware_max_diff(prod.hidden[name], x)[0])
+                h_err = max(h_err, _nan_aware_max_diff(prod.hidden[name_], x)[0])
             acc["hidden"].append(h_err)
             # files hold float16(traces), topk_ids int32 and the float16 residuals
             f_tr, f_hid, f_ans = _read_outputs(ext_dir, it.id)
@@ -789,43 +898,49 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             if qi == 0:
                 pbank = PermutedBank(bank)
                 pres = compute_item(bundle, pbank, trace, it.id, all_betas, hidden_layers, k_mass, k_ids)
-                ptol = permutation_tolerances(bundle, bank, pbank, trace, pv, betas, k_mass)
-                perm = trace_ratios(view(pres.traces, CONTROL), pv, ptol, betas)
                 cres = compute_item(bundle, gamma_shuffled_bank(bank), trace, it.id, all_betas,
                                     hidden_layers, k_mass, k_ids)
-                ctrl = trace_ratios(view(cres.traces, CONTROL), pv, ptol, betas)
-                # topk_ids are memory indices: permuted index j is original perm[j]
-                ids = f"{PRIMARY}/topk_ids"
-                mapped = np.stack([pbank.perm[l].cpu().numpy()[pres.traces[ids][l]] for l in range(L)])
-                acc["perm"].append((perm, ctrl, _topk_jaccard(mapped, prod.traces[ids])))
-                del pres, cres, ptol
+                perm = {}
+                for v in VARIANTS:
+                    pv = view(prod.traces, v)
+                    ptol = permutation_tolerances(bundle, bank, pbank, trace, pv, all_betas[v], k_mass, v)
+                    jac = None
+                    if "topk_ids" in pv:
+                        # topk_ids are memory indices: permuted index j is original perm[j]
+                        ids = pres.traces[f"{v}/topk_ids"]
+                        mapped = np.stack([pbank.perm[l].cpu().numpy()[ids[l]] for l in range(L)])
+                        jac = _topk_jaccard(mapped, pv["topk_ids"])
+                    perm[v] = (trace_ratios(view(pres.traces, v), pv, ptol, all_betas[v]),
+                               trace_ratios(view(cres.traces, v), pv, ptol, all_betas[v]), jac)
+                del pres, cres
 
-            # limits, monotonicity, self-divergence on real scores
-            grid = cfg.calibration.beta_grid()
+            # limits, monotonicity, self-divergence on real scores, both variants
             sel_pos = torch.tensor([n_p - 1] + trace.response_positions, device=bank.device)
-            lim_worst, mono_worst, self_worst = 0.0, 0.0, 0.0
+            lim_worst, mono_worst, self_worst = (dict.fromkeys(VARIANTS, 0.0) for _ in range(3))
             for l in range(L):
-                s = bank.scores(l, metrics.rms_normalise(trace.residuals[l].to(bank.device),
-                                                         bundle.dims.rms_norm_eps))
-                s0 = s[n_p - 1]
-                h0 = metrics.norm_entropy(metrics.log_distribution(s0, 1e-8)).item()
-                m0 = metrics.margin(s0).item()
-                if m0 > 0:
-                    b_inf = 50.0 / m0                       # e^-50 ~ 2e-22 per runner-up
-                    h_inf = metrics.norm_entropy(metrics.log_distribution(s0, b_inf)).item()
-                    lp_inf = metrics.log_distribution(s0, b_inf)
-                    e_gap = abs(metrics.energy(s0, b_inf).item() + s0.max().item())
-                    lim_worst = max(lim_worst, 1 - h0, h_inf,
-                                    e_gap - math.log(s0.shape[0]) / b_inf,
-                                    metrics.var_score(lp_inf, s0).item(),
-                                    1 - metrics.topk_mass(lp_inf, k_mass).item())
-                else:
-                    lim_worst = max(lim_worst, 1 - h0)
-                hs = torch.stack([metrics.norm_entropy(metrics.log_distribution(s[sel_pos], b)) for b in grid])
-                mono_worst = max(mono_worst, (hs[1:] - hs[:-1]).max().item())
-                lp = metrics.log_distribution(s0, beta_star)
-                self_worst = max(self_worst, metrics.js_divergence(lp, lp).item(),
-                                 abs(metrics.kl_divergence(lp, lp).item()))
+                x_hat = metrics.rms_normalise(trace.residuals[l].to(bank.device), eps)
+                for v in VARIANTS:
+                    s = bank.scores(l, x_hat, v)
+                    s0 = s[n_p - 1]
+                    h0 = metrics.norm_entropy(metrics.log_distribution(s0, 1e-8)).item()
+                    m0 = metrics.margin(s0).item()
+                    if m0 > 0:
+                        b_inf = 50.0 / m0                       # e^-50 ~ 2e-22 per runner-up
+                        lp_inf = metrics.log_distribution(s0, b_inf)
+                        h_inf = metrics.norm_entropy(lp_inf).item()
+                        e_gap = abs(metrics.energy(s0, b_inf).item() + s0.max().item())
+                        lim_worst[v] = max(lim_worst[v], 1 - h0, h_inf,
+                                           e_gap - math.log(s0.shape[0]) / b_inf,
+                                           metrics.var_score(lp_inf, s0).item(),
+                                           1 - metrics.topk_mass(lp_inf, k_mass).item())
+                    else:
+                        lim_worst[v] = max(lim_worst[v], 1 - h0)
+                    hs = torch.stack([metrics.norm_entropy(metrics.log_distribution(s[sel_pos], b))
+                                      for b in grid])
+                    mono_worst[v] = max(mono_worst[v], (hs[1:] - hs[:-1]).max().item())
+                    lp = metrics.log_distribution(s0, beta_star[v])
+                    self_worst[v] = max(self_worst[v], metrics.js_divergence(lp, lp).item(),
+                                        abs(metrics.kl_divergence(lp, lp).item()))
             acc["limits"].append(lim_worst)
             acc["monotone"].append(mono_worst)
             acc["self"].append(self_worst)
@@ -833,41 +948,59 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     finally:
         hooks.remove()
 
-    tf_ns = noise_to_signal(tf_noise, tf_signal)
-    tokens_equal = all(t for _, t in acc["tf_cache"])
+    tokens_equal = all(acc["tf_tokens"])
+    tf_g = {v: grouped_noise(tf_noise[v], tf_signal[v], tf_masks) for v in VARIANTS}
     fp32 = fp32_reference(cfg, bundle, bank, saved, beta_star, tf_signal) if fp32_check else None
     del saved
 
+    def worst(key):             # max over questions, per variant -> {v: value}
+        return {v: max(q[v] for q in acc[key]) for v in VARIANTS}
+
     self_tol = self_divergence_tolerance(bundle.dims.d_ff)
-    perm, ctrl, perm_jac = acc["perm"][0]
+    ref_w = {v: max(q[v][0] for q in acc["reference"]) for v in VARIANTS}
+    ref_ok = all(q[v][1] for q in acc["reference"] for v in VARIANTS)
+    gate_w, gate_ctrl = worst("gate"), min(acc["gate_ctrl"])
+    tf_w = {v: tf_g[v][ANALYSIS]["max_ratio_p99"] for v in VARIANTS}
+    perm_ok = all(p["worst"]["ratio"] <= 1.0 and c["worst"]["ratio"] > 1.0
+                  and (j is None or j >= TOPK_MIN_JACCARD) for p, c, j in perm.values())
+    lim, mono, selfd = worst("limits"), worst("monotone"), worst("self")
     checks = [
-        Check("reference", _status(all(ok for _, ok in acc["reference"])),
-              max(r for r, _ in acc["reference"]), 1.0,
+        Check("reference", _status(ref_ok), max(ref_w.values()), 1.0,
               {"layers": ref_layers, "n_questions": len(acc["reference"]),
                "metric": "max error / tolerance (tolerances from "
                "Lipschitz bounds on the observed score error, see reference_tolerances)",
-               "per_question": ref_details}),
-        Check("gate", _status(max(acc["gate"]) <= gtol and min(acc["gate_ctrl"]) > 10 * gtol),
-              max(acc["gate"]), gtol,
-              {"no_gamma_control_min_error": min(acc["gate_ctrl"]),
+               "per_variant": ref_w, "per_question": ref_details}),
+        Check("gate", _status(max(gate_w.values()) <= gtol and gate_ctrl > 10 * gtol),
+              max(gate_w.values()), gtol,
+              {"per_variant": gate_w,
+               "reconstruction": {PRIMARY: "||w_i|| ||gamma * x_hat|| c_i",
+                                  CONTROL: "||w_tilde_i|| sqrt(D) s_i"},
+               "no_gamma_control_min_error": gate_ctrl,
                "control_must_exceed": 10 * gtol, "model_dtype": bundle.dtype}),
-        Check("tf_vs_cache", _status(tf_ns["max_ratio_p99"] <= tf_max_noise_ratio and tokens_equal),
-              tf_ns["max_ratio_p99"], tf_max_noise_ratio,
-              {"metric": "max over layers and traces of p99(|delta|) / sigma_l at beta*: delta = "
-                         "|H_bar|, |E| and JS(p_cache, p_tf) differences over the compared positions; "
+        Check("tf_vs_cache", _status(max(tf_w.values()) <= tf_max_noise_ratio and tokens_equal),
+              max(tf_w.values()), tf_max_noise_ratio,
+              {"metric": "per variant, max over layers and traces of p99(|delta|) / sigma_l at beta*_v "
+                         "on the analysis positions: delta = |H_bar|, |E| and JS(p_cache, p_tf); "
                          "sigma_l = std over (response positions x questions) of norm_entropy, "
-                         "energy, js/question_last at beta*",
+                         "energy, js/question_last at beta*_v (reported per layer next to the ratio)",
+               "pass_positions": "analysis = response tokens + question_last, prompt_last, response_first "
+                                 "(of the compared positions 0 .. n_prompt + T_g - 2); template tokens "
+                                 "and position 0 are reported apart and do not enter the criterion",
                "tokens_equal": tokens_equal,
-               "max_ratio_max": tf_ns["max_ratio_max"], "worst_p99_at": tf_ns["worst_p99_at"],
-               "per_layer": tf_ns["per_layer"],
+               "per_variant": {v: {"max_ratio_p99": tf_w[v],
+                                   "max_ratio_max": tf_g[v][ANALYSIS]["max_ratio_max"],
+                                   "worst_p99_at": tf_g[v][ANALYSIS]["worst_p99_at"],
+                                   "groups": tf_g[v]} for v in VARIANTS},
                "x_rel_informative": {"metric": "||x_cache - x_tf|| / ||x_tf||",
                                      "threshold": tf_cache_tolerance(bundle.dtype),
                                      "max": x_worst["value"],
                                      "within_threshold": x_worst["value"] <= tf_cache_tolerance(bundle.dtype),
                                      "max_at": {k: v for k, v in x_worst.items() if k != "value"},
-                                     "per_layer": [dist_stats(r) for r in x_rel]}}),
-        (Check("fp32_reference", "INFO", fp32["traces_tf_vs_fp32"]["max_ratio_p99"], None,
-               fp32 | {"max_error_is": "p99 noise / sigma of the TF bf16 traces vs float32 (informative)"})
+                                     "groups": grouped_dist(x_rel, tf_masks)}}),
+        (Check("fp32_reference", "INFO", fp32["precision_rule"]["value"], RECOMMEND_FP32_RATIO,
+               fp32 | {"max_error_is": "p99 noise / sigma of the TF traces vs float32 on the analysis "
+                                       "positions (informative; above the tolerance: RECOMMEND "
+                                       "trace_dtype=float32)"})
          if fp32 is not None else
          Check("fp32_reference", "SKIP", None, None, {"reason": "disabled (--no-fp32-reference)"})),
         Check("alignment", _status(all(ok for ok, _, _ in acc["align"])),
@@ -881,25 +1014,29 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
               max(e for e, _ in acc["files"]), det_tol,
               {"metric": "traces.h5 / hidden.h5 vs an in-memory recomputation, in float16 ulps; "
                          "topk_ids exact on CPU, row Jaccard >= 0.98 on GPU"}),
-        Check("permutation", _status(perm["worst"]["ratio"] <= 1.0 and ctrl["worst"]["ratio"] > 1.0
-                                     and perm_jac >= TOPK_MIN_JACCARD),
-              perm["worst"]["ratio"], 1.0,
-              {"metric": "max over traces and elements of |change| / tolerance; per-trace tolerances "
-                         "from float32 reduction bounds (permutation_tolerances)",
+        Check("permutation", _status(perm_ok),
+              max(p["worst"]["ratio"] for p, _, _ in perm.values()), 1.0,
+              {"metric": "per variant, max over traces and elements of |change| / tolerance; per-trace "
+                         "tolerances from float32 reduction bounds (permutation_tolerances)",
                "reduction_model": "tree (pairwise): ceil(log2 D_ff) * u32 per reduction over D_ff",
-               "c": PERM_C, "worst": perm["worst"], "per_trace": perm["traces"],
-               "negative_control": {"what": "gamma permuted over D without permuting W_g; must exceed 1",
-                                    "worst": ctrl["worst"],
-                                    "per_trace_max_ratio": {k: v["max_ratio"]
-                                                            for k, v in ctrl["traces"].items()}},
-               "topk_ids_min_row_jaccard": perm_jac, "topk_ids_required": TOPK_MIN_JACCARD}),
-        Check("limits", _status(max(acc["limits"]) <= F32_FLOOR), max(acc["limits"]), F32_FLOOR,
-              {"metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
+               "c": PERM_C,
+               "per_variant": {v: {"worst": p["worst"], "per_trace": p["traces"],
+                                   "negative_control": {
+                                       "what": "gamma permuted over D without permuting W_g; must exceed 1",
+                                       "worst": c["worst"],
+                                       "per_trace_max_ratio": {k: x["max_ratio"] for k, x in c["traces"].items()}},
+                                   "topk_ids_min_row_jaccard": j}
+                               for v, (p, c, j) in perm.items()},
+               "topk_ids_required": TOPK_MIN_JACCARD}),
+        Check("limits", _status(max(lim.values()) <= F32_FLOOR), max(lim.values()), F32_FLOOR,
+              {"per_variant": lim,
+               "metric": "max of 1 - H_bar(beta=1e-8), H_bar(beta=50/margin), "
                          "|E + max s| - log(D_ff)/beta, var_score and 1 - topk_mass at beta=50/margin"}),
-        Check("monotone", _status(max(acc["monotone"]) <= F32_FLOOR), max(acc["monotone"]), F32_FLOOR,
-              {"metric": "max increase of H_bar between consecutive grid betas"}),
-        Check("self_divergence", _status(max(acc["self"]) <= self_tol), max(acc["self"]), self_tol,
-              {"metric": "max of JS(p, p) and |KL(p || p)| (expected exactly 0: pointwise forms)",
+        Check("monotone", _status(max(mono.values()) <= F32_FLOOR), max(mono.values()), F32_FLOOR,
+              {"per_variant": mono, "metric": "max increase of H_bar between consecutive grid betas"}),
+        Check("self_divergence", _status(max(selfd.values()) <= self_tol), max(selfd.values()), self_tol,
+              {"per_variant": selfd,
+               "metric": "max of JS(p, p) and |KL(p || p)| (expected exactly 0: pointwise forms)",
                "tolerance_is": "4 * u32 * log(D_ff), see self_divergence_tolerance"}),
         Check("determinism", _status(all(acc["det_tokens"]) and max(e for e, _ in acc["files"]) <= det_tol),
               max(e for e, _ in acc["files"]), det_tol,
@@ -912,11 +1049,13 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
         "model": {"id": cfg.model.id, "revision": cfg.model.revision, "dtype": bundle.dtype,
                   "device": str(bundle.device)},
         "beta_star": beta_star,
+        "primary": PRIMARY,
         "n_questions": len(sel),
         "options": {"n": n, "reference_n": ref_n, "reference_layers": ref_layers,
                     "tf_max_noise_ratio": tf_max_noise_ratio, "fp32_reference": fp32_check},
         "elapsed_s": round(time.time() - started, 1),
         "passed": all(c.status != "FAIL" for c in checks),
+        "recommend": None if fp32 is None else fp32["precision_rule"]["recommend"],
         "checks": [asdict(c) for c in checks],
     }
     write_json_atomic(ext_dir / "verify_report.json", report)
@@ -924,46 +1063,69 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
 
 
 def _calibration_check(cfg: RunConfig, bundle: ModelBundle, bank: Bank, rec: dict) -> Check:
-    """H_bar is monotone in beta, so the true mean H_bar at beta* must lie
-    between the curve values of the two grid points that bracket beta*."""
+    """Per variant: H_bar is monotone in beta, so the true mean H_bar at beta*_v
+    must lie between the curve values of the two grid points that bracket it."""
     path = Path(rec.get("input_path", ""))
     if not path.exists() or sha256_file(path) != rec["input_sha256"]:
         return Check("calibration", "SKIP", None, None, {"reason": f"warm-up file {path} not available"})
-    rv = rec["variants"][CONTROL]
-    grid, curve = np.asarray(rec["beta_grid"]), np.asarray(rv["mean_norm_entropy_curve"])
-    i = int(np.searchsorted(grid, rv["beta_star"])) - 1
-    hi, lo = float(curve[i]), float(curve[i + 1])
+    grid = np.asarray(rec["beta_grid"])
     hooks = ResidualHooks(bundle.model)
-    vals = []
+    vals = {v: [] for v in VARIANTS}
     try:
         for it in read_items(path):
             if it.id not in set(rec["warmup_ids"]):
                 continue
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
             trace = forward_item(bundle, hooks, prompt)
-            vals.append(float(norm_entropy_curve(bundle, bank, trace, [rv["beta_star"]])[CONTROL][0]))
+            for v in VARIANTS:
+                b = rec["variants"][v]["beta_star"]
+                vals[v].append(float(norm_entropy_curve(bundle, bank, trace, [b])[v][0]))
     finally:
         hooks.remove()
-    h = float(np.mean(vals))
-    ok = lo - F32_FLOOR <= h <= hi + F32_FLOOR
-    return Check("calibration", _status(ok), abs(h - rec["target_norm_entropy"]), None,
-                 {"mean_norm_entropy_at_beta_star": h, "target": rec["target_norm_entropy"],
-                  "bracket": [lo, hi], "n_warmup": len(vals),
-                  "max_error_is": "|H_bar(beta*) - H*| (informative; PASS = inside the bracket)"})
+    per, ok, err = {}, True, 0.0
+    for v in VARIANTS:
+        rv = rec["variants"][v]
+        curve = np.asarray(rv["mean_norm_entropy_curve"])
+        i = int(np.searchsorted(grid, rv["beta_star"])) - 1
+        hi, lo = float(curve[i]), float(curve[i + 1])
+        h = float(np.mean(vals[v]))
+        ok &= lo - F32_FLOOR <= h <= hi + F32_FLOOR
+        err = max(err, abs(h - rec["target_norm_entropy"]))
+        per[v] = {"mean_norm_entropy_at_beta_star": h, "bracket": [lo, hi], "beta_star": rv["beta_star"],
+                  "grid_position": rv["grid_position"]}
+    return Check("calibration", _status(ok), err, None,
+                 {"per_variant": per, "target": rec["target_norm_entropy"],
+                  "n_warmup": len(vals[PRIMARY]),
+                  "max_error_is": "max over variants of |H_bar(beta*_v) - H*| (informative; "
+                                  "PASS = inside the bracket for both)"})
 
 
 def format_report(r: dict) -> str:
+    stars = "  ".join(f"{v}={b:.6g}" for v, b in r["beta_star"].items())
     lines = [f"verify {r['model']['id']} ({r['model']['dtype']} on {r['model']['device']}), "
-             f"beta*={r['beta_star']:.6g}, {r['n_questions']} questions, {r['elapsed_s']} s",
+             f"beta* {stars}, {r['n_questions']} questions, {r['elapsed_s']} s",
              f"  {'check':<17} {'status':<6} {'max error':>12} {'tolerance':>12}"]
+    fmt = lambda v: "-" if v is None else f"{v:.3e}"
     for c in r["checks"]:
-        fmt = lambda v: "-" if v is None else f"{v:.3e}"
         lines.append(f"  {c['name']:<17} {c['status']:<6} {fmt(c['max_error']):>12} {fmt(c['tolerance']):>12}")
     for c in r["checks"]:
+        d = c["detail"]
         if c["name"] == "tf_vs_cache":
-            xi = c["detail"]["x_rel_informative"]
-            lines.append(f"  tf_vs_cache: max ratio (max) {c['detail']['max_ratio_max']:.3e} at worst p99 "
-                         f"{c['detail']['worst_p99_at']}; x rel max {xi['max']:.3e} at {xi['max_at']}")
+            for v, pv in d["per_variant"].items():
+                w = pv["worst_p99_at"] or {}
+                g = pv["groups"]
+                lines.append(f"  tf_vs_cache[{v}]: analysis p99/sigma {pv['max_ratio_p99']:.3e} at layer "
+                             f"{w.get('layer')} {w.get('metric')} (sigma {fmt(w.get('sigma'))}); "
+                             f"template {g['role/template']['max_ratio_p99']:.3e}, "
+                             f"position 0 {g['position/position_0']['max_ratio_p99']:.3e} (not in PASS)")
+            xi = d["x_rel_informative"]
+            lines.append(f"  tf_vs_cache: x rel max {xi['max']:.3e} at {xi['max_at']}")
+        if c["name"] == "fp32_reference" and c["status"] == "INFO":
+            pr = d["precision_rule"]
+            lines.append(f"  fp32_reference: max p99/sigma TF vs float32 (analysis) {pr['value']:.3e} "
+                         f"at {pr['at']} (threshold {pr['threshold']})")
+    if r.get("recommend"):
+        lines.append(f"  RECOMMEND {r['recommend']}")
     lines.append(f"  options: {r.get('options')}")
     lines.append(f"  => {'ALL PASS' if r['passed'] else 'FAILURES'}   report: "
                  f"{r['extraction_dir']}/verify_report.json")

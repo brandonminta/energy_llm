@@ -8,9 +8,16 @@ and positions and Python floats (float64). It does NOT import anything from
 residual activations, which the caller reads with whatever hook it likes.
 
 It is slow on purpose (no vectorised softmax, no fused kernels, a different
-algebraic route: explicit unit rows of W_tilde instead of folding gamma into
-x_hat), so agreement with the production pipeline is evidence that both
-compute the specification, not that they share a bug.
+algebraic route: explicit unit rows instead of one shared pre-activation), so
+agreement with the production pipeline is evidence that both compute the
+specification, not that they share a bug. Two score variants, written out
+independently:
+
+    cos_gamma_query  c_i = (w_i / ||w_i||) . (q / ||q||),  q = gamma * x_hat
+    cos_gamma_key    s_i = (w_tilde_i / ||w_tilde_i||) . x_hat / sqrt(D),
+                     w_tilde_i = w_i * gamma
+
+and the query gain g = ||gamma * x_hat|| / sqrt(D).
 """
 
 from __future__ import annotations
@@ -93,8 +100,8 @@ def xhat_top1_frac(xh: list[float]) -> float:
 # ---------------------------------------------------------------- per layer
 
 def layer_scores(w_g: np.ndarray, gamma: np.ndarray, xs: list[list[float]]) -> tuple[list[list[float]], list[float]]:
-    """Explicit W_tilde rows, their norms, unit rows, and s = unit . x_hat / sqrt(D).
-    Returns (scores [T][K], row norms [K])."""
+    """cos_gamma_key: explicit W_tilde rows, their norms, unit rows, and
+    s = unit . x_hat / sqrt(D). Returns (scores [T][K], row norms [K])."""
     d = len(gamma)
     gamma_l = [float(g) for g in gamma]
     scores = [[0.0] * w_g.shape[0] for _ in xs]
@@ -110,65 +117,98 @@ def layer_scores(w_g: np.ndarray, gamma: np.ndarray, xs: list[list[float]]) -> t
     return scores, norms
 
 
+def query_scores(w_g: np.ndarray, gamma: np.ndarray, xs: list[list[float]]) -> tuple[list[list[float]], list[float]]:
+    """cos_gamma_query: explicit queries q_t = gamma * x_hat_t and unit queries,
+    explicit unit rows of W_g (no gamma), c = unit_w . unit_q.
+    Returns (scores [T][K], query gains [T] = ||q_t|| / sqrt(D))."""
+    d = len(gamma)
+    qs, gains = [], []
+    for x in xs:
+        q = [float(g) * v for g, v in zip(gamma, x)]
+        nq = math.sqrt(math.fsum(v * v for v in q))
+        gains.append(nq / math.sqrt(d))
+        qs.append([v / nq for v in q])
+    qs = np.asarray(qs, dtype=np.float64)
+    scores = [[0.0] * w_g.shape[0] for _ in xs]
+    for i in range(w_g.shape[0]):
+        w = [float(v) for v in w_g[i]]
+        n = math.sqrt(math.fsum(v * v for v in w))
+        col = qs @ np.array([v / n for v in w], dtype=np.float64)
+        for t in range(len(xs)):
+            scores[t][i] = float(col[t])
+    return scores, gains
+
+
 REFERENCES = ("question_last", "prompt_last", "response_first")   # written out independently
+VARIANTS = ("cos_gamma_query", "cos_gamma_key")
+
+
+def _variant_traces(s: list[list[float]], refs: dict, betas: list[float],
+                    topk_mass_k: int, topk_ids_k: int) -> dict:
+    """Every per-token trace of one layer from its scores s [T][K]."""
+    T, nb = len(s), len(betas)
+    per_beta = ["energy", "norm_entropy", "topk_mass", "mean_score", "var_score"] + \
+        [f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES]
+    out = {k: np.full((T, nb), np.nan) for k in per_beta}
+    out["margin"] = np.array([margin(s[t]) for t in range(T)])
+    out["topk_ids"] = np.array([topk_indices(s[t], topk_ids_k) for t in range(T)], dtype=np.int64)
+    for bi, beta in enumerate(betas):
+        ps, logps = [], []
+        for t in range(T):
+            p, lse = softmax_and_lse(s[t], beta)
+            ps.append(p)
+            logps.append([beta * v - lse for v in s[t]])
+            out["energy"][t, bi] = energy(lse, beta)
+            out["norm_entropy"][t, bi] = norm_entropy(p)
+            out["topk_mass"][t, bi] = topk_mass(p, topk_mass_k)
+            out["mean_score"][t, bi] = mean_score(p, s[t])
+            out["var_score"][t, bi] = var_score(p, s[t])
+        for r, pos in refs.items():
+            if pos is None:
+                continue
+            for t in range(T):
+                out[f"js/{r}"][t, bi] = js(ps[t], ps[pos])
+                out[f"dkl/{r}"][t, bi] = kl(logps[t], logps[pos]) - kl(logps[pos], logps[t])
+    return out
 
 
 def reference_item(model, residuals: dict, n_prompt: int, gen_ids: list[int],
-                   stop_ids: list[int], layers: list[int], betas: list[float],
+                   stop_ids: list[int], layers: list[int], betas: dict,
                    question_last: int, topk_mass_k: int, topk_ids_k: int) -> dict:
-    """Every per-token trace for one question on the given layers.
+    """Every per-token trace of both score variants for one question on the
+    given layers.
 
     residuals[l]: array-like [T, D] (any dtype), T = n_prompt + len(gen_ids).
-    ``question_last``: position of the last question token (the caller reads
-    it from the role mask). Returns scores {l: [T][K]}, the reference
-    positions, and traces named as in production: [len(layers), T, n_beta]
-    for energy, norm_entropy, topk_mass, mean_score, var_score, js/<ref>,
-    dkl/<ref> (dkl = KL(p_t||p_ref) - KL(p_ref||p_t)); [len(layers), T] for
-    margin and xhat_top1_frac; topk_ids [len(layers), T, k] (as sets: ties
-    may order differently).
+    ``betas[variant]``: that variant's beta list. ``question_last``: position
+    of the last question token (the caller reads it from the role mask).
+    Returns scores {variant: {l: [T][K]}}, query_gain and xhat_top1_frac
+    [len(layers), T], the reference positions, and traces {variant: {name:
+    array}} named as in production: [len(layers), T, n_beta] for energy,
+    norm_entropy, topk_mass, mean_score, var_score, js/<ref>, dkl/<ref>
+    (dkl = KL(p_t||p_ref) - KL(p_ref||p_t)); [len(layers), T] for margin;
+    topk_ids [len(layers), T, k] (as sets: ties may order differently).
     """
     stops = set(int(t) for t in stop_ids)
     resp = [n_prompt + j for j, t in enumerate(gen_ids) if int(t) not in stops]
     refs = {"question_last": question_last, "prompt_last": n_prompt - 1,
             "response_first": resp[0] if resp else None}
     eps = float(model.config.rms_norm_eps)
-    T, nl, nb = n_prompt + len(gen_ids), len(layers), len(betas)
-
-    per_beta = ["energy", "norm_entropy", "topk_mass", "mean_score", "var_score"] + \
-        [f"{d}/{r}" for d in ("js", "dkl") for r in REFERENCES]
-    out = {k: np.full((nl, T, nb), np.nan) for k in per_beta}
-    out["margin"] = np.empty((nl, T))
-    out["xhat_top1_frac"] = np.empty((nl, T))
-    out["topk_ids"] = np.empty((nl, T, topk_ids_k), dtype=np.int64)
-    scores_out = {}
-    for li, l in enumerate(layers):
+    T = n_prompt + len(gen_ids)
+    scores = {v: {} for v in VARIANTS}
+    per_layer = {v: [] for v in VARIANTS}
+    xfrac, gains = [], []
+    for l in layers:
         layer = model.model.layers[l]
         w_g = layer.mlp.gate_proj.weight.detach().double().cpu().numpy()
         gamma = layer.post_attention_layernorm.weight.detach().double().cpu().numpy()
         x = np.asarray(residuals[l], dtype=np.float64)
         xs = [x_hat([float(v) for v in x[t]], eps) for t in range(T)]
-        s, _ = layer_scores(w_g, gamma, xs)
-        scores_out[l] = s
-        for t in range(T):
-            out["margin"][li, t] = margin(s[t])
-            out["xhat_top1_frac"][li, t] = xhat_top1_frac(xs[t])
-            out["topk_ids"][li, t] = topk_indices(s[t], topk_ids_k)
-        for bi, beta in enumerate(betas):
-            ps, logps = [], []
-            for t in range(T):
-                p, lse = softmax_and_lse(s[t], beta)
-                ps.append(p)
-                logps.append([beta * v - lse for v in s[t]])
-                out["energy"][li, t, bi] = energy(lse, beta)
-                out["norm_entropy"][li, t, bi] = norm_entropy(p)
-                out["topk_mass"][li, t, bi] = topk_mass(p, topk_mass_k)
-                out["mean_score"][li, t, bi] = mean_score(p, s[t])
-                out["var_score"][li, t, bi] = var_score(p, s[t])
-            for r, pos in refs.items():
-                if pos is None:
-                    continue
-                for t in range(T):
-                    out[f"js/{r}"][li, t, bi] = js(ps[t], ps[pos])
-                    out[f"dkl/{r}"][li, t, bi] = kl(logps[t], logps[pos]) - kl(logps[pos], logps[t])
-    return {"scores": scores_out, "reference_positions": refs, "response_positions": resp,
-            "traces": out}
+        xfrac.append([xhat_top1_frac(xs[t]) for t in range(T)])
+        scores["cos_gamma_key"][l], _ = layer_scores(w_g, gamma, xs)
+        scores["cos_gamma_query"][l], g = query_scores(w_g, gamma, xs)
+        gains.append(g)
+        for v in VARIANTS:
+            per_layer[v].append(_variant_traces(scores[v][l], refs, betas[v], topk_mass_k, topk_ids_k))
+    traces = {v: {k: np.stack([d[k] for d in per_layer[v]]) for k in per_layer[v][0]} for v in VARIANTS}
+    return {"scores": scores, "reference_positions": refs, "response_positions": resp,
+            "traces": traces, "query_gain": np.asarray(gains), "xhat_top1_frac": np.asarray(xfrac)}

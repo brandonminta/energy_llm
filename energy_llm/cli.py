@@ -109,7 +109,8 @@ def cmd_verify(args) -> int:
 
     cfg, items, bundle, _ = _load(args)
     layers = [int(x) for x in args.reference_layers.split(",")] if args.reference_layers else None
-    report = run_verify(cfg, bundle, items, n=args.n, ref_layers=layers, ref_n=args.reference_n)
+    report = run_verify(cfg, bundle, items, n=args.n, ref_layers=layers, ref_n=args.reference_n,
+                        tf_max_noise_ratio=args.tf_max_noise_ratio, fp32_check=args.fp32_reference)
     print(format_report(report))
     return EXIT_DONE if report["passed"] else 1
 
@@ -200,6 +201,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="comma-separated layers for the float64 reference (default 0,L/2,L-1)")
     sp.add_argument("--reference-n", type=int, default=2,
                     help="questions that go through the float64 reference (default 2)")
+    sp.add_argument("--tf-max-noise-ratio", type=float, default=0.1,
+                    help="tf_vs_cache PASS: max p99(|trace change|) / sigma per layer (default 0.1)")
+    sp.add_argument("--no-fp32-reference", dest="fp32_reference", action="store_false",
+                    help="skip the float32 reference check (loads a second, float32 model)")
     sp = sub.add_parser("inspect", help="print positions and per-layer phases of one id")
     sp.add_argument("--run", required=True, help="extraction directory (with manifest.json)")
     sp.add_argument("--id", required=True)

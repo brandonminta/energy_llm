@@ -203,7 +203,8 @@ fixing datasets or parameters. The sequence on the cluster is below
 
 ```bash
 python -m energy_llm verify  --config C --input dev/dev_questions.jsonl [--n 4] \
-                             [--reference-n 2] [--reference-layers 0,18,35]
+                             [--reference-n 2] [--reference-layers 0,18,35] \
+                             [--tf-max-noise-ratio 0.1] [--no-fp32-reference]
 python -m energy_llm inspect --run <extraction_dir> --id dev-known-01
 hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 min walltime
 ```
@@ -296,13 +297,16 @@ full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
 |---|---|---|
 | `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w̃‖·√D·s` | error ≤ 4·u_bf16; `no_gamma_control_min_error` ≫ tolerance |
 | `reference` | every per-token trace (all β, three references) == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1); `topk_ids` row Jaccard ≥ 0.98. The pure-Python reference over the β grid adds a few minutes per layer and question: watch the 45 min walltime |
-| `tf_vs_cache` | teacher-forced x == x during cached generation | tolerance 5e-2 is **provisional** for bf16: note the observed max |
+| `tf_vs_cache` | teacher-forced x == x during cached generation, judged on the traces | PASS: tokens equal and, per layer, p99 of `|ΔH̄|`, `|ΔE|`, `JS(p_cache, p_tf)` at β\* ≤ 0.1 × σ_ℓ (spread of the metric over response positions × questions; `--tf-max-noise-ratio`). `max_ratio_max`, the per-layer x error (median/p99/max) and its location (id, layer, position, role) are reported apart |
+| `fp32_reference` | how far the bf16 residuals (TF and cached) are from a float32 forward on the same tokens | INFO only: per-layer x distances and the same propagated ratios; loads a second, float32 instance (~12 GB) and frees it; TF32 off during the check. `--no-fp32-reference` skips it |
 | `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
 | `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
 | `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket |
 
-If `tf_vs_cache` fails only on its bf16 tolerance while tokens are equal,
-report the observed value before changing anything.
+If `tf_vs_cache` fails while tokens are equal, compare its ratios with
+`fp32_reference`: if the TF and cached residuals are equally far from float32,
+the disagreement is bf16 rounding, not a pipeline error; report it before
+changing anything.
 
 #### 5. Smoke test on the dev questions (each model)
 

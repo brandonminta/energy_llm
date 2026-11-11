@@ -131,15 +131,16 @@ def release_cuda() -> None:
         torch.cuda.empty_cache()
 
 
-def load_model(model_id: str, revision: str, device: str = "auto"):
-    """Load model + tokenizer at the exact hub revision in bfloat16. With
-    HF_HUB_OFFLINE=1 (compute nodes) this reads only the local cache."""
+def load_model(model_id: str, revision: str, device: str = "auto", dtype=torch.bfloat16):
+    """Load model + tokenizer at the exact hub revision in bfloat16 (``dtype``
+    is overridden only by verify's float32 reference). With HF_HUB_OFFLINE=1
+    (compute nodes) this reads only the local cache."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision, dtype=torch.bfloat16,
+        model_id, revision=revision, dtype=dtype,
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     if not getattr(tokenizer, "is_fast", False):

@@ -274,13 +274,71 @@ def check_gate(bundle: ModelBundle, bank: Bank, trace) -> tuple[float, float, fl
     return err, ctrl, tol
 
 
+def rel_err(a: torch.Tensor, b: torch.Tensor) -> np.ndarray:
+    """Per row ||a - b|| / ||b||, float32."""
+    a, b = a.float(), b.float()
+    return ((a - b).norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-30)).cpu().numpy()
+
+
+def dist_stats(v) -> dict:
+    """median / p99 / max of a flat sample (None when empty)."""
+    v = np.concatenate([np.ravel(x) for x in v]) if isinstance(v, list) else np.ravel(v)
+    if v.size == 0:
+        return {"median": None, "p99": None, "max": None}
+    return {"median": float(np.median(v)), "p99": float(np.percentile(v, 99)), "max": float(v.max())}
+
+
+# Trace quantities the residual error is propagated to, and the dataset whose
+# spread between questions is the signal it is compared with.
+PROPAGATED = {"norm_entropy": "norm_entropy", "energy": "energy", "js": "js/question_last"}
+
+
 @torch.inference_mode()
-def check_tf_vs_cache(bundle: ModelBundle, trace) -> tuple[float, dict]:
-    """Regenerate with the KV cache while recording x at every call, and compare
-    with the teacher-forced x at positions 0 .. n_prompt + T_g - 2 (the last
-    generated token is never fed back during generation). Error per position:
-    ||x_cache - x_tf|| / ||x_tf||. Also returns the first-step logits for the
-    alignment check."""
+def propagate(bank: Bank, eps: float, l: int, x_a: torch.Tensor, x_b: torch.Tensor,
+              beta: float) -> dict[str, np.ndarray]:
+    """Per position at one beta: |H_bar(a) - H_bar(b)|, |E(a) - E(b)| and
+    JS(p_a, p_b), with p = softmax(beta s) from the residuals x_a, x_b of layer l."""
+    s_a = bank.scores(l, metrics.rms_normalise(x_a.to(bank.device), eps))
+    s_b = bank.scores(l, metrics.rms_normalise(x_b.to(bank.device), eps))
+    la, lb = metrics.log_distribution(s_a, beta), metrics.log_distribution(s_b, beta)
+    out = {"norm_entropy": (metrics.norm_entropy(la) - metrics.norm_entropy(lb)).abs(),
+           "energy": (metrics.energy(s_a, beta) - metrics.energy(s_b, beta)).abs(),
+           "js": metrics.js_divergence(la, lb)}
+    return {k: v.cpu().numpy() for k, v in out.items()}
+
+
+def noise_to_signal(noise: dict, signal: dict) -> dict:
+    """noise[metric][l], signal[metric][l]: lists of per-question arrays.
+    sigma_l = std over (response positions x questions) of the metric at beta*;
+    ratio = p99(|delta|) / sigma_l (the PASS statistic) and max(|delta|) / sigma_l
+    (reported apart). sigma_l = 0 gives ratio 0 when the noise is 0, else inf."""
+    def ratio(x, sd):
+        return 0.0 if x == 0 else (float("inf") if sd == 0 else x / sd)
+
+    per_layer, worst_p99, worst_max, where = [], 0.0, 0.0, None
+    for l in range(len(next(iter(noise.values())))):
+        row = {"layer": l}
+        for m in noise:
+            st = dist_stats(noise[m][l])
+            sig = np.concatenate([np.ravel(x) for x in signal[m][l]]) if signal[m][l] else np.zeros(0)
+            sd = float(np.std(sig)) if sig.size > 1 else 0.0
+            rp, rm = ratio(st["p99"] or 0.0, sd), ratio(st["max"] or 0.0, sd)
+            row[m] = st | {"sigma": sd, "ratio_p99": rp, "ratio_max": rm}
+            if rp > worst_p99:
+                worst_p99, where = rp, {"layer": l, "metric": m}
+            worst_max = max(worst_max, rm)
+        per_layer.append(row)
+    return {"max_ratio_p99": worst_p99, "max_ratio_max": worst_max, "worst_p99_at": where,
+            "per_layer": per_layer}
+
+
+@torch.inference_mode()
+def check_tf_vs_cache(bundle: ModelBundle, trace) -> tuple[dict, dict]:
+    """Regenerate with the KV cache while recording x at every call. Positions
+    0 .. n_prompt + T_g - 2 are compared with the teacher-forced x (the last
+    generated token is never fed back during generation). Returns the cached
+    residuals per layer ([n_cmp, D], model dtype, CPU) and info (tokens_equal,
+    positions_compared, the first-step logits for the alignment check)."""
     model = bundle.model
     cap = _Capture(model, gate=False)
     ids = torch.tensor([trace.prompt.input_ids], device=bundle.device)
@@ -290,25 +348,92 @@ def check_tf_vs_cache(bundle: ModelBundle, trace) -> tuple[float, dict]:
     finally:
         cap.remove()
     gen = out.sequences[0, ids.shape[1]:].tolist()
-    worst = 0.0
-    n_cmp = 0
-    for l in range(bundle.dims.n_layers):
-        x_cache = torch.cat(cap.x[l], dim=0).float()
-        x_tf = trace.residuals[l][: x_cache.shape[0]].float()
-        n_cmp = x_cache.shape[0]
-        rel = (x_cache - x_tf).norm(dim=-1) / x_tf.norm(dim=-1).clamp_min(1e-30)
-        worst = max(worst, rel.max().item())
-    return worst, {"tokens_equal": gen == trace.gen_ids, "positions_compared": n_cmp,
-                   "first_step_logits": out.logits[0][0].float()}
+    x_cache = {l: torch.cat(cap.x[l], dim=0).cpu() for l in range(bundle.dims.n_layers)}
+    del cap
+    return x_cache, {"tokens_equal": gen == trace.gen_ids, "positions_compared": x_cache[0].shape[0],
+                     "first_step_logits": out.logits[0][0].float()}
 
 
 def tf_cache_tolerance(dtype: str) -> float:
-    """KV-cached and full-sequence attention use different kernels and
-    reduction orders; in float32 the difference stays ~1e-6 relative (1e-4
-    allows for depth). In bfloat16 it is PROVISIONAL and EMPIRICAL (5e-2):
-    rounding differences compound over layers; the decisive criterion is that
-    the tokens agree. Revisit after the first cluster run (report shows the max)."""
+    """INFORMATIVE threshold on ||x_cache - x_tf|| / ||x_tf|| (not the PASS
+    criterion since step 9). KV-cached and full-sequence attention use different
+    kernels and reduction orders; in float32 the difference stays ~1e-6 relative
+    (1e-4 allows for depth); in bfloat16 rounding differences compound over
+    layers (pilot: 0.09 at Qwen2.5-3B). PASS is decided on the traces: see
+    noise_to_signal."""
     return 1e-4 if dtype == "float32" else 5e-2
+
+
+def load_fp32_model(cfg: RunConfig, device: torch.device):
+    """A separate float32 instance of the same checkpoint (local cache)."""
+    from energy_llm.core.model import load_model
+
+    model, _ = load_model(cfg.model.id, cfg.model.revision, device=str(device), dtype=torch.float32)
+    model.eval()
+    return model
+
+
+@torch.inference_mode()
+def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[dict],
+                   beta: float, signal: dict) -> dict:
+    """Recompute x with a float32 model on the same tokens (one teacher-forced
+    pass per question) and compare the bf16 residuals with it, per layer:
+    d(x_tf, x_fp32) at every position, d(x_cache, x_fp32) at the cached
+    positions, and both propagated to the traces at beta (noise_to_signal).
+    The float32 instance is loaded separately from the cache (never an in-place
+    cast of the production model) and freed afterwards; a float32 bundle (tests)
+    is its own reference. Full float32 matmul precision is forced during the
+    check (no TF32) and restored after."""
+    from energy_llm.core.model import release_cuda
+
+    prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    separate = bundle.dtype != "float32"
+    x32 = []
+    try:
+        model = load_fp32_model(cfg, bundle.device) if separate else bundle.model
+        for rec in saved:
+            cap = _Capture(model, gate=False)
+            try:
+                model(input_ids=torch.tensor([rec["ids"]], device=bundle.device), use_cache=False,
+                      logits_to_keep=1)
+            finally:
+                cap.remove()
+            x32.append({l: v[0].float().cpu() for l, v in cap.x.items()})
+            del cap
+        if separate:
+            del model
+            release_cuda()
+    finally:
+        torch.set_float32_matmul_precision(prev[0])
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prev[1], prev[2]
+
+    L, eps = bundle.dims.n_layers, bundle.dims.rms_norm_eps
+    d_tf = [[] for _ in range(L)]
+    d_cache = [[] for _ in range(L)]
+    n_tf = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    n_cache = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    for rec, x in zip(saved, x32):
+        for l in range(L):
+            n = rec["x_cache"][l].shape[0]
+            d_tf[l].append(rel_err(rec["x_tf"][l], x[l]))
+            d_cache[l].append(rel_err(rec["x_cache"][l], x[l][:n]))
+            for m, v in propagate(bank, eps, l, rec["x_tf"][l], x[l], beta).items():
+                n_tf[m][l].append(v)
+            for m, v in propagate(bank, eps, l, rec["x_cache"][l], x[l][:n], beta).items():
+                n_cache[m][l].append(v)
+    return {
+        "separate_fp32_instance": separate,
+        "precision": {"float32_matmul_precision": "highest", "cuda_matmul_allow_tf32": False,
+                      "cudnn_allow_tf32": False, "restored_after": True},
+        "x_rel_tf_vs_fp32": [dist_stats(d) for d in d_tf],
+        "x_rel_cache_vs_fp32": [dist_stats(d) for d in d_cache],
+        "traces_tf_vs_fp32": noise_to_signal(n_tf, signal),
+        "traces_cache_vs_fp32": noise_to_signal(n_cache, signal),
+    }
 
 
 class PermutedBank(Bank):
@@ -350,12 +475,19 @@ def _read_outputs(ext_dir: Path, item_id: str):
     return tr, hid, ans
 
 
+TF_MAX_NOISE_RATIO = 0.1     # default PASS threshold of tf_vs_cache (p99 noise / sigma)
+
+
 def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 4,
                ref_layers: list[int] | None = None, ref_n: int = 2,
-               name: str | None = None) -> dict:
+               name: str | None = None, tf_max_noise_ratio: float = TF_MAX_NOISE_RATIO,
+               fp32_check: bool = True) -> dict:
     """``ref_n`` questions x ``ref_layers`` go through the float64 reference
     (~75 s per layer and question at Qwen2.5-3B size on one CPU core); every
-    other check runs on all ``n`` questions and all layers."""
+    other check runs on all ``n`` questions and all layers. ``tf_max_noise_ratio``
+    is the tf_vs_cache PASS threshold; ``fp32_check`` runs fp32_reference."""
+    from energy_llm.core.prompting import ROLE_NAMES
+
     from energy_llm.pipeline.smoke import run_single_process
 
     started = time.time()
@@ -382,6 +514,13 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     acc = {key: [] for key in ("reference", "gate", "gate_ctrl", "tf_cache", "align",
                                "hidden", "files", "perm", "limits", "monotone", "self", "det_tokens")}
     ref_details = []
+    # tf_vs_cache: x relative error per layer, its argmax location, the error
+    # propagated to the traces at beta* (noise) and the trace spread (signal)
+    x_rel = [[] for _ in range(L)]
+    x_worst = {"value": -1.0}
+    tf_noise = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    tf_signal = {m: [[] for _ in range(L)] for m in PROPAGATED}
+    saved = []                                   # residuals kept for fp32_reference
     try:
         for qi, it in enumerate(sel):
             prompt = build_prompt(bundle.tokenizer, cfg.prompt.system, it.question, cfg.prompt.date_string)
@@ -408,8 +547,28 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
             acc["gate_ctrl"].append(ctrl)
 
             # (b) teacher forcing vs cached generation; (c) alignment
-            tf_err, info = check_tf_vs_cache(bundle, trace)
-            acc["tf_cache"].append((tf_err, info["tokens_equal"]))
+            x_cache, info = check_tf_vs_cache(bundle, trace)
+            n_cmp = info["positions_compared"]
+            roles_all = trace.roles
+            resp = trace.response_positions
+            for l in range(L):
+                x_tf = trace.residuals[l][:n_cmp]
+                rel = rel_err(x_cache[l], x_tf)
+                x_rel[l].append(rel)
+                j = int(rel.argmax())
+                if rel[j] > x_worst["value"]:
+                    x_worst = {"value": float(rel[j]), "id": it.id, "layer": l, "position": j,
+                               "role": ROLE_NAMES[roles_all[j]]}
+                for m, v in propagate(bank, bundle.dims.rms_norm_eps, l, x_cache[l], x_tf,
+                                      beta_star).items():
+                    tf_noise[m][l].append(v)
+                for m, ds_name in PROPAGATED.items():
+                    tf_signal[m][l].append(prod.traces[ds_name][l, resp, -1])
+            acc["tf_cache"].append((max(float(np.max(r[-1])) for r in x_rel), info["tokens_equal"]))
+            if fp32_check:
+                saved.append({"ids": trace.prompt.input_ids + trace.gen_ids, "x_cache": x_cache,
+                              "x_tf": {l: v.cpu() for l, v in trace.residuals.items()}})
+            del x_cache
             full = torch.tensor([trace.prompt.input_ids + trace.gen_ids], device=bundle.device)
             with torch.inference_mode():
                 tf_logits = bundle.model(input_ids=full, use_cache=False,
@@ -499,6 +658,11 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
     finally:
         hooks.remove()
 
+    tf_ns = noise_to_signal(tf_noise, tf_signal)
+    tokens_equal = all(t for _, t in acc["tf_cache"])
+    fp32 = fp32_reference(cfg, bundle, bank, saved, beta_star, tf_signal) if fp32_check else None
+    del saved
+
     self_tol = self_divergence_tolerance(bundle.dims.d_ff)
     checks = [
         Check("reference", _status(all(ok for _, ok in acc["reference"])),
@@ -511,11 +675,25 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
               max(acc["gate"]), gtol,
               {"no_gamma_control_min_error": min(acc["gate_ctrl"]),
                "control_must_exceed": 10 * gtol, "model_dtype": bundle.dtype}),
-        Check("tf_vs_cache", _status(max(e for e, _ in acc["tf_cache"]) <= tf_cache_tolerance(bundle.dtype)
-                                     and all(t for _, t in acc["tf_cache"])),
-              max(e for e, _ in acc["tf_cache"]), tf_cache_tolerance(bundle.dtype),
-              {"metric": "max ||x_cache - x_tf|| / ||x_tf||", "tokens_equal": all(t for _, t in acc["tf_cache"]),
-               "provisional": bundle.dtype != "float32"}),
+        Check("tf_vs_cache", _status(tf_ns["max_ratio_p99"] <= tf_max_noise_ratio and tokens_equal),
+              tf_ns["max_ratio_p99"], tf_max_noise_ratio,
+              {"metric": "max over layers and traces of p99(|delta|) / sigma_l at beta*: delta = "
+                         "|H_bar|, |E| and JS(p_cache, p_tf) differences over the compared positions; "
+                         "sigma_l = std over (response positions x questions) of norm_entropy, "
+                         "energy, js/question_last at beta*",
+               "tokens_equal": tokens_equal,
+               "max_ratio_max": tf_ns["max_ratio_max"], "worst_p99_at": tf_ns["worst_p99_at"],
+               "per_layer": tf_ns["per_layer"],
+               "x_rel_informative": {"metric": "||x_cache - x_tf|| / ||x_tf||",
+                                     "threshold": tf_cache_tolerance(bundle.dtype),
+                                     "max": x_worst["value"],
+                                     "within_threshold": x_worst["value"] <= tf_cache_tolerance(bundle.dtype),
+                                     "max_at": {k: v for k, v in x_worst.items() if k != "value"},
+                                     "per_layer": [dist_stats(r) for r in x_rel]}}),
+        (Check("fp32_reference", "INFO", fp32["traces_tf_vs_fp32"]["max_ratio_p99"], None,
+               fp32 | {"max_error_is": "p99 noise / sigma of the TF bf16 traces vs float32 (informative)"})
+         if fp32 is not None else
+         Check("fp32_reference", "SKIP", None, None, {"reason": "disabled (--no-fp32-reference)"})),
         Check("alignment", _status(all(ok for ok, _, _ in acc["align"])),
               max(d for _, _, d in acc["align"]), None,
               {"per_question": [a for _, a, _ in acc["align"]],
@@ -554,6 +732,8 @@ def run_verify(cfg: RunConfig, bundle: ModelBundle, items: list[Item], n: int = 
                   "device": str(bundle.device)},
         "beta_star": beta_star,
         "n_questions": len(sel),
+        "options": {"n": n, "reference_n": ref_n, "reference_layers": ref_layers,
+                    "tf_max_noise_ratio": tf_max_noise_ratio, "fp32_reference": fp32_check},
         "elapsed_s": round(time.time() - started, 1),
         "passed": all(c.status != "FAIL" for c in checks),
         "checks": [asdict(c) for c in checks],
@@ -597,6 +777,12 @@ def format_report(r: dict) -> str:
     for c in r["checks"]:
         fmt = lambda v: "-" if v is None else f"{v:.3e}"
         lines.append(f"  {c['name']:<17} {c['status']:<6} {fmt(c['max_error']):>12} {fmt(c['tolerance']):>12}")
+    for c in r["checks"]:
+        if c["name"] == "tf_vs_cache":
+            xi = c["detail"]["x_rel_informative"]
+            lines.append(f"  tf_vs_cache: max ratio (max) {c['detail']['max_ratio_max']:.3e} at worst p99 "
+                         f"{c['detail']['worst_p99_at']}; x rel max {xi['max']:.3e} at {xi['max_at']}")
+    lines.append(f"  options: {r.get('options')}")
     lines.append(f"  => {'ALL PASS' if r['passed'] else 'FAILURES'}   report: "
                  f"{r['extraction_dir']}/verify_report.json")
     return "\n".join(lines)

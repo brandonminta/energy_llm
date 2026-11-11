@@ -302,7 +302,36 @@ def test_smoke_summary(calibrated, capsys):
     assert "TF == greedy" in text and "layer   0" in text
     assert s["tf_disagreements"]["n"] == 0 and s["tf_disagreements"]["all_below_delta"] is True
     assert "TF/greedy disagreements 0" in text
-    assert "ablation" in text and "gamma zeroed" in text
+    assert "ablation top_gamma_zeroed" in text and "ablation dstar_zeroed" in text
+    assert "without layer 0" in text and "beta_l" in text and "re-matched beta" in text
+    L = bundle.dims.n_layers
+    assert len(s["per_layer"]) == L
+    for r in s["per_layer"]:
+        assert 0 <= r["dstar"] < bundle.dims.d_model and 0 < r["dstar_share"] <= 1
+        assert set(r["delta_norm_entropy"]) == {"intact", "top_gamma_zeroed", "dstar_zeroed"}
+        assert set(r["criteria"]) == {"criterion3_xhat_prompt_last_median_gt_0.5",
+                                      "criterion4_gamma_fraction_gt_0.5_or_sign_flip",
+                                      "gamma_ablation_sign_flip"}
+    first = s["bands_excluding_layer0"][0]          # None when the first third is layer 0 alone
+    assert first is None if s["bands"][0]["layers"] == [0, 0] else first["layers"][0] == 1
+    assert s["bands_excluding_layer0"][1:] == s["bands"][1:]
+    # re-matched beta: the ablated bank's mean H_bar(prompt_last) returns to the intact value
+    ab = s["ablation_betas"]
+    assert ab["beta_matched"]["intact"] == rec["beta_star"]
+    for k in ("top_gamma_zeroed", "dstar_zeroed"):
+        bm = ab["beta_matched"][k]
+        assert bm is None or bm > 0
+        blk = s["bands"][0]["ablation"][k]
+        assert (blk["beta_matched"] is None) == (bm is None)
+    # intact at the re-matched beta is intact at beta*
+    assert s["bands"][0]["ablation"]["intact"]["beta_matched"] == s["bands"][0]["ablation"]["intact"]["beta_star"]
+    bl = s["beta_per_layer"]
+    assert len(bl["per_layer"]) == L and bl["target"] == rec["target_norm_entropy"]
+    assert bl["min"] is None or bl["min"] <= bl["max"]
+    pl = s["prompt_last_entropy"]
+    assert pl["target_band"] == pytest.approx([rec["target_norm_entropy"] - 0.05, rec["target_norm_entropy"] + 0.05])
+    lo, hi = pl["calibration_bracket"]
+    assert lo <= hi and pl["in_calibration_bracket"] == (lo <= pl["mean_h_prompt_last_beta_star"] <= hi)
     L = bundle.dims.n_layers
     assert len(s["bands"]) == 3 and s["bands"][0]["layers"][0] == 0 and s["bands"][-1]["layers"][1] == L - 1
     # the intact branch of the ablation equals the production traces (float16 storage)
@@ -319,7 +348,7 @@ def test_smoke_summary(calibrated, capsys):
         want = np.mean(np.asarray(deltas)[:, lo:hi + 1])
         got = b["delta_norm_entropy_response_minus_prompt_last"]
         assert got["intact"] == pytest.approx(want, abs=2e-3)
-        assert np.isfinite(got["top_gamma_zeroed"])
+        assert np.isfinite(got["top_gamma_zeroed"]) and np.isfinite(got["dstar_zeroed"])
         assert 0.0 <= b["gamma_top_fraction"] <= 1.0
         for r in ("question_last", "prompt_last", "response_first"):
             x = b["xhat_top1_frac"][r]

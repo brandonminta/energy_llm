@@ -323,10 +323,15 @@ Check:
 - mean H̄ per layer at β\*: not saturated (not ≈ 0 or ≈ 1 in most layers);
 - peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
 - empty / truncated counts: plausible for short factual answers;
-- per layer band: `xhat_top1_frac` median/max at the three references,
-  `var_score` prompt vs response, γ top-5 fraction, and the ablation line
-  (mean `H̄(response) − H̄(prompt_last)` with the top-5 γ dims zeroed vs
-  intact).
+- TF/greedy disagreements: each with its margins; `all margins < delta`
+  should be True (a disagreement above δ is not a numerical near-tie);
+- mean `H̄(prompt_last)` at β\* against the 0.55 ± 0.05 band and the
+  calibration bracket; β_ℓ min/max over layers;
+- per band (and per band without layer 0): `xhat_top1_frac` median/max at
+  the three references, `var_score` prompt vs response, γ top-5 fraction,
+  criteria 3 and 4, and the ablations (top-5 γ dims, outlier dim d\*):
+  `ΔH̄` and JS at β\* and at the re-matched β;
+- per layer: d\* and its share, γ fraction, `ΔH̄` intact / γ / d\*, β_ℓ.
 
 #### 6. Manual alignment review: 3 questions per model
 

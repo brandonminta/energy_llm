@@ -502,15 +502,34 @@ median s per item` (a 2 h target inside the 3 h walltime).
   (`smoke.tf_disagreements`; the step-0 maximum is reported as information), max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
   truncated counts, per layer the mean over ids of `H̄` at β\* (last
   β column) read from `traces.h5` (prompt = last prompt token | response = each id's mean over
-  its response positions, empty responses skipped), and per layer band
-  (early / middle / late thirds): median and max `xhat_top1_frac` at the
-  three reference positions; mean `var_score` at β\* over prompt tokens vs
-  response tokens; the mean γ top-5 fraction (`gamma_diagnostic`); and the
-  **ablation line** — mean over ids of `H̄(response mean) − H̄(prompt_last)`
-  at β\* with the bank intact vs with the top-5 `|γ|` dimensions zeroed (row
-  norms of the ablated `W̃` recomputed), from residuals captured afresh for
-  the smoke questions (a second `forward_item` per question; report only, no
-  production output involved). Output name
+  its response positions, empty responses skipped), and the report-only
+  diagnostics of `smoke.retrieval_diagnostics`, from residuals captured
+  afresh for the smoke questions (a second `forward_item` per question, kept
+  on CPU; no production output involved):
+  - per layer and per band — thirds, and the same thirds **without layer 0**
+    (`bands_excluding_layer0`; None when a third is layer 0 alone): median
+    and max `xhat_top1_frac` at the three references; mean `var_score` at β\*
+    over prompt vs response tokens; the γ top-5 fraction; the pilot
+    **criteria 3** (median `xhat_top1_frac` at `prompt_last` > 0.5) and
+    **4** (γ top-5 fraction > 0.5, or `ΔH̄` changes sign under the γ
+    ablation);
+  - **d\***: per layer the most frequent `argmax_j |x̂_j|` over every position
+    of every smoke question, and its share of positions;
+  - **ablations** (`zeroed_gamma_bank`: γ zeroed on the given dims, row norms
+    of the ablated `W̃` recomputed) of the top-5 `|γ|` dims and of d\*: mean
+    `ΔH̄ = H̄(response mean) − H̄(prompt_last)` and the response mean of JS to
+    `question_last` / `prompt_last`, at β\* and at the **re-matched β** — the
+    β at which the ablated bank's mean `H̄(prompt_last)` over ids and layers
+    returns to its intact value at β\*, interpolated in log β on the
+    calibration grid (None if not bracketed);
+  - **β_ℓ** per layer: `H̄_ℓ(β_ℓ) = target` (mean over ids of the mean over
+    the calibration positions), interpolated on the calibration grid; min,
+    max, their layers, unbracketed count;
+  - mean `H̄(prompt_last)` at β\* against `target ± 0.05` and against the
+    calibration bracket (`beta_star.json` curve at the grid points around
+    β\*).
+
+  Output name
   `smoke-<UTC time>`, report `smoke_report.json`. CLI exit 1 if any id
   failed or a signal stopped it.
 - **verify** (`verification/verify.py`): runs the same single-process path

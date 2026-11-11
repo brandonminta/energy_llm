@@ -48,7 +48,7 @@ def test_rel_err_and_propagate_accept_mixed_devices():
     np.testing.assert_array_equal(rel_err(a, b.cuda().bfloat16().float()), rel_err(a, b.bfloat16().float()))
     w = torch.randn(16, 8, generator=g)
     bank = Bank(gate_weights=[w.cuda()], gamma=[torch.ones(8, device="cuda")],
-                row_norms=[w.norm(dim=1).cuda()], d_model=8)
+                key_norms=[w.norm(dim=1).cuda()], row_norms=[w.norm(dim=1).cuda()], d_model=8)
     out = propagate(bank, 1e-6, 0, a, b.cuda(), 3.0)
     assert set(out) == {"norm_entropy", "energy", "js"} and all(v.dtype == np.float64 for v in out.values())
 

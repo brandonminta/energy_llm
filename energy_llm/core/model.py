@@ -47,6 +47,36 @@ def decoder_layers(model: nn.Module) -> nn.ModuleList:
         ) from None
 
 
+# Architecture adapter: the RMSNorm in front of the gated FFN, per
+# ``config.model_type``. Its INPUT is the read point (the residual x) and its
+# effective gain is the vector x_hat is multiplied by: RMSNorm(x) = x_hat * gain.
+# Scope: pre-RMSNorm decoders with a gated, dense FFN (overview §3).
+_FFN_NORM = {"qwen2": "post_attention_layernorm", "llama": "post_attention_layernorm"}
+
+
+def _arch(model: nn.Module) -> str:
+    mt = str(getattr(model.config, "model_type", ""))
+    if mt in _FFN_NORM:
+        return mt
+    if mt.startswith("gemma"):
+        raise NotImplementedError(
+            f"{mt}: not implemented. GemmaRMSNorm scales by (1 + weight), so the effective "
+            "gain would be 1 + gamma, and Gemma 2/3 put the FFN read point at "
+            "pre_feedforward_layernorm (post_attention_layernorm normalises the attention "
+            "output); neither is implemented nor tested")
+    raise ValueError(f"unsupported architecture {mt!r}: supported {sorted(_FFN_NORM)}")
+
+
+def ffn_norm(model: nn.Module, layer: nn.Module) -> nn.Module:
+    """The norm whose input is the FFN read point of ``layer``."""
+    return getattr(layer, _FFN_NORM[_arch(model)])
+
+
+def effective_gain(model: nn.Module, layer: nn.Module) -> torch.Tensor:
+    """float32 [D] gain of the FFN norm: gamma = weight for Qwen2 / Llama."""
+    return ffn_norm(model, layer).weight.detach().float()
+
+
 def model_dims(model: nn.Module) -> ModelDims:
     cfg = model.config
     dims = ModelDims(
@@ -62,9 +92,9 @@ def model_dims(model: nn.Module) -> ModelDims:
         w = layer.mlp.gate_proj.weight
         if tuple(w.shape) != (dims.d_ff, dims.d_model):
             raise ValueError(f"layer {l}: gate_proj.weight {tuple(w.shape)} != (D_ff, D)")
-        norm = layer.post_attention_layernorm
+        norm = ffn_norm(model, layer)
         if tuple(norm.weight.shape) != (dims.d_model,):
-            raise ValueError(f"layer {l}: post_attention_layernorm.weight is not [D]")
+            raise ValueError(f"layer {l}: FFN norm weight is not [D]")
         eps = getattr(norm, "variance_epsilon", None)
         if eps is not None and float(eps) != dims.rms_norm_eps:
             raise ValueError(f"layer {l}: norm eps {eps} != config rms_norm_eps")

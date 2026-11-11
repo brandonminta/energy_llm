@@ -97,7 +97,8 @@ def zeroed_gamma_bank(bank: Bank, dims_per_layer) -> Bank:
         norms.append(torch.linalg.vector_norm(w * g0, dim=1))
         del w
         gammas.append(g0)
-    return Bank(gate_weights=bank.gate_weights, gamma=gammas, row_norms=norms, d_model=bank.d_model)
+    return Bank(gate_weights=bank.gate_weights, gamma=gammas, key_norms=bank.key_norms,
+                row_norms=norms, d_model=bank.d_model)
 
 
 def interp_beta(grid, curve, target) -> float | None:

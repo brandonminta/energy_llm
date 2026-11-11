@@ -71,8 +71,8 @@ def ensure_bank_record(cfg: RunConfig, bank, bundle: ModelBundle) -> None:
         "model_id": cfg.model.id, "revision": cfg.model.revision,
         "n_layers": d.n_layers, "d_model": d.d_model, "d_ff": d.d_ff,
         "rms_norm_eps": d.rms_norm_eps,
-        "definition": "W_tilde = gate_proj.weight * post_attention_layernorm.weight "
-                      "(column-wise); row_norms = ||W_tilde_i||",
+        "definition": "gamma = effective gain of the FFN norm; W_tilde = gate_proj.weight * gamma "
+                      "(column-wise); key_norms = ||gate_proj.weight_i||, row_norms = ||W_tilde_i||",
         "gamma_top_k": diag["k"],
         "gamma_top_indices": np.asarray(diag["indices"], dtype=np.int64),   # [L, k]
         "gamma_top_fraction": np.asarray(diag["fraction"], dtype=np.float64),  # [L]

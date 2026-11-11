@@ -9,8 +9,8 @@ residual hooks, and every per-layer metric.
    logits must reproduce the greedy tokens; any mismatch is recorded with the
    top1 - top2 logit margin in both passes, and per generated step the
    max |logit_gen - logit_tf| (the TF/decoding discrepancy) is kept.
-3. A forward pre-hook on every ``post_attention_layernorm`` reads the
-   residual x at its INPUT. x_hat, scores and all metrics are float32.
+3. A forward pre-hook on every layer's FFN norm (``core.model.ffn_norm``:
+   ``post_attention_layernorm`` in Qwen2 / Llama) reads the residual x at its INPUT. x_hat, scores and all metrics are float32.
 4. Per layer (layers never mixed), per-token traces over every position
    (prompt and response; the role mask separates them downstream) at every
    beta of the grid (beta* last). No aggregation over tokens: that is
@@ -33,7 +33,7 @@ import torch
 
 from energy_llm.core import metrics
 from energy_llm.core.bank import Bank
-from energy_llm.core.model import ModelBundle, decoder_layers
+from energy_llm.core.model import ModelBundle, decoder_layers, ffn_norm
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, ROLE_TEMPLATE, Prompt, PromptError
 
 FP16_MAX = float(np.finfo(np.float16).max)
@@ -49,14 +49,14 @@ class NonFiniteError(RuntimeError):
 # ----------------------------------------------------------------------
 
 class ResidualHooks:
-    """Forward pre-hooks on each layer's post_attention_layernorm. They only
+    """Forward pre-hooks on each layer's FFN norm (``ffn_norm``). They only
     copy the input tensor; the computation graph is untouched."""
 
     def __init__(self, model):
         self.enabled = False
         self.x: dict[int, torch.Tensor] = {}
         self._handles = [
-            layer.post_attention_layernorm.register_forward_pre_hook(
+            ffn_norm(model, layer).register_forward_pre_hook(
                 self._make_hook(l), with_kwargs=True)
             for l, layer in enumerate(decoder_layers(model))
         ]

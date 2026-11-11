@@ -41,7 +41,7 @@ from energy_llm.config import RunConfig
 from energy_llm.core import metrics
 from energy_llm.core.bank import Bank, build_bank
 from energy_llm.core.capture import REFERENCES, ResidualHooks, compute_item, forward_item, norm_entropy_curve
-from energy_llm.core.model import ModelBundle, decoder_layers
+from energy_llm.core.model import ModelBundle, decoder_layers, ffn_norm
 from energy_llm.core.prompting import ROLE_QUESTION, ROLE_RESPONSE, build_prompt
 from energy_llm.pipeline.extract import load_beta_star
 from energy_llm.storage import Item, read_items, sha256_file, write_json_atomic
@@ -237,7 +237,7 @@ class _Capture:
         self.g: dict[int, torch.Tensor] = {}
         self.handles = []
         for l, layer in enumerate(decoder_layers(model)):
-            self.handles.append(layer.post_attention_layernorm.register_forward_pre_hook(
+            self.handles.append(ffn_norm(model, layer).register_forward_pre_hook(
                 lambda m, a, k, l=l: self.x.setdefault(l, []).append(
                     (a[0] if a else k["hidden_states"])[0].detach().clone()), with_kwargs=True))
             if gate:
@@ -457,21 +457,22 @@ def fp32_reference(cfg: RunConfig, bundle: ModelBundle, bank: Bank, saved: list[
 
 
 class PermutedBank(Bank):
-    """Bank whose memories are permuted (rows of W_g and the norms together),
-    computed on the fly: scores come out permuted, nothing else changes."""
+    """Bank whose memories are permuted (rows of W_g and both key norms
+    together), computed on the fly: scores come out permuted, nothing else changes."""
 
     def __init__(self, base: Bank, seed: int = 0):
         g = torch.Generator().manual_seed(seed)
         self.perm = [torch.randperm(n.shape[0], generator=g).to(n.device) for n in base.row_norms]
         super().__init__(gate_weights=base.gate_weights, gamma=base.gamma,
+                         key_norms=[k[p] for k, p in zip(base.key_norms, self.perm)],
                          row_norms=[n[p] for n, p in zip(base.row_norms, self.perm)],
                          d_model=base.d_model)
 
-    def scores(self, l, x_hat):
+    def preactivation(self, l, x_hat):
         w = self.gate_weights[l].detach()[self.perm[l]].float()
-        s = (x_hat * self.gamma[l]) @ w.T
+        z = (x_hat * self.gamma[l]) @ w.T
         del w
-        return s / (self.row_norms[l] * math.sqrt(self.d_model))
+        return z
 
 
 # Safety factor of the permutation tolerances: each term of a reduction also
@@ -486,7 +487,7 @@ def gamma_shuffled_bank(base: Bank, seed: int = 1) -> Bank:
     g = torch.Generator().manual_seed(seed)
     return Bank(gate_weights=base.gate_weights,
                 gamma=[gm[torch.randperm(gm.shape[0], generator=g).to(gm.device)] for gm in base.gamma],
-                row_norms=base.row_norms, d_model=base.d_model)
+                key_norms=base.key_norms, row_norms=base.row_norms, d_model=base.d_model)
 
 
 @torch.inference_mode()

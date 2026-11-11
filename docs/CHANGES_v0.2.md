@@ -277,6 +277,60 @@ Acceptance: `pytest` 148 passed + 1 skipped (CPU); on the cluster `verify`
 and `smoke` re-run on the same config and dev data as jobs 32879/32880,
 bundled with `hpc/pilot_bundle.sh`.
 
+## Step 10: score variants, relative β grid, portability, trace dtype
+
+Pilot evidence (Qwen2.5-3B, A100):
+
+- **Smoke 33014.** The dominant dimension of `x̂` is d\* = 1874, with γ_d\* ≈ 0 in layers 7–11 and 32–34. Under the former score `s_i = cos(γ⊙w_i, x̂)` this gives a position-dependent effective temperature `β·g_t`, `g_t = ‖γ⊙x̂_t‖/√D` (overview §6.0).
+- **Verify 33019.**
+  - TF and cached bf16 states are equally far from float32 in every layer (ratio ≈ 1).
+  - The excess is in layers ≥ 30, with p99 ≈ max.
+  - The `tf_vs_cache` maximum is at position 0, of role template (attention sink).
+  - Large ratios in layers 26–27 come with a small σ_ℓ.
+
+Decisions (Brandon, 2026-11-11):
+
+- Control variant name: `cos_gamma_key`.
+- Exclusion rule:
+  - evaluated at the re-matched β;
+  - bootstrap CI as in C6;
+  - list proposed from `cos_gamma_query` only.
+- `ΔH̄` reported against `prompt_last` and against `question_last`.
+- `tf_vs_cache` must PASS for both variants.
+- Overview §3 and §5 are updated as well.
+- `topk_ids` only for the primary.
+- β\* grid position printed, with a 0.5-decade warning.
+
+| task | change | file(s) |
+|---|---|---|
+| C1 | architecture adapter (`ffn_norm`, `effective_gain`: Qwen2/Llama; Gemma `NotImplementedError`); one pre-activation per layer serves `cos_gamma_query` `c = z/(‖w‖‖γ⊙x̂‖)` and `cos_gamma_key` `s = z/(‖w̃‖√D)`; `query_gain`; `bank.h5` stores `key_norms`, fingerprint covers them | `core/model.py`, `core/bank.py` |
+| C2 | `extraction.beta_grid_log10_offset {min: -0.7, max: 0.9, num: 9}` (β\*_v·10^o, β\* last); `beta_grid_log10` rejected; `extraction.control_topk_ids_k` (default 0) | `config.py`, `configs/*.yaml` |
+| C3 | one β\* per variant (`beta_star.json: variants`), grid position and `near_edge` (< 0.5 decades), printed by calibrate; extract refuses a record missing a variant | `pipeline/calibrate.py`, `pipeline/extract.py`, `cli.py` |
+| C4 | traces of both variants (`<variant>/<name>`), `query_gain` and `xhat_top1_frac` once; item files and `traces.h5` per variant group, file attrs per variant; `inspect --variant` | `core/capture.py`, `pipeline/extract.py`, `pipeline/merge.py`, `verification/inspection.py` |
+| C5a/b | `dev/reference.py` computes both variants independently; verify: every bank check per variant (gate `‖w‖‖γ⊙x̂‖c`), `tf_vs_cache` / `fp32_reference` broken down by role and special position with σ_ℓ per layer, PASS on the analysis positions only; precision rule `RECOMMEND trace_dtype=float32` (p99/σ > 0.1) | `dev/reference.py`, `verification/verify.py` |
+| C5c | `model.trace_dtype` (bfloat16 \| float32): bf16 generation, traced TF pass on the trace model; part of the calibration context | `core/model.py`, `core/capture.py`, `cli.py`, `config.py` |
+| C6 | smoke per variant: `H̄`, `ΔH̄` vs `prompt_last` and `question_last`, JS, ablations at β\* and re-matched β; `g_t` distribution by role and band; relative-depth bands; `exclusion_layers` (reported, not applied); β\* grid position; topk_ids saving (MB/question) | `pipeline/smoke.py` |
+| C7 | `pilot_bundle.sh`: the commit is recorded with any git (no `git -C`, `safe.directory`, error shown, `.git/HEAD` fallback) | `hpc/pilot_bundle.sh` |
+| C8 | GPU tests for both variants and for `trace_dtype: float32`; found a missing check, so `prepare_bundle` now requires identical bank weights in the trace model, and the bank is built from it | `tests/test_gpu_verify.py`, `core/model.py` |
+| C9 | this section; overview §3 (and §3.1 scope), §5, §6.0, §6.1, §6.3, §7, §8; ARCHITECTURE §1–§12, §13.1, §13.7, glossary; README; CLAUDE.md | docs |
+
+Criteria **revised after the pilot** (overview §8):
+
+- §8.1 TF vs generation: the PASS set is now the **analysis positions** (response tokens + `question_last`, `prompt_last`, `response_first`).
+  - Before: every compared position.
+  - Reason: the excess comes from position 0 and template tokens, which the analysis never reads.
+  - Template tokens and position 0 are reported apart.
+  - Pre-registered precision rule: p99/σ_ℓ of bf16 vs float32 > 0.1 on the analysis positions → `RECOMMEND trace_dtype=float32`.
+- §8.2 gate: checked for both variants.
+- §8.3 `H̄` band: checked per β\*_v.
+- The extraction β grid is relative to each β\*_v.
+  - Before: an absolute 10⁰…10⁴ grid shared by every model.
+  - Reason: two variants with different β\*.
+
+Acceptance: `pytest` 191 passed + 1 skipped with CUDA (182 + 10 skipped
+without); on the cluster: calibrate in a clean `SCRATCH_ROOT`, then verify
+and smoke, bundled with `hpc/pilot_bundle.sh`.
+
 ## Out of scope (do not implement)
 
 Native energy, participation ratio of native coefficients, `FFN(r)`

@@ -8,8 +8,9 @@ disagree, the code is the fact; Brandon decides what changes.
 
 `energy_llm` is an **extraction module**: per question and per layer it
 computes Modern-Hopfield retrieval metrics from the SwiGLU gate of
-Qwen2.5-3B-Instruct / Llama-3.2-3B-Instruct and writes them to disk indexed
-by `id`. It ends at the metrics — no labelling, judges, probes, CV or
+Qwen2.5-3B-Instruct / Llama-3.2-3B-Instruct, under two score variants
+(`cos_gamma_query` primary, `cos_gamma_key` control), and writes them to disk
+indexed by `id`. It ends at the metrics — no labelling, judges, probes, CV or
 statistics (those live in Brandon's analysis repository; do not add such
 code to the package).
 
@@ -33,14 +34,14 @@ according to his research. Mention them; change them only when asked.
 ```bash
 micromamba activate hopfield-llm   # HPC env name; local dev env: energy-lab
 pip install -r requirements.txt && pip install -e ".[dev]"
-pytest                             # CPU only, ~55 s; tiny random Qwen2 + Llama models
+pytest                             # ~80-115 s; tiny random Qwen2 + Llama models; GPU files skip without CUDA
 # locally, if python is not on PATH:
 micromamba run -n energy-lab python -m pytest -q
 ```
 
-Run the tests after every change; with a CUDA device 155 pass + 1 skipped
-(real tokenizers, opt-in) is the baseline (v2.1.0 + step 9); without CUDA,
-147 pass + 9 skipped (`test_gpu.py`, `test_gpu_verify.py`).
+Run the tests after every change; with a CUDA device 191 pass + 1 skipped
+(real tokenizers, opt-in) is the baseline (v2.1.0 + step 10); without CUDA,
+182 pass + 10 skipped (`test_gpu.py`, `test_gpu_verify.py`).
 
 ## CLI and layout
 
@@ -51,7 +52,7 @@ energy-llm status    --config C --input eval.jsonl --name N [--missing|--num-sha
 energy-llm merge     --config C --input eval.jsonl --name N   -> <out>/extract/N/{manifest.json,*.parquet,*.h5}
 energy-llm smoke     --config C --input eval.jsonl [--n 20]
 energy-llm verify    --config C --input dev/dev_questions.jsonl [--n 4]      (verification only)
-energy-llm inspect   --run <extraction_dir> --id ID                          (verification only)
+energy-llm inspect   --run <extraction_dir> --id ID [--variant V]            (verification only)
 
 energy_llm/   cli.py config.py storage.py manifest.py
   core/         model prompting bank metrics capture      what is computed; never touches output_dir
@@ -72,17 +73,28 @@ pinned). `output_dir` uses `${SCRATCH_ROOT}`, which is mandatory.
 
 - Input JSONL `{id, question}`; every other field is dropped at read time and
   never reaches an output. Everything is indexed by `id`.
-- Hook: forward pre-hook on each layer's `post_attention_layernorm` — the
-  residual x at its INPUT. `x_hat = x/sqrt(mean(x^2)+eps)` with the model's
-  eps, float32.
-- Bank: `W_tilde = gate_proj.weight * post_attention_layernorm.weight`
-  (column-wise), conceptually unit rows — NEVER materialised: only gamma and
-  the row norms are kept (bank.h5); `s = (W_g.float() @ (gamma*x_hat)) /
-  (norms*sqrt(D))`, one layer's W_g in float32 at a time. No CPU-bank
-  fallback. `g_i == ||w_tilde_i|| * sqrt(D) * s_i`.
+- Architecture adapter (`core.model.ffn_norm` / `effective_gain`, by
+  `model_type`): qwen2/llama only (read point `post_attention_layernorm`,
+  gain = its weight gamma); gemma* raises NotImplementedError (gain 1+gamma,
+  `pre_feedforward_layernorm`); others rejected. No fixed layer or dimension
+  index in code or config (smoke bands are thirds of l/L).
+- Hook: forward pre-hook on each layer's FFN norm of `bundle.trace_model` —
+  the residual x at its INPUT. `x_hat = x/sqrt(mean(x^2)+eps)` with the
+  model's eps, float32.
+- Bank: rows w_i of `gate_proj.weight`, gamma, `W_tilde = W_g * gamma`
+  (column-wise) — NEVER materialised: only gamma, `key_norms = ||w_i||` and
+  `row_norms = ||w_tilde_i||` are kept (bank.h5, all in the fingerprint). ONE
+  pre-activation per layer `z = W_g.float() @ (gamma*x_hat)` (one layer's W_g
+  in float32 at a time) serves both variants: `cos_gamma_query` (PRIMARY)
+  `c = z / (||w|| ||gamma*x_hat||)`; `cos_gamma_key` (CONTROL)
+  `s = z / (||w_tilde|| sqrt(D))`. `query_gain g_t = ||gamma*x_hat||/sqrt(D)`;
+  `s = g_t (||w||/||w_tilde||) c`. No CPU-bank fallback.
+  `g_i == ||w_i|| ||gamma*x_hat|| c_i == ||w_tilde_i|| sqrt(D) s_i`.
 - `E = -(1/beta) logsumexp(beta s)` (no quadratic term); `H_bar = H/log(D_ff)`;
   margin = top1-top2. All bank, score, softmax and metric computation is
-  float32.
+  float32. Every trace exists per variant (`<variant>/<name>`);
+  `query_gain` and `xhat_top1_frac` once; `topk_ids` only for the primary
+  unless `extraction.control_topk_ids_k > 0`.
 - Divergences (JS, KL) and topk_mass are computed from LOG-probabilities.
   Never reintroduce p-domain versions (float32 underflow at large beta; old
   bug). JS is pointwise in d = log p - log q (ln2 = softplus(0), xlogy
@@ -101,18 +113,31 @@ pinned). `output_dir` uses `${SCRATCH_ROOT}`, which is mandatory.
   checked against greedy and mismatches recorded (with top1-top2 logit
   margins; smoke criterion: every disagreement has margin < delta).
 - dtype: model must load as bfloat16 (fail otherwise); actual dtype recorded.
-  transformers >= 4.56.
-- Extraction betas: absolute log grid `extraction.beta_grid_log10`
-  (10^0..10^4, 9 points, same for every model since s is a cosine) with
-  beta* appended last; `merge` asserts identical (betas, topk_mass_k,
-  topk_ids_k) across items.
+  `model.trace_dtype` (bfloat16 | float32): generation always in the model
+  dtype; the traced TF pass on `bundle.trace_model` (a second float32
+  instance with exactly the same bank weights when float32; the bank is
+  built from it). Part of the calibration context. transformers >= 4.56.
+- Extraction betas, per variant: grid RELATIVE to beta*_v,
+  `beta*_v * 10^o` for `extraction.beta_grid_log10_offset`
+  ({min: -0.7, max: 0.9, num: 9}), beta*_v appended last; the absolute
+  `beta_grid_log10` is rejected; `merge` asserts identical per-variant
+  (betas, topk_mass_k, topk_ids_k) across items.
 - Gamma diagnostic (top-5 |gamma| dims per layer and their share of
   sum ||w_tilde_i||^2) is report only: bank.h5 attrs + manifest; the
-  ablation lives in the smoke report. No production ablation flag.
-- beta*: one per model, from `calibrate` (warm-up JSONL disjoint from
-  evaluation; last prompt token + response tokens; log grid; fail if not
-  bracketed — never clamp). `extract` never recalibrates and refuses a beta*
-  from another context or overlapping questions.
+  ablations and the layer exclusion rule (first layer + CI-backed gamma
+  ablation sign flips at the re-matched beta, proposed from cos_gamma_query)
+  live in the smoke report and are NEVER applied. No production ablation flag.
+- verify: every bank check for both variants; `tf_vs_cache` PASS only on the
+  analysis positions (response + question_last, prompt_last, response_first),
+  template / position 0 reported apart; precision rule in `fp32_reference`
+  (p99/sigma > 0.1 -> `RECOMMEND trace_dtype=float32`). Comparisons between
+  paths (tf, cache, fp32) on CPU float64 inside the helper (`verify.cpu64`).
+- beta*: one per model AND score variant, from `calibrate` (warm-up JSONL
+  disjoint from evaluation; last prompt token + response tokens; shared log
+  grid; fail if either is not bracketed — never clamp; grid position printed,
+  WARNING within 0.5 decades of an edge). `extract` never recalibrates and
+  refuses a record missing a variant, a beta* from another context or
+  overlapping questions.
 - Robustness: one shard dir per array task; per-id atomic item file, then
   `completed.jsonl`; failures never marked complete — `failed.jsonl`
   (shared schema via `storage.append_failure`), retried up to

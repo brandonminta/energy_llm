@@ -33,8 +33,15 @@ Contents
 input and every decoder layer of a Qwen2/Llama-style model it computes
 Modern-Hopfield retrieval metrics (energy, normalised entropy, margin,
 divergences) from the residual stream that feeds the SwiGLU gate, using the
-gate matrix (with the RMSNorm scale folded in) as the memory bank. It writes
-everything to disk, indexed by question `id`.
+gate matrix as the memory bank, under **two score variants**: the primary
+`cos_gamma_query` (key `w_i` without γ, query `γ ⊙ x̂`) and the control
+`cos_gamma_key` (γ folded into the key, the convention up to v0.2 step 9).
+It writes everything to disk, indexed by question `id`.
+
+Scope (`core.model` adapter): pre-RMSNorm decoders with a gated, dense FFN.
+Implemented and tested: Qwen2 and Llama (`model_type` `qwen2`, `llama`);
+Gemma raises `NotImplementedError` (gain `1 + γ`, read point
+`pre_feedforward_layernorm`); anything else is rejected.
 
 It deliberately **ends at the metrics**. Labelling (judge), probes, cross
 validation and statistics are *not* in the package: they live in Brandon's
@@ -54,9 +61,11 @@ energy_llm/                 the installed package (CLI: energy-llm, python -m en
   storage.py                atomic writes, HDF5 array layout, JSONL logs, failure log, hashing, input items
   manifest.py               provenance: git commit, library versions, hardware, seeds
   core/                     WHAT is computed (no output directory involved)
-    model.py                loading at a pinned revision, dims from the checkpoint, clean greedy config
+    model.py                loading at a pinned revision, architecture adapter (FFN norm, effective
+                            gain), dims from the checkpoint, clean greedy config, trace model
     prompting.py            chat template, single system instruction, per-token role mask
-    bank.py                 the unmaterialised bank: gamma + row norms, on-the-fly cosine scores
+    bank.py                 the unmaterialised bank: gamma + key norms, one pre-activation per
+                            layer, scores of both variants, query gain
     metrics.py              float32 primitives: x_hat, E, log p, H_bar, margin, mean/var score,
                             top-k mass/indices, x_hat top-1 fraction, KL, JS
     capture.py              per question: greedy + teacher forcing + hooks + every metric
@@ -126,8 +135,8 @@ For one item `{id, question}` inside `extract` (the same sequence runs in
 | 1 | `storage.read_items` | JSONL line → `Item(id, question.strip())`; every other field is dropped |
 | 2 | `core.prompting.build_prompt` | official chat template on `[system, user]`, `add_generation_prompt=True`; tokenised with `add_special_tokens=False`; role per token from the offset mapping |
 | 3 | `core.capture.forward_item` | `model.generate` with the clean greedy config (hooks disabled) → `gen_ids`, per-token log-prob and entropy from the decoding logits (float32), `truncated`, `stop_token_id`, `response_positions` |
-| 4 | same | one teacher-forced forward pass over `prompt ++ gen_ids` with `use_cache=False`, hooks **enabled** → residual `x` per layer `[T, D]` (model dtype); argmax of its logits compared with `gen_ids` → `tf_mismatch_positions` |
-| 5 | `core.capture.compute_item` | per layer: `x̂`, scores `s` `[T, D_ff]`, per-token traces at every β of the grid (β\* last) with divergences to three reference positions, hidden states, `answer` and `baselines` dicts, finiteness checks |
+| 4 | same | one teacher-forced forward pass over `prompt ++ gen_ids` with `use_cache=False` on `bundle.trace_model` (the same module unless `model.trace_dtype: float32`), hooks **enabled** → residual `x` per layer `[T, D]` (trace dtype); argmax of its logits compared with `gen_ids` → `tf_mismatch_positions` |
+| 5 | `core.capture.compute_item` | per layer: `x̂`, one pre-activation `z [T, D_ff]`, the scores of both variants, `query_gain`; per variant the per-token traces at every β of its grid (β\*_v last) with divergences to three reference positions; hidden states, `answer` and `baselines` dicts, finiteness checks |
 | 6 | `pipeline.extract.write_item` | one HDF5 file per id (tmp + fsync + rename), then one line in `completed.jsonl` |
 | 7 | `pipeline.merge.run_merge` | later, on CPU: every item file in input order → parquet + HDF5 + `manifest.json` |
 
@@ -139,13 +148,27 @@ For one item `{id, question}` inside `extract` (the same sequence runs in
   then `.to(device)`; `device: auto` → cuda if available else cpu. The
   tokenizer must be a *fast* tokenizer (offset mapping is needed for the
   role mask). With `HF_HUB_OFFLINE=1` only the local cache is read.
+- **Architecture adapter** (`ffn_norm`, `effective_gain`, keyed by
+  `config.model_type`): the norm whose *input* is the read point and the
+  vector `x̂` is multiplied by. `qwen2`, `llama`: `post_attention_layernorm`,
+  gain = its weight γ. `gemma*`: `NotImplementedError` (GemmaRMSNorm scales
+  by `1 + weight`; Gemma 2/3 read before `pre_feedforward_layernorm`). Other
+  types: `ValueError`. Hooks (`ResidualHooks`, verify's `_Capture`),
+  `model_dims` and `build_bank` go through it.
 - `prepare_bundle`: `model.eval()`, gradients off, **fails unless the
   parameters are bfloat16** (`require_bf16=True` in the CLI; tests pass
   `False`). Reads `ModelDims(L, D, D_ff, rms_norm_eps)` from `model.config`
-  and checks every layer's `gate_proj.weight` is `[D_ff, D]`, every
-  `post_attention_layernorm.weight` is `[D]` and every norm eps equals the
-  config eps. Collects the stop tokens and installs the clean generation
-  config on the model.
+  and checks every layer's `gate_proj.weight` is `[D_ff, D]`, every FFN-norm
+  weight is `[D]` and every norm eps equals the config eps. Collects the stop
+  tokens and installs the clean generation config on the model.
+- **Trace model** (`model.trace_dtype`): `ModelBundle.model` generates;
+  `ModelBundle.trace_model` runs the teacher-forced pass that is traced. With
+  `bfloat16` (default) they are the same module. With `float32` the CLI loads
+  a second, float32 instance of the same checkpoint (`load_model(dtype=float32)`);
+  `prepare_bundle` requires it to be float32, on the same device, with the
+  same dims and **exactly** the same `gate_proj` and FFN-norm weights (a
+  float32 load of a bf16 checkpoint is). The bank is built from the trace
+  model. `trace_dtype` is part of the calibration context and the config hash.
 - `stop_token_ids`: `generation_config.eos_token_id` (int or list, e.g.
   `<|im_end|>` / `<|eot_id|>`) ∪ `tokenizer.eos_token_id`, sorted. Read
   **before** the generation config is replaced.
@@ -204,9 +227,11 @@ For one item `{id, question}` inside `extract` (the same sequence runs in
 
 ### 5.4 Read point (`core/capture.py: ResidualHooks`)
 
-A forward **pre**-hook on every `layer.post_attention_layernorm` copies its
-input, i.e. the residual stream after the attention block and before the
-FFN RMSNorm: `x ∈ R^{T×D}` in the model dtype. The normalised query is
+A forward **pre**-hook on every layer's FFN norm (`ffn_norm`:
+`post_attention_layernorm` in Qwen2 / Llama) of the **trace model** copies
+its input, i.e. the residual stream after the attention block and before the
+FFN RMSNorm: `x ∈ R^{T×D}` in the trace dtype. `forward_item` refuses hooks
+installed on another module. The normalised query is
 computed later in float32 by the extractor itself:
 
     x̂ = x / sqrt(mean_j(x_j²) + eps)          (metrics.rms_normalise, eps = config.rms_norm_eps)
@@ -217,29 +242,38 @@ so `‖x̂‖² = D·ms/(ms+eps)` ≈ D. The maximum relative deviation of
 
 ### 5.5 Bank and scores (`core/bank.py`)
 
-Definition per layer `l`, with `W_g = gate_proj.weight ∈ R^{D_ff×D}` and
-`γ = post_attention_layernorm.weight ∈ R^D`:
+Definition per layer `l`, with `W_g = gate_proj.weight ∈ R^{D_ff×D}` (rows
+`w_i`) and `γ = effective_gain` (the FFN-norm weight in Qwen2 / Llama):
 
-    W̃ = W_g · diag(γ)          (column j scaled by γ_j)
-    bank = rows of W̃ normalised to unit length     — conceptually
+    W̃ = W_g · diag(γ)          (column j scaled by γ_j), rows w̃_i
 
-The bank is **never materialised**. `build_bank` keeps, per layer, a
-reference to the live `gate_proj.weight` (no copy), `γ` in float32 and the
-row norms `‖W̃_i‖` in float32 (computed from a transient float32 `W̃` that
-is freed immediately; an all-zero row raises). Scores for float32 `x̂ [T, D]`:
+The bank is **never materialised**. `build_bank` (from the trace model)
+keeps, per layer, a reference to the live `gate_proj.weight` (no copy), `γ`
+in float32 and two key-norm vectors in float32: `key_norms = ‖w_i‖` and
+`row_norms = ‖w̃_i‖` (from a transient float32 `W_g`, freed immediately; an
+all-zero row raises). One **pre-activation** per layer for float32 `x̂ [T, D]`
+serves both variants (`Bank.preactivation`, only the current layer's `W_g`
+in float32):
 
-    s = ((x̂ ⊙ γ) @ W_g.float().T) / (‖W̃‖ · √D)        [T, D_ff]
+    z = (x̂ ⊙ γ) @ W_g.float().T          [T, D_ff]   = the model's gate pre-activation
 
-converting only the current layer's `W_g` to float32 and deleting it after
-the matmul. Algebraically `s_i = (W̃_i · x̂) / (‖W̃_i‖ √D)` = cosine(W̃_i, x̂)
-up to the ‖x̂‖/√D ≈ 1 factor, so `s ∈ [-1, 1]`. The model's own gate
-pre-activation satisfies `g_i = W_g,i · (γ ⊙ x̂) = ‖W̃_i‖ · √D · s_i`
-(`verify` and `tests/test_bank.py` check this against a real forward pass).
+| variant | `Bank.from_preactivation` | meaning |
+|---|---|---|
+| `cos_gamma_query` (**primary**, `bank.PRIMARY`) | `c = z / (‖w‖ · ‖γ ⊙ x̂‖)` | `cos(w_i, γ ⊙ x̂)`: key without γ, query with γ, an exact cosine in [−1, 1] |
+| `cos_gamma_key` (**control**, `bank.CONTROL`) | `s = z / (‖w̃‖ · √D)` | `cos(w̃_i, x̂) · ‖x̂‖/√D`: γ folded into the key (the convention up to step 9) |
+
+**Query gain** `g_t = ‖γ ⊙ x̂_t‖ / √D` (`Bank.query_gain`). The two variants
+are related by `s_i = g_t · (‖w_i‖/‖w̃_i‖) · c_i`: under `softmax(β s)` the
+control carries a position-dependent effective temperature `β·g_t` and a
+per-memory weight `‖w_i‖/‖w̃_i‖`. The model's gate pre-activation is
+`g_i = ‖w_i‖ · ‖γ ⊙ x̂‖ · c_i = ‖w̃_i‖ · √D · s_i` (`verify: gate` and
+`tests/test_bank.py` check both against a real forward pass).
+`Bank.scores(l, x̂, variant)` = `from_preactivation(preactivation)`.
 
 `bank.h5` (written once by `calibrate`, copied by `merge`) stores only
-`layer_l/gamma [D]`, `layer_l/row_norms [D_ff]` and attrs (model id,
-revision, dims, eps, definition string, `fingerprint` = sha256 of all γ and
-norms, and the γ diagnostic below).
+`layer_l/gamma [D]`, `layer_l/key_norms [D_ff]`, `layer_l/row_norms [D_ff]`
+and attrs (model id, revision, dims, eps, definition string, `fingerprint` =
+sha256 of all γ and both norm vectors, and the γ diagnostic below).
 
 **γ diagnostic** (`gamma_diagnostic(bank, k=5)`, report only): column `j`
 of `W̃` carries `γ_j²·‖W_g[:, j]‖²` of `Σ_i ‖w̃_i‖²`. Per layer it records
@@ -294,36 +328,45 @@ reduction over tokens is done in the module (aggregation is analysis).
   state that emits the first generated token); `response_first` = the first
   response position, `None` for an empty response. Stop tokens never carry
   the question role.
-- β: `betas = ExtractionConfig.betas(β*)` = the absolute log grid
-  `10^min … 10^max` with `num` points (`extraction.beta_grid_log10`,
-  default `{min: 0, max: 4, num: 9}`: half-decade steps, identical across
-  models because `s` is a cosine) **plus β\* appended last**, so
-  `n_beta = num + 1` and `betas[-1] == β*`. The grid is looped inside the
-  layer (one `log_softmax` of `[T, D_ff]` per β).
+- β, **per variant**: `betas[v] = ExtractionConfig.betas(β*_v)` = the grid
+  **relative to that variant's β\***, `β*_v · 10^o` for `num` offsets `o`
+  linearly spaced in `[min, max]` (`extraction.beta_grid_log10_offset`,
+  default `{min: -0.7, max: 0.9, num: 9}`: steps of 0.2 decades), **plus
+  β\*_v appended last**, so `n_beta = num + 1` and `betas[v][-1] == β*_v`
+  (`extract.variant_betas`). The grid is looped inside the layer (one
+  `log_softmax` of `[T, D_ff]` per β and variant).
 
 ### 5.8 Traces, hidden states, baselines
 
 - **Traces** (`ItemResult.traces`, float32 in memory; float16 in the files
   except `topk_ids`), over *all* `T = n_prompt + n_generated` positions
-  (template, instruction, question, response and stop tokens alike), with
-  `p_t = softmax(β s_t)`:
+  (template, instruction, question, response and stop tokens alike). Per
+  score variant `v` ∈ {`cos_gamma_query`, `cos_gamma_key`}, named
+  `<v>/<dataset>`, with that variant's scores `s` and `p_t = softmax(β s_t)`
+  on its own β grid:
 
   | dataset | shape | definition |
   |---|---|---|
-  | `energy` | `[L, T, n_beta]` | `E` |
-  | `norm_entropy` | `[L, T, n_beta]` | `H̄` |
-  | `topk_mass` | `[L, T, n_beta]` | mass of the `extraction.topk_mass_k` largest `p` |
-  | `mean_score`, `var_score` | `[L, T, n_beta]` | `Σ p s`, `Σ p (s - mean)²` |
-  | `margin` | `[L, T]` | top1 − top2 of `s` |
+  | `<v>/energy` | `[L, T, n_beta]` | `E` |
+  | `<v>/norm_entropy` | `[L, T, n_beta]` | `H̄` |
+  | `<v>/topk_mass` | `[L, T, n_beta]` | mass of the `extraction.topk_mass_k` largest `p` |
+  | `<v>/mean_score`, `<v>/var_score` | `[L, T, n_beta]` | `Σ p s`, `Σ p (s - mean)²` |
+  | `<v>/margin` | `[L, T]` | top1 − top2 of `s` |
+  | `<v>/topk_ids` | `[L, T, k_ids]` int32 | indices of the `k_ids` largest `s` (= largest `p` at any β), descending; `k_ids = extraction.topk_ids_k` for the primary, `extraction.control_topk_ids_k` for the control (default 0: **not stored**) |
+  | `<v>/js/<ref>` | `[L, T, n_beta]` | `JS(p_t, p_ref)` |
+  | `<v>/dkl/<ref>` | `[L, T, n_beta]` | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+
+  Independent of the memories, stored once (`capture.SHARED`):
+
+  | dataset | shape | definition |
+  |---|---|---|
+  | `query_gain` | `[L, T]` | `g_t = ‖γ ⊙ x̂_t‖ / √D` |
   | `xhat_top1_frac` | `[L, T]` | `max_j x̂_j² / D` |
-  | `topk_ids` | `[L, T, k_ids]` int32 | indices of the `extraction.topk_ids_k` largest `s` (= largest `p` at any β), descending |
-  | `js/<ref>` | `[L, T, n_beta]` | `JS(p_t, p_ref)` |
-  | `dkl/<ref>` | `[L, T, n_beta]` | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
 
   `<ref>` ∈ {`question_last`, `prompt_last`, `response_first`}. At a
   reference position its own `dkl` and `js` rows are exactly 0 (pointwise
-  forms, one `log_softmax`). Plus
-  `role_mask [T] int8`.
+  forms, one `log_softmax`). Plus `role_mask [T] int8`.
+  `capture.variant_traces(traces, v)` strips the prefix.
 - Not computed anywhere: the un-normalised entropy `H`, pooled
   prompt-span references, any aggregate across layers or tokens.
 - **Hidden states** (`ItemResult.hidden`): for the layers in
@@ -369,9 +412,11 @@ reduction over tokens is done in the module (aggregation is analysis).
 
 - Storage: traces are written as float16 (relative precision 2⁻¹¹ ≈ 5e-4;
   subnormals below 6e-5), `topk_ids` as int32, residuals as float16.
-- Model forward passes: model dtype (bfloat16 in production; float32 in
-  tests). Everything after the hook — `x̂`, scores, softmax, metrics,
-  decoding log-probs — is float32 on the model's device.
+- Model forward passes: generation in the model dtype (bfloat16 in
+  production; float32 in tests), the traced teacher-forced pass in
+  `model.trace_dtype` (default bfloat16; float32 on a second instance).
+  Everything after the hook — `x̂`, scores, softmax, metrics, decoding
+  log-probs — is float32 on the model's device.
 - `manifest.set_determinism(seed)`: seeds `random`, `numpy`, `torch`;
   disables TF32 for matmul and cuDNN; `set_float32_matmul_precision("highest")`.
 - `verify` tolerances are derived in `verification/verify.py`
@@ -386,27 +431,34 @@ Inputs: a warm-up JSONL (must be disjoint from every evaluation set) and the
 ```
 calibration/
   state.json         {input_sha256, context, ids}   refuses a different warm-up/config in the same dir
-  bank.h5            gamma + row norms + gamma diagnostic (section 5.5), written once; later runs must match its fingerprint
-  items/<sha1(id)>.json   one H_bar curve per warm-up question (the unit of resumption)
+  bank.h5            gamma + key norms + row norms + gamma diagnostic (section 5.5), written once; later runs must match its fingerprint
+  items/<sha1(id)>.json   {id, curves: {variant: H_bar curve}, n_positions} per warm-up question (the unit of resumption)
   failed.jsonl       failed attempts (same schema as extract)
   beta_star.json     the record below, written last
 ```
 
 Per warm-up question: full `forward_item` (greedy + teacher forcing), then
-`norm_entropy_curve`: for every β on the grid, `H̄` averaged over **all
-layers** and over the calibration positions = last prompt token + response
-tokens (stop tokens excluded). Questions are then weighted equally
-(`mean_curve = mean over questions`).
+`norm_entropy_curve`: for **each score variant** and every β on the grid,
+`H̄` averaged over **all layers** and over the calibration positions = last
+prompt token + response tokens (stop tokens excluded); one pre-activation
+per layer serves both variants. Questions are then weighted equally
+(`mean_curve[v] = mean over questions`).
 
 Grid: `num_grid` points, log-uniform between `10^log10_beta_min` and
 `10^log10_beta_max` (defaults 10⁰…10⁴, 81 points = 20 per decade).
 
-β\*: `interpolate_log_beta` finds the first consecutive grid pair with
-`curve[i] ≥ target ≥ curve[i+1]` and interpolates linearly in `log β`. If no
-pair brackets the target it raises `CalibrationError` — **never clamps**.
+β\*_v, **one per variant**: `interpolate_log_beta` finds the first
+consecutive grid pair with `curve[i] ≥ target ≥ curve[i+1]` and interpolates
+linearly in `log β`. If no pair brackets the target for either variant it
+raises `CalibrationError` (naming the variant) — **never clamps**.
+`grid_position` records `log10 β*_v`, its distance in decades to each end of
+the grid, the bracketing indices and `near_edge` (< `EDGE_DECADES` = 0.5
+decades); `format_beta_stars` prints one line per variant (calibrate CLI and
+log, smoke summary) with a `WARNING` when near the edge.
 
-`beta_star.json` holds `beta_star`, `target_norm_entropy`, `beta_grid`,
-`mean_norm_entropy_curve`, `n_questions`, `failed_ids`, `warmup_ids`,
+`beta_star.json` holds `primary`, `variants: {v: {beta_star,
+mean_norm_entropy_curve, grid_position}}`, `target_norm_entropy`,
+`beta_grid`, `n_questions`, `failed_ids`, `warmup_ids`,
 `warmup_question_sha256` (sha256 of the whitespace-normalised, lower-cased
 question), `input_path`, `input_sha256`, `context`
 (`RunConfig.calibration_context()`), `bank_fingerprint`, `code`, `created`.
@@ -416,8 +468,10 @@ some question failed fewer than `max_attempts` times) → CLI exit 75 →
 requeue. If `beta_star.json` already exists it returns it without touching
 the model (the CLI even skips loading the model).
 
-`extract` **never** recalibrates. `load_beta_star` refuses the record if
-`context` differs from the current config's calibration context, or if any
+`extract` **never** recalibrates. `load_beta_star` refuses the record if it
+lacks a β\* for either variant (a pre-step-10 record: re-run `calibrate` in a
+new `output_dir`), if `context` differs from the current config's
+calibration context, or if any
 evaluation `id` is in `warmup_ids` or any evaluation question hash is in
 `warmup_question_sha256`.
 
@@ -428,15 +482,16 @@ Layout of `<output_dir>/extract/<name>/` while running:
 ```
 shards/shard_KKKKK/
   shard.json        identity: shard_index, num_shards, ids, input_sha256, config_sha256,
-                    beta_star, bank_fingerprint  — a resume under a different value refuses
-  items/<sha1(id)>.h5   every output of one id (attrs id, betas = grid + [beta*],
-                    topk_mass_k, topk_ids_k, reference_positions [3] in REFERENCES
-                    order, -1 for None; datasets answer_json, baselines_json, role_mask,
-                    traces/<name> (float16; topk_ids int32), hidden/<position> float16;
-                    arrays gzip 4, chunked one layer at a time: storage.write_array)
+                    beta_star {variant: value}, bank_fingerprint  — a resume under a different value refuses
+  items/<sha1(id)>.h5   every output of one id (attrs id, topk_mass_k, reference_positions [3]
+                    in REFERENCES order, -1 for None; datasets answer_json, baselines_json,
+                    role_mask, traces/<variant>/<name> with group attrs betas (grid + [beta*_v])
+                    and topk_ids_k, traces/{query_gain, xhat_top1_frac} (float16; topk_ids
+                    int32), hidden/<position> float16; arrays gzip 4, chunked one layer at a
+                    time: storage.write_array)
   completed.jsonl   {id, key, time} appended only AFTER the item file is fsynced and renamed
   failed.jsonl      one record per failed attempt
-  runs.jsonl        one record per process run: counts, timings, model dtype,
+  runs.jsonl        one record per process run: counts, timings, model and trace dtype,
                     peak GPU memory, hardware, SLURM ids, code commit
 submissions.log     written by hpc/ (array id, merge id, shard list per submission)
 ```
@@ -478,10 +533,10 @@ input order and writes, each atomically, into `<output_dir>/extract/<name>/`:
 |---|---|
 | `answers.parquet` | one row per id: the answer record of 5.8 |
 | `baselines.parquet` | one row per id |
-| `traces.h5` | `/<id>/<dataset>` for every trace of 5.8, `/<id>/role_mask [T]`, gzip 4, chunks `[1, T, …]` (one layer reads alone); group attr `reference_positions [3]` (−1 = none); file attrs `role_codes`, `role_names`, `reference_names`, `beta_star`, `betas` (float64, last = β\*), `topk_mass_k`, `topk_ids_k`, `layout`. `merge` raises if two items disagree on `(betas, topk_mass_k, topk_ids_k)` |
+| `traces.h5` | `/<id>/<variant>/<dataset>` and `/<id>/{query_gain, xhat_top1_frac}` for every trace of 5.8, `/<id>/role_mask [T]`, gzip 4, chunks `[1, T, …]` (one layer reads alone); group attr `reference_positions [3]` (−1 = none); file attrs `variants` (primary first), `primary`, `role_codes`, `role_names`, `reference_names`, `beta_star [n_variants]`, `betas [n_variants, n_beta]` (float64, last column = β\*_v), `topk_mass_k`, `topk_ids_k [n_variants]`, `layout`, all in `variants` order. `merge` raises if two items disagree on the per-variant `(betas, topk_mass_k, topk_ids_k)` |
 | `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last} [L_h, D] float16` (gzip, chunks `[1, D]`); attrs `layers`, `layout` |
 | `bank.h5` | byte copy of `calibration/bank.h5` |
-| `manifest.json` | written last: name, created, full config + `config_sha256`, β\* and the calibration summary, input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`, `max_xhat_top1_frac` per reference position over ids and layers, `gamma_top_fraction_max` = largest top-k γ fraction and its layer), `gamma_diagnostic` (from `bank.h5`), actual model dtypes seen, role names, code commit, library versions, merge host, every shard run record |
+| `manifest.json` | written last: name, created, full config + `config_sha256`, `beta_star {variant: value}` and the calibration summary (`primary`, `beta_grid`, per variant β\* and `grid_position`), input path/sha/count, counts (completed/exhausted/pending), `exhausted_ids` with last error, `incomplete_shards`, checks (`xhat_norm_max_rel_dev` max, `tf_mismatch_ids`, `n_truncated`, `n_empty_response`, `max_xhat_top1_frac` per reference position over ids and layers, `gamma_top_fraction_max` = largest top-k γ fraction and its layer), `gamma_diagnostic` (from `bank.h5`), actual model and trace dtypes seen, role names, code commit, library versions, merge host, every shard run record |
 
 `status_report` (CLI `status`) uses the same shard states and `runs.jsonl`
 records: per-shard counts, `missing_shards`, `exhausted_ids`, and a
@@ -494,55 +549,82 @@ median s per item` (a 2 h target inside the 3 h walltime).
   config, sets `samples_per_shard = len(sel)` (one shard), writes the
   selected items to `<ext_dir>/input.jsonl`, runs `run_extract` for shard 0
   and `run_merge(allow_incomplete=True)` in the same process; `run_smoke`
-  then summarises: counts, dtype, β\*, TF==greedy % of tokens and of
-  answers, the **list of TF/greedy disagreements** (id, step, generated and TF
-  token, margins in both passes) against `δ = max(p99 over the non-divergent
-  generated steps of the smoke of tf_logit_diff, 3 bf16 ulp(|top1 logit|))`
-  with the criterion "every disagreement has max(margin_tf, margin_gen) < δ"
-  (`smoke.tf_disagreements`; the step-0 maximum is reported as information), max `‖x̂‖` deviation, peak GPU memory, s/question, empty and
-  truncated counts, per layer the mean over ids of `H̄` at β\* (last
-  β column) read from `traces.h5` (prompt = last prompt token | response = each id's mean over
-  its response positions, empty responses skipped), and the report-only
+  then summarises: counts, model and trace dtype, **β\* of each variant and
+  its position on the calibration grid** (`format_beta_stars`, WARNING within
+  0.5 decades of an end), TF==greedy % of tokens and of answers, the **list
+  of TF/greedy disagreements** (id, step, generated and TF token, margins in
+  both passes) against `δ = max(p99 over the non-divergent generated steps
+  of the smoke of tf_logit_diff, 3 bf16 ulp(|top1 logit|))` with the
+  criterion "every disagreement has max(margin_tf, margin_gen) < δ"
+  (`smoke.tf_disagreements`; the step-0 maximum is reported as information),
+  max `‖x̂‖` deviation, peak GPU memory, s/question, empty and truncated
+  counts, the **topk_ids storage saved** by not storing them for the control
+  variant (`topk_ids_savings`: MB/question uncompressed `L·T·k·4` bytes, and
+  a gzip estimate from the stored primary `topk_ids`), and the report-only
   diagnostics of `smoke.retrieval_diagnostics`, from residuals captured
   afresh for the smoke questions (a second `forward_item` per question, kept
-  on CPU; no production output involved):
-  - per layer and per band — thirds, and the same thirds **without layer 0**
-    (`bands_excluding_layer0`; None when a third is layer 0 alone): median
-    and max `xhat_top1_frac` at the three references; mean `var_score` at β\*
-    over prompt vs response tokens; the γ top-5 fraction; the pilot
-    **criteria 3** (median `xhat_top1_frac` at `prompt_last` > 0.5) and
-    **4** (γ top-5 fraction > 0.5, or `ΔH̄` changes sign under the γ
-    ablation);
+  on CPU; no production output involved). Bands are **thirds of relative
+  depth** (`depth_bands`: band k holds the layers with `k/3 ≤ ℓ/L < (k+1)/3`),
+  also without the first layer (`bands_excluding_layer0`; None when a third
+  is that layer alone); no layer or dimension index is fixed anywhere.
+  Shared by both variants:
   - **d\***: per layer the most frequent `argmax_j |x̂_j|` over every position
-    of every smoke question, and its share of positions;
-  - **ablations** (`zeroed_gamma_bank`: γ zeroed on the given dims, row norms
-    of the ablated `W̃` recomputed) of the top-5 `|γ|` dims and of d\*: mean
-    `ΔH̄ = H̄(response mean) − H̄(prompt_last)` and the response mean of JS to
-    `question_last` / `prompt_last`, at β\* and at the **re-matched β** — the
-    β at which the ablated bank's mean `H̄(prompt_last)` over ids and layers
-    returns to its intact value at β\*, interpolated in log β on the
-    calibration grid (None if not bracketed);
+    of every smoke question, and its share of positions; the γ top-5
+    fraction; median `xhat_top1_frac` at `prompt_last` (`per_layer_shared`);
+  - **query gain** `g_t` (`query_gain_distribution`): median, p10, p90, min,
+    max at `question_last`, `prompt_last` and the response positions, per
+    layer and per band.
+
+  Per score variant (`variants.<v>`, at β\*_v; `mean_norm_entropy_per_layer`
+  read from `traces.h5`):
+  - per layer and per band: `H̄(prompt_last)`, `ΔH̄` = `H̄(response mean) −
+    H̄(prompt_last)` and `− H̄(question_last)`, JS to `question_last` /
+    `prompt_last` (response mean), median and max `xhat_top1_frac` at the
+    three references, mean `var_score` over prompt vs response tokens, the γ
+    top-5 fraction, the pilot **criteria 3** (median `xhat_top1_frac` at
+    `prompt_last` > 0.5) and **4** (γ top-5 fraction > 0.5, or `ΔH̄` changes
+    sign under the γ ablation);
+  - **ablations** (`zeroed_gamma_bank`: γ zeroed on the given dims, `‖w̃‖`
+    recomputed; `‖w‖` unchanged, so for `cos_gamma_query` the ablation acts
+    on the query `γ ⊙ x̂` only) of the top-5 `|γ|` dims and of d\*: the same
+    `ΔH̄` and JS, at β\*_v and at the **re-matched β** — the β at which the
+    ablated bank's mean `H̄(prompt_last)` over ids and layers returns to its
+    intact value at β\*_v, interpolated in log β on the calibration grid
+    (None if not bracketed);
   - **β_ℓ** per layer: `H̄_ℓ(β_ℓ) = target` (mean over ids of the mean over
     the calibration positions), interpolated on the calibration grid; min,
     max, their layers, unbracketed count;
-  - mean `H̄(prompt_last)` at β\* against `target ± 0.05` and against the
-    calibration bracket (`beta_star.json` curve at the grid points around
-    β\*).
+  - mean `H̄(prompt_last)` at β\*_v against `target ± 0.05` and against the
+    calibration bracket (the variant's `beta_star.json` curve at the grid
+    points around β\*_v);
+  - **layer exclusion** (`exclusion_layers`, report only, **not applied**):
+    the first layer, plus the layers where zeroing the top-5 `|γ|` dims flips
+    the sign of `ΔH̄` (response mean − `prompt_last`) at the **re-matched β**
+    with `|ΔH̄| > 0.02` on both sides **and** both 95 % bootstrap CIs over
+    questions (B = 1000 paired resamples, seed = config `seed`, ids with an
+    empty response dropped) excluding 0 with opposite signs. The same rule at
+    β\*_v is reported but does not count. Computed for both variants; the
+    proposed list (`layer_exclusion.proposed_excluded_layers`) comes from
+    `cos_gamma_query` only.
 
   Output name
   `smoke-<UTC time>`, report `smoke_report.json`. CLI exit 1 if any id
   failed or a signal stopped it.
 - **verify** (`verification/verify.py`): runs the same single-process path
   under `verify-<time>`, then on the first `n` questions runs thirteen checks
-  (table below). Each check reports max observed error and tolerance (status PASS, FAIL, SKIP or INFO); the CLI options (`n`, `reference_n`, `reference_layers`, `tf_max_noise_ratio`, `fp32_reference`) are recorded under `options`;
-  `verify_report.json`; exit 1 on any FAIL. Keeps its own minimal hooks
-  (`_Capture`) and its own stop-token derivation on purpose.
+  (table below); every check involving the bank runs for **both score
+  variants** and must pass for both (`per_variant` in each detail). Each check reports max observed error and tolerance (status PASS, FAIL, SKIP or INFO); the CLI options (`n`, `reference_n`, `reference_layers`, `tf_max_noise_ratio`, `fp32_reference`) are recorded under `options`;
+  `verify_report.json`; exit 1 on any FAIL. The report carries `recommend`
+  (`trace_dtype=float32` or null, see `fp32_reference`), printed as a
+  `RECOMMEND` line. Keeps its own minimal hooks (`_Capture`, on the trace
+  model) and its own stop-token derivation on purpose.
 - **inspect** (`verification/inspection.py`): no model; reads
   `manifest.json`, `answers.parquet` and `traces.h5` of a finished run and
   prints every position (token id, decoded token if the tokenizer is in the
   local cache, role, reference position or `response`) and one table per
-  quantity — `E`, `H̄`, `margin`, `var_score`, `topk_mass` at β\* (last β
-  column) — with one row per layer and columns `question_last`,
+  quantity — `E`, `H̄`, `margin`, `var_score`, `topk_mass` at β\*_v (last β
+  column) of one variant (`--variant`, default `cos_gamma_query`) and
+  `query_gain` — with one row per layer and columns `question_last`,
   `prompt_last`, `response_first`, `response_mean`.
 
 Verification checks (none is part of the production path):
@@ -558,16 +640,16 @@ differences and JS in CPU float64. Score computations move their input to
 
 | check | implementation | tolerance and justification |
 |---|---|---|
-| `reference`: every per-token trace == independent float64 reference, at every β and reference position | `dev/reference.py` (explicit loops, no `energy_llm` imports; `reference_item` returns the traces of 5.8 and the reference positions, `question_last` passed in from the role mask); `verify.compare_with_reference`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); every trace by a first-order bound on the observed score error δ at each β (`reference_tolerances`): E δ; margin 2δ; H̄ 2βδ; `mean_score` 2βδ·range(s) + δ; `var_score` 2βδ·range(s) + 2δ·range(s); `topk_mass` max(k, 2)·βδ; JS 4βδ; `dkl` 2βδ·A + 8βδ with A = Σp\|log p − log q\| + Σq\|log q − log p\| computed per element from the reference scores; `xhat_top1_frac` within the score tolerance; plus a float32 floor 1e-5·max(1, \|value\|) per element; `topk_ids` as sets, row Jaccard ≥ 0.98 (near-ties at the k-th score); NaN patterns and reference positions equal |
-| `gate`: read point + γ integration | `verify.check_gate` | `g` vs `‖w̃‖√D·s`: 4·u of the model dtype (three roundings in the model path), floor 1e-5; the no-γ control must exceed 10× |
-| `tf_vs_cache`: TF residuals == cached generation, judged on the traces | `verify.check_tf_vs_cache`, `propagate`, `noise_to_signal` | tokens must agree, and per layer ℓ and trace m ∈ {`H̄`, `E`, JS}: p99 over (questions × compared positions) of `|m(x_cache) − m(x_tf)|` (JS: `JS(p_cache, p_tf)`) at β\* ≤ `--tf-max-noise-ratio` (0.1) × σ_ℓ(m), σ_ℓ = std over (response positions × questions) of `norm_entropy`, `energy`, `js/question_last` at β\*. Reported apart: max/σ ratio; `‖x_cache − x_tf‖/‖x_tf‖` per layer (median, p99, max) and the location of its max (id, layer, position, role), against the former thresholds fp32 1e-4 / bf16 5e-2 (informative since step 9) |
-| `fp32_reference` (INFO) | `verify.fp32_reference`, `load_fp32_model` | no PASS/FAIL. A separate float32 instance from the local cache (never an in-place cast), one TF pass per question on the same tokens, freed afterwards; `set_float32_matmul_precision("highest")` and TF32 off in `cuda.matmul` and `cudnn` during the check, restored after (recorded in the report). Per layer: `d(x_tf, x_fp32)`, `d(x_cache, x_fp32)` (median/p99/max) and both propagated to the traces with the same σ ratios. A float32 bundle (tests) is its own reference. `--no-fp32-reference` → SKIP |
+| `reference`: every per-token trace of both variants == independent float64 reference, at every β and reference position | `dev/reference.py` (explicit loops, no `energy_llm` imports; `cos_gamma_key` from explicit unit rows of `W̃`, `cos_gamma_query` from explicit unit rows of `W_g` and unit queries `γ ⊙ x̂`; `reference_item` returns the traces of 5.8 per variant, `query_gain`, `xhat_top1_frac` and the reference positions, `question_last` passed in from the role mask); `verify.compare_with_reference(…, variant)`; `tests/test_reference.py` | scores ≤ D·u₃₂ (float32 dot of D terms, Cauchy–Schwarz); every trace by a first-order bound on the observed score error δ at each β (`reference_tolerances`): E δ; margin 2δ; H̄ 2βδ; `mean_score` 2βδ·range(s) + δ; `var_score` 2βδ·range(s) + 2δ·range(s); `topk_mass` max(k, 2)·βδ; JS 4βδ; `dkl` 2βδ·A + 8βδ with A = Σp\|log p − log q\| + Σq\|log q − log p\| computed per element from the reference scores; `xhat_top1_frac` and `query_gain` within the score tolerance (for `c` the same D·u₃₂ bound holds: Cauchy–Schwarz on `w·q/(‖w‖‖q‖)`); plus a float32 floor 1e-5·max(1, \|value\|) per element; `topk_ids` as sets, row Jaccard ≥ 0.98 (near-ties at the k-th score); NaN patterns and reference positions equal |
+| `gate`: read point + γ integration, both variants | `verify.check_gate` (gate read from the trace model) | `g` vs `‖w_i‖·‖γ⊙x̂‖·c_i` (`cos_gamma_query`) and vs `‖w̃_i‖√D·s_i` (`cos_gamma_key`): 4·u of the trace dtype (three roundings in the model path), floor 1e-5; the no-γ control must exceed 10× |
+| `tf_vs_cache`: TF residuals == cached generation, judged on the traces of both variants | `verify.check_tf_vs_cache`, `propagate`, `position_groups`, `grouped_noise`, `noise_to_signal` | tokens must agree, and for **each variant**, per layer ℓ and trace m ∈ {`H̄`, `E`, JS}: p99 over (questions × **analysis positions**) of `|m(x_cache) − m(x_tf)|` (JS: `JS(p_cache, p_tf)`) at β\*_v ≤ `--tf-max-noise-ratio` (0.1) × σ_ℓ(m), σ_ℓ = std over (response positions × questions) of `norm_entropy`, `energy`, `js/question_last` at β\*_v. **Analysis positions** = response tokens ∪ {`question_last`, `prompt_last`, `response_first`} among the compared positions `0 … n_prompt + T_g − 2`; template tokens and position 0 (attention sink; the pilot maximum) are reported apart and do not enter the criterion (revised after the pilot, overview §8.1). Reported per variant and per position group — `analysis`, `role/{template, instruction, question, response}`, `position/{position_0, question_last, prompt_last, response_first}` — median/p99/max and the p99 and max ratios per layer **with σ_ℓ next to them** (a large ratio can be a small σ), and the worst (layer, metric, σ). `‖x_cache − x_tf‖/‖x_tf‖` per layer and group and the location of its max (id, layer, position, role), against the former thresholds fp32 1e-4 / bf16 5e-2 (informative) |
+| `fp32_reference` (INFO) | `verify.fp32_reference`, `load_fp32_model` | no PASS/FAIL. A separate float32 instance from the local cache (never an in-place cast), one TF pass per question on the same tokens, freed afterwards; `set_float32_matmul_precision("highest")` and TF32 off in `cuda.matmul` and `cudnn` during the check, restored after (recorded in the report). Per layer and position group: `d(x_tf, x_fp32)`, `d(x_cache, x_fp32)` (median/p99/max) and both propagated to the traces of each variant with the same σ ratios. A float32 bundle (tests) or a float32 trace model is its own reference. **Precision rule** (pre-registered, `RECOMMEND_FP32_RATIO` = 0.1): if max over variants, layers and metrics of p99/σ_ℓ of TF vs float32 on the analysis positions exceeds 0.1, the report sets `recommend: "trace_dtype=float32"` and the console prints `RECOMMEND trace_dtype=float32`. `--no-fp32-reference` → SKIP |
 | `alignment`: last prompt position emits the first token; response = generated non-stop tokens | `verify.run_verify` | exact (booleans) |
 | `hidden`: residuals at the four positions, derived independently (roles, stop tokens) | `verify.run_verify` | exact |
 | `files_vs_memory`: `hidden.h5` / `traces.h5` hold what was computed | `verify.run_verify` | in float16 ulps: 0 on CPU, ≤ 1 on GPU (a float32 difference of a recomputation can flip the last float16 bit); `topk_ids` exact on CPU, row Jaccard ≥ 0.98 on GPU |
-| `permutation`: permuting memories changes nothing | `verify.PermutedBank`, `permutation_tolerances`, `trace_ratios`, `gamma_shuffled_bank`; `tests/test_invariance.py` | per trace and element, tolerance from float32 reduction bounds over D_ff (tree reduction, `g_n = ⌈log₂ D_ff⌉·u₃₂`, safety factor c = 2; derivation in §13.5); PASS if every `|Δ|/tol ≤ 1`, the **negative control** (γ permuted over D without permuting `W_g`) exceeds 1, and `topk_ids` mapped through the permutation have row Jaccard ≥ 0.98. Reported: per trace max error, max ratio and where (layer, position, β); the overall worst; the control's ratios |
-| `limits`, `monotone`, `self_divergence` | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| expected exactly 0 (pointwise forms); tolerance `4·u₃₂·log D_ff` (`self_divergence_tolerance`, 2.2e-6 at D_ff = 11008) |
-| `calibration`: H̄(β\*) on the warm-up set | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values |
+| `permutation`: permuting memories changes nothing, both variants | `verify.PermutedBank` (rows of `W_g` and both key norms permuted, `preactivation` overridden), `permutation_tolerances(…, variant)`, `trace_ratios`, `gamma_shuffled_bank`; `tests/test_invariance.py` | per variant, trace (including `query_gain`, tolerance 0 + floor) and element, tolerance from float32 reduction bounds over D_ff (tree reduction, `g_n = ⌈log₂ D_ff⌉·u₃₂`, safety factor c = 2; derivation in §13.5); PASS if every `|Δ|/tol ≤ 1`, the **negative control** (γ permuted over D without permuting `W_g`) exceeds 1, and `topk_ids` (where stored) mapped through the permutation have row Jaccard ≥ 0.98. Reported: per trace max error, max ratio and where (layer, position, β); the overall worst; the control's ratios |
+| `limits`, `monotone`, `self_divergence`, both variants | `verify.run_verify`; `tests/test_invariance.py` | 1e-5; β∞ = 50/margin so runner-ups weigh ≤ e⁻⁵⁰: `H̄` → 0, `E` → −max s, `var_score` → 0, `topk_mass` → 1; β → 0: `H̄` → 1; JS(p,p) and \|KL(p‖p)\| expected exactly 0 (pointwise forms); tolerance `4·u₃₂·log D_ff` (`self_divergence_tolerance`, 2.2e-6 at D_ff = 11008) |
+| `calibration`: H̄(β\*_v) on the warm-up set, both variants | `verify._calibration_check` | H̄ monotone ⇒ it must lie between the two bracketing grid values of the variant's curve |
 | `determinism` | `verify.run_verify`; `tests/test_invariance.py` | bit-exact on CPU, ≤ 1 float16 ulp on GPU |
 
 The cluster sequence (environment, real tokenizers, dev calibration,
@@ -583,7 +665,8 @@ output_dir: ${SCRATCH_ROOT}/energy_llm/runs/qwen25_3b   # required; env vars exp
 model:
   id: Qwen/Qwen2.5-3B-Instruct       # required
   revision: <40-hex hub commit>      # required, validated by regex
-  dtype: bfloat16                    # the only accepted value
+  dtype: bfloat16                    # the only accepted value (generation)
+  trace_dtype: bfloat16              # bfloat16 | float32: dtype of the traced teacher-forced pass (5.1)
   device: auto                       # auto | cuda | cpu
 prompt:
   system: "Answer the question briefly and directly."   # non-empty
@@ -596,9 +679,11 @@ calibration:
   log10_beta_max: 4.0                # > min
   num_grid: 81                       # >= 2
 extraction:
-  beta_grid_log10: {min: 0.0, max: 4.0, num: 9}   # exactly these keys; num >= 2, max > min; beta* appended
+  beta_grid_log10_offset: {min: -0.7, max: 0.9, num: 9}   # beta*_v * 10^o per variant; exactly these keys;
+                                     # num >= 2, max > min; beta*_v appended (the absolute beta_grid_log10 is rejected)
   topk_mass_k: 10                    # >= 1
-  topk_ids_k: 100                    # >= 1
+  topk_ids_k: 100                    # >= 1, topk_ids of cos_gamma_query
+  control_topk_ids_k: 0              # >= 0, topk_ids of cos_gamma_key; 0 = not stored
   hidden_layers: all                 # 'all' or a list of layer indices (validated against L at run time)
   samples_per_shard: 1000            # >= 1
   max_attempts: 3                    # >= 1 (also used by calibrate)
@@ -615,7 +700,8 @@ Two hashes/contexts drive the guards:
   `calibration`, `extraction` including `samples_per_shard` and
   `max_attempts`). Stored in `shard.json` and `manifest.json`; a shard
   refuses to resume and `merge` refuses to read under a different value.
-- `RunConfig.calibration_context()` — `model` (with `device` nulled),
+- `RunConfig.calibration_context()` — `model` (with `device` nulled;
+  `trace_dtype` included),
   `prompt`, `generation`, `calibration`. Stored in `beta_star.json` and
   `calibration/state.json`; `extract` refuses a β\* with another context.
 
@@ -649,11 +735,14 @@ Two hashes/contexts drive the guards:
   directories **those jobs** printed (`report: <dir>/<x>_report.json` line of
   each log; never a `find`). JSON is pretty-printed with the stdlib's
   `python3 -m json.tool` when available, else copied. `LOG_DIR`, `TAIL_N`
-  override the defaults (`logs/`, 150). Tested in `tests/test_hpc_scripts.py`.
+  override the defaults (`logs/`, 150). The commit and status come from
+  `git --git-dir=… --work-tree=… -c safe.directory=…` (no `git -C`, absent
+  before git 1.8.5); git's error is printed, and HEAD and its ref are read
+  from `.git` when git fails. Tested in `tests/test_hpc_scripts.py`.
 - The verification sequence on the cluster is in the README ("Verification
   on the cluster"). β\* values from `dev/` are verification-only.
 
-## 12. Tests (`tests/`, CPU only, ~55 s)
+## 12. Tests (`tests/`, CPU, ~110 s; GPU files skipped without CUDA)
 
 `conftest.py` builds tiny random Qwen2 and Llama models (3 layers, D=32,
 D_ff=48, non-trivial γ), word-level tokenizers with templates that mimic the
@@ -663,19 +752,19 @@ must override.
 
 | file | proves |
 |---|---|
-| `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped); item file round trip (float16 / int32, attrs, gzip, chunks `[1, T, n_beta]`) |
-| `test_bank.py` | `g = ‖W̃‖·√D·s` against the real forward; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip; γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
-| `test_hpc_scripts.py` | `pilot_bundle.sh` bundles the run directories printed by the given jobs (not another run), works without `sacct`, reports an unfinished job; usage error |
+| `test_storage.py` | atomic writes leave no temp file and keep the old file on error; torn JSONL lines skipped; input validation (ids, duplicates, extra fields dropped); item file round trip (both variant groups with their `betas` / `topk_ids_k` attrs, no control `topk_ids`, float16 / int32, gzip, chunks `[1, T, n_beta]`) |
+| `test_bank.py` | `g = ‖W̃‖·√D·s` and `g = ‖w‖·‖γ⊙x̂‖·c` against the real forward; `c` equals an explicit cosine with γ on the query; `s = g_t (‖w‖/‖w̃‖) c`; one pre-activation serves both variants; bank keeps no copy of `W_g`; scores equal explicit unit rows and are cosines; dims from config; `bank.h5` round trip (key norms; fingerprint covers them); architecture adapter (Qwen2/Llama read point and gain; Gemma `NotImplementedError`; others rejected); γ diagnostic (top-`|γ|` indices, fraction vs explicit `W̃`, in [0, 1], all dims sum to 1, deterministic); bf16 enforcement |
+| `test_hpc_scripts.py` | `pilot_bundle.sh` bundles the run directories printed by the given jobs (not another run), works without `sacct`, records the commit, and with a failing git (old git without `-C`) prints the error and reads the commit from `.git`; reports an unfinished job; usage error |
 | `test_metrics.py` | `JS(p,p) == 0` and `KL(p‖p) == 0` exactly at three β; JS with `log p = −inf` (xlogy masking); `var_score` is the centred form (raw-moment form fails on scores packed near 0.9); `‖x̂‖` formula; distributions sum to 1; entropy bounds/extremes; energy vs scipy; JS symmetry/bounds/scipy convention/log 2 on disjoint supports; log-domain underflow regression; margin; KL zero on identical inputs and the KL difference antisymmetric; `var_score` → variance of `s` (β→0) and → 0 (β→∞); `topk_mass` → 1 (β→∞); `topk_indices` sorted, unique, int32; `xhat_top1_frac` extremes; the six primitives vs `dev/reference.py` |
-| `test_capture.py` | TF/decoding logit discrepancy recorded per step; a forced TF flip records the mismatch, TF token and both margins; `tf_exact` and the `tf_logit_diff*` answer fields; explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; `token_logits` == chosen-token logits of an explicit forward; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas; `topk_ids` sorted and unique; `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast); `betas` recorded; NaN raises |
-| `test_config.py` | YAML round trip keeps values and hash; `betas` = absolute grid + β\* last; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`) rejected |
-| `test_calibrate.py` | log-β interpolation; unbracketed target fails; curve decreasing and β\* hits the target; idempotence; extract refuses without β\*, with overlap, with another context |
-| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; merge of two shards (attrs, per-id reference positions, chunks, `max_xhat_top1_frac`, `mean_neg_logit`, γ summary); `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces, NaN baselines and `response_last`); smoke summary (three bands and the bands without layer 0; the intact branch of the ablation equals the production traces; d\*, criteria, re-matched β, β_ℓ, `prompt_last` band/bracket; disagreement list; report path line); the δ rule of `tf_disagreements` |
-| `test_invariance.py` | permuting memories changes nothing (`topk_ids` map through the permutation); the derived per-trace tolerances hold (worst ≤ 1, `dkl` ratio > 1e-3: not loose by orders) and the γ-shuffled control exceeds them by > 10³; β→0 and β→∞ limits; `H̄` monotone in β; self-divergence zero; two runs bit-identical on CPU |
-| `test_reference.py` | every production trace == `dev/reference.py` within the derived tolerances on the grid {1, 10², 10⁴, β\*} at three β\*; reference positions equal; empty response (NaN `*/response_first`); negative control (no γ) fails |
-| `test_verify.py` | all checks PASS on the tiny models (`fp32_reference` INFO); options recorded; `noise_to_signal` ratios; `fp32_reference` loads a separate instance and restores the matmul precision; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (each reference position marked once; five per-layer tables with the four columns) |
+| `test_capture.py` | TF/decoding logit discrepancy recorded per step; a forced TF flip records the mismatch, TF token and both margins; `tf_exact` and the `tf_logit_diff*` answer fields; explicit system prompt and exact role mask; Llama `date_string`; hub sampling overridden; teacher forcing == greedy == explicit argmax loop; `token_logits` == chosen-token logits of an explicit forward; hook reads the norm input; truncation; every stop token excluded; empty response as a valid sample (NaN exactly in `*/response_first` and the response residuals); shapes/dtypes/bounds of every trace of both variants and the shared ones; the variants differ; `query_gain` explicit; control `topk_ids` omitted at k = 0; reference positions (and `PromptError` without a question token); own-reference rows zero; `js`/`dkl` vs explicit float64 formulas, `topk_ids` sorted and unique, `energy[..., -1]` == the single-β trace at β\* (and within float16 after the cast), per variant; `betas` recorded; NaN raises; `trace_dtype` bfloat16 (one model, bf16 residuals) and float32 (bf16 generation, float32 trace pass equal to a direct float32 forward; hooks on the wrong model and a different checkpoint refused) |
+| `test_config.py` | YAML round trip keeps values and hash; `betas` = β\* × the relative grid + β\* last; shipped configs use the relative grid and `control_topk_ids_k: 0`; `trace_dtype` validated and part of the calibration context and hash; invalid grid / top-k rejected; removed keys (`beta_multipliers`, `jaccard_top_k`, `beta_grid_log10`) rejected |
+| `test_calibrate.py` | log-β interpolation; unbracketed target fails; per variant the curve decreases and β\* hits the target, grid position consistent; the two β\* differ; grid position and the 0.5-decade edge WARNING; idempotence; extract refuses without β\*, with a record missing a variant or in the old format, with overlap, with another context |
+| `test_resume.py` | interrupted + resumed run is byte-identical to a full run; outputs indexed by id without input extras; failures retried and never completed; exhausted ids end the shard and are reported; changed config (top-k or β grid) refuses to resume; merged `traces.h5` layout (variant groups, file attrs per variant, `query_gain`); merge of two shards (attrs, per-id reference positions, chunks, `max_xhat_top1_frac`, `mean_neg_logit`, γ summary); `merge` refuses items with different `betas`; status/missing shards and CLI; SIGUSR1 finishes the current id; CLI skips a finished shard without loading the model; empty responses completed and flagged (finite traces of both variants, NaN baselines and `response_last`); smoke summary (β\* per variant and its grid position, topk_ids saving, relative-depth bands and the bands without layer 0, `g_t` distribution, per variant: the intact branch of the ablation equals the production traces for `ΔH̄` vs `prompt_last` and vs `question_last`, d\*, criteria, re-matched β, β_ℓ, `prompt_last` band/bracket, exclusion; disagreement list; report path line); `depth_bands` relative; the exclusion rule (thresholds, CIs, first layer, NaN ids dropped, fixed seed); the δ rule of `tf_disagreements` |
+| `test_invariance.py` | permuting memories changes nothing (`topk_ids` map through the permutation); per variant, the derived per-trace tolerances hold (worst ≤ 1, `dkl` ratio > 1e-3: not loose by orders) and the γ-shuffled control exceeds them by > 10³; per variant β→0 and β→∞ limits, `H̄` monotone in β, self-divergence zero; two runs bit-identical on CPU |
+| `test_reference.py` | every production trace of both variants == `dev/reference.py` within the derived tolerances on the grid {1, 10², 10⁴, β\*} at three β\* (with `query_gain`, `xhat_top1_frac`, `topk_ids`); reference positions equal; empty response (NaN `*/response_first`); negative control (pre-activation without γ) fails for both |
+| `test_verify.py` | all checks PASS on the tiny models (`fp32_reference` INFO) with `per_variant` details for both variants; tf_vs_cache groups (analysis, roles, special positions) with σ per layer; options recorded; `noise_to_signal` ratios (σ at the worst); `position_groups` and the analysis-only criterion (a sink at position 0 does not count); `fp32_reference` loads a separate instance, restores the matmul precision and recommends `trace_dtype=float32` above 0.1; no recommendation for a float32 model; a wrong read point makes `gate` and `reference` FAIL; CLI exit code; inspect output (each reference position marked once; per-layer tables with the four columns; `--variant`; `query_gain`) |
 | `test_gpu.py` | (skipped without CUDA) GPU == CPU within float32, peak memory recorded |
-| `test_gpu_verify.py` | (skipped without CUDA) `verify` (all checks PASS, `fp32_reference` INFO) and the smoke diagnostics on the tiny models on CUDA; `fp32_reference` with a separate instance on the device and CPU-saved residuals; `rel_err` / `propagate` accept operands on different devices and return float64 (regression: job 33013) |
+| `test_gpu_verify.py` | (skipped without CUDA) `verify` (all checks PASS for both variants, `fp32_reference` INFO) and the smoke diagnostics per variant on the tiny models on CUDA; `fp32_reference` with a separate instance on the device and CPU-saved residuals; verify with `trace_dtype: float32` (bf16 generation, float32 traces: gate and reference PASS, its own float32 reference); `rel_err` / `propagate` accept operands on different devices and return float64 (regression: job 33013) |
 | `test_real_tokenizer.py` | (opt-in via `ENERGY_LLM_TOKENIZER_DIRS`) prompt ids equal the official template, role mask exact |
 
 ## 13. Audit: inconsistencies and open points
@@ -691,16 +780,17 @@ departs from it:
 
 | topic | `overview.md` | code |
 |---|---|---|
-| hooks (§5, Etapa 2) | output of `gate_proj` (`g`) and input of `mlp` (`r`) | one pre-hook on `post_attention_layernorm` (residual `x`); `x̂` and `s` recomputed in float32, γ folded into the bank; `g = ‖w̃‖√D·s` checked against the real `gate_proj` by `verify` (`gate`) |
-| bank storage (§5, Etapa 0.1) | `‖m_i‖` and `M̂` in float32 with a hash | `M̂` never materialised: γ and `‖w̃_i‖` in `bank.h5` with a fingerprint |
+| hooks (§5, Etapa 2) | output of `gate_proj` (`g`) and input of `mlp` (`r`) | one pre-hook on the FFN norm (`post_attention_layernorm`; residual `x`) of the trace model; `x̂`, one pre-activation and the scores of both variants recomputed in float32; `g = ‖w‖·‖γ⊙x̂‖·c = ‖w̃‖√D·s` checked against the real `gate_proj` by `verify` (`gate`) |
+| bank storage (§5, Etapa 0.1) | `‖m_i‖` and `M̂` in float32 with a hash | `M̂` never materialised: γ, `‖w_i‖` and `‖w̃_i‖` in `bank.h5` with a fingerprint |
 | stored residuals (§7) | `r` and `h` at the three references | `x` (from which `r = γ ⊙ x̂`) at the three references **and** `response_last` |
 | TF vs generation (§8.1, revised step 9) | noise/signal of the traces ≤ 0.1 | `verify: tf_vs_cache`: as specified, propagated from `x` (not `r`) to `H̄`, `E`, JS at β\*; `‖Δx‖/‖x‖` informative; `fp32_reference` (INFO) |
 | TF/greedy disagreements (§8.6, step 9) | every disagreement with margin < δ | recorded per answer (`answers.parquet`); evaluated in `smoke` only, on its own questions |
 | extras (§6.2), `intervene` (§5) | optional | not implemented |
-| ablation (§6.3) | flag `drop_outlier_dims` | no flag; report-only ablation line in `smoke` (top-5 `|γ|` dims zeroed vs intact) |
+| ablation (§6.3) | report only, no production flag | as specified: report-only ablations and the layer exclusion rule in `smoke`, per variant (§9); nothing is applied |
 | response positions | generated tokens | generated tokens **excluding every stop token**; an empty response is a valid sample (NaN `*/response_first`) |
 | decoding | greedy | greedy with a **clean** generation config (Qwen's hub `repetition_penalty=1.05` removed); TF argmax checked |
 | extras not in `overview.md` | — | `margin`, `xhat_top1_frac`, `mean_score` stored per token; `hidden.h5:response_last`; `answers.parquet: xhat_norm_max_rel_dev`; token-level baselines (`mean/min_logprob`, `mean_token_entropy`, `mean_neg_logit`) |
+| `topk_ids` of the control variant | — (overview §7 lists ids top-100 once) | not stored by default (`control_topk_ids_k: 0`); `reference` and `permutation` check `topk_ids` where stored only |
 
 The thesis chapters (`fundamentals-FINAL.tex`, `metodology-FINAL.tex`, in
 Overleaf; last in this repository at tag `thesis-e1e3`) predate both: query
@@ -837,16 +927,51 @@ response tokens, so the two need not agree; `smoke` now reports β_ℓ per
 layer and the band/bracket comparison. Layer 0 (`H̄` ≈ 0.95) dominates the
 first band's `ΔH̄`; criteria are now also reported without it.
 
+### 13.7 Score variants, relative β grid and trace dtype (v0.2 step 10)
+
+Facts introduced by step 10 that a reader deciding what to change should know:
+
+1. **Two of everything.** Both variants are computed, calibrated, stored and
+   verified; extraction cost of the metric loop and the trace storage roughly
+   double (minus the control `topk_ids`, the largest dataset: the smoke
+   reports the MB/question saved). The smoke prints s/question; `status`
+   suggests `samples_per_shard` for the 3 h walltime from the measured rate.
+2. **Exclusion rule details chosen in code.** `ΔH̄` of the rule is
+   response mean − `prompt_last` (the `− question_last` version is reported
+   next to it but not used by the rule); the bootstrap is paired (the same
+   resampled question indices for intact and ablated) with the config `seed`;
+   ids with an empty response are dropped. If the γ-ablated bank's matched β
+   is not bracketed on the calibration grid, the rule at the re-matched β is
+   `None` and no list is proposed.
+3. **`tf_vs_cache` with `trace_dtype: float32`** compares the bf16 cached
+   generation with the float32 TF pass, i.e. the bf16 rounding itself, not
+   two equal-precision paths; it will typically FAIL its 0.1 criterion and is
+   then informative (the GPU test asserts it only runs).
+4. **`gamma_shuffled_bank`** (permutation negative control) keeps the key
+   norms of the intact bank for both variants (unchanged from step 9 for the
+   control; for the primary only the query changes).
+5. **The calibration grid is shared** by both variants (`calibration.*`);
+   only the extraction grid is relative to each β\*_v.
+6. **Gemma is out of scope** by `NotImplementedError` (adapter, §5.1); no
+   architecture other than `qwen2` / `llama` model types is accepted.
+7. **The topk_ids saving's gzip figure is an estimate** (storage size of the
+   primary `topk_ids`, same shape and comparable entropy), not a measurement
+   of the control.
+
 ## 14. Glossary
 
 | term | meaning in this code |
 |---|---|
 | `L`, `D`, `D_ff` | number of decoder layers, hidden size, SwiGLU intermediate size (from the checkpoint config) |
-| `x`, `x̂` | residual at the input of `post_attention_layernorm`; its RMS-normalised version (no γ) |
-| `W_g`, `γ`, `W̃` | `gate_proj.weight`, `post_attention_layernorm.weight`, `W_g·diag(γ)` |
-| bank | unit rows of `W̃`, conceptually; only γ and `‖W̃_i‖` exist on disk/in memory |
-| `s` | cosine scores `[T, D_ff]`; `g = ‖W̃‖√D·s` is the model's gate pre-activation |
-| `β*` | inverse temperature calibrated so the mean `H̄` on the warm-up set equals `target_norm_entropy` |
+| `x`, `x̂` | residual at the input of the FFN norm (`post_attention_layernorm` in Qwen2 / Llama); its RMS-normalised version (no γ) |
+| `W_g`, `γ`, `W̃` | `gate_proj.weight` (rows `w_i`), the FFN norm's effective gain (its weight in Qwen2 / Llama), `W_g·diag(γ)` |
+| bank | conceptually unit rows of `W_g` (primary) or of `W̃` (control); only γ, `‖w_i‖` and `‖W̃_i‖` exist on disk/in memory |
+| score variant | `cos_gamma_query` (primary): `c_i = cos(w_i, γ⊙x̂)`; `cos_gamma_key` (control): `s_i = cos(w̃_i, x̂)·‖x̂‖/√D`; trace names `<variant>/<trace>` |
+| `c`, `s` | scores `[T, D_ff]` of the two variants; the model's gate pre-activation is `g = ‖w‖·‖γ⊙x̂‖·c = ‖W̃‖√D·s` |
+| `g_t`, query gain | `‖γ⊙x̂_t‖/√D` (`query_gain`); `s_i = g_t (‖w_i‖/‖w̃_i‖) c_i` |
+| `β*_v` | inverse temperature of variant v, calibrated so the mean `H̄` on the warm-up set equals `target_norm_entropy`; the extraction grid is `β*_v·10^o` |
+| trace model, `trace_dtype` | the module that runs the traced teacher-forced pass: the generating model (bfloat16) or a float32 instance of the same checkpoint |
+| analysis positions | response tokens ∪ {`question_last`, `prompt_last`, `response_first`}: the positions on which `tf_vs_cache` and the precision rule are judged |
 | last prompt position / response positions | position `n_prompt-1` / generated non-stop positions |
 | empty response | first generated token is a stop token; valid sample with NaN response-only values |
 | shard | contiguous block of `samples_per_shard` ids = one SLURM array task = one directory |

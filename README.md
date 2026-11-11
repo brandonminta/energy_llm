@@ -18,27 +18,43 @@ Three documents describe it:
 
 ## What is computed
 
-Per layer, from the residual `x` at the input of `post_attention_layernorm`
-(float32): `x̂ = x/√(mean(x²)+eps)`, bank = unit rows of `W̃ = W_g·γ`,
-`s = bank·x̂/√D` (cosines). The bank is never materialised: only γ and `‖W̃_i‖`
-are kept and `s = (W_g.float() @ (γ⊙x̂)) / (‖W̃‖·√D)` converts one layer's `W_g`
-to float32 at a time. With `p_t = softmax(β s_t)` for every β of an absolute
-log grid (`extraction.beta_grid_log10`: 10⁰…10⁴, 9 points) **plus β\* last**
-(`n_beta = 10`), the module stores, for every layer `l` and every position
-`t` (prompt and response; `role_mask` separates them downstream):
+Per layer, from the residual `x` at the input of the FFN RMSNorm
+(`post_attention_layernorm` in Qwen2 / Llama; float32): `x̂ = x/√(mean(x²)+eps)`,
+one gate pre-activation `z = W_g·(γ⊙x̂)` (one layer's `W_g` in float32 at a
+time; the bank is never materialised, only γ, `‖w_i‖` and `‖w̃_i‖` are kept)
+and **two score variants** from it:
+
+| variant | score | |
+|---|---|---|
+| `cos_gamma_query` (primary) | `c_i = z_i / (‖w_i‖·‖γ⊙x̂‖) = cos(w_i, γ⊙x̂)` | key without γ, query with γ |
+| `cos_gamma_key` (control) | `s_i = z_i / (‖w̃_i‖·√D) = cos(w̃_i, x̂)·‖x̂‖/√D` | γ folded into the key (the convention up to step 9) |
+
+They differ by the query gain `g_t = ‖γ⊙x̂_t‖/√D`: `s_i = g_t·(‖w_i‖/‖w̃_i‖)·c_i`,
+a position-dependent temperature in the control (overview §6.0). Each variant
+has its own β\* and its own β grid **relative to it** (`β*_v·10^o`, 9 offsets
+from −0.7 to +0.9 decades, `extraction.beta_grid_log10_offset`) **plus β\*_v
+last** (`n_beta = 10`). With `p_t = softmax(β · score_t)` the module stores,
+for every variant `v`, layer `l` and position `t` (prompt and response;
+`role_mask` separates them downstream):
 
 | dataset | shape | dtype | β | definition |
 |---|---|---|---|---|
-| `energy` | `[L, T, n_beta]` | float16 | grid | `-(1/β)·logsumexp(β s)` |
-| `norm_entropy` | `[L, T, n_beta]` | float16 | grid | `H(p)/log D_ff` |
-| `topk_mass` | `[L, T, n_beta]` | float16 | grid | mass of the 10 largest `p` |
-| `mean_score` | `[L, T, n_beta]` | float16 | grid | `Σ p s` |
-| `var_score` | `[L, T, n_beta]` | float16 | grid | `Σ p (s − mean_score)²` |
-| `margin` | `[L, T]` | float16 | – | top1 − top2 of `s` |
+| `<v>/energy` | `[L, T, n_beta]` | float16 | grid | `-(1/β)·logsumexp(β s)` |
+| `<v>/norm_entropy` | `[L, T, n_beta]` | float16 | grid | `H(p)/log D_ff` |
+| `<v>/topk_mass` | `[L, T, n_beta]` | float16 | grid | mass of the 10 largest `p` |
+| `<v>/mean_score` | `[L, T, n_beta]` | float16 | grid | `Σ p s` |
+| `<v>/var_score` | `[L, T, n_beta]` | float16 | grid | `Σ p (s − mean_score)²` |
+| `<v>/margin` | `[L, T]` | float16 | – | top1 − top2 of the scores |
+| `<v>/js/<ref>` | `[L, T, n_beta]` | float16 | grid | `JS(p_t, p_ref)` (nats) |
+| `<v>/dkl/<ref>` | `[L, T, n_beta]` | float16 | grid | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+| `cos_gamma_query/topk_ids` | `[L, T, 100]` | int32 | – | indices of the 100 largest scores, descending (not stored for the control: `control_topk_ids_k: 0`) |
+| `query_gain` | `[L, T]` | float16 | – | `g_t = ‖γ⊙x̂_t‖/√D` |
 | `xhat_top1_frac` | `[L, T]` | float16 | – | `max_j x̂_j² / D` |
-| `topk_ids` | `[L, T, 100]` | int32 | – | indices of the 100 largest `s`, descending |
-| `js/<ref>` | `[L, T, n_beta]` | float16 | grid | `JS(p_t, p_ref)` (nats) |
-| `dkl/<ref>` | `[L, T, n_beta]` | float16 | grid | `KL(p_t‖p_ref) − KL(p_ref‖p_t)` |
+
+The traced teacher-forced pass runs in `model.trace_dtype` (bfloat16 by
+default; `float32` loads a second instance of the checkpoint, generation
+stays bf16; `verify` prints `RECOMMEND trace_dtype=float32` when the bf16
+traces are too far from float32).
 
 `<ref>` ∈ {`question_last`, `prompt_last`, `response_first`} (last question
 token, last prompt token, first response token). The row at a reference
@@ -205,7 +221,7 @@ fixing datasets or parameters. The sequence on the cluster is below
 python -m energy_llm verify  --config C --input dev/dev_questions.jsonl [--n 4] \
                              [--reference-n 2] [--reference-layers 0,18,35] \
                              [--tf-max-noise-ratio 0.1] [--no-fp32-reference]
-python -m energy_llm inspect --run <extraction_dir> --id dev-known-01
+python -m energy_llm inspect --run <extraction_dir> --id dev-known-01 [--variant cos_gamma_key]
 hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 min walltime
 ```
 
@@ -214,11 +230,14 @@ hpc/submit.sh verify configs/qwen25_3b.yaml dev/dev_questions.jsonl 4     # 45 m
 observed error and its tolerance (exit 1 on any FAIL; `verify_report.json`).
 The checks (`reference`, `gate`, `tf_vs_cache`, `alignment`, `hidden`,
 `files_vs_memory`, `permutation`, `limits`, `monotone`, `self_divergence`,
-`determinism`, `calibration`) and their tolerances are tabulated in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §9. `inspect` reads a
-finished extraction (no model) and prints each position (token, role,
-reference position) and, per layer, E, H̄, margin, var_score and topk_mass
-at β\* at the three reference positions and averaged over the response.
+`determinism`, `calibration`, plus `fp32_reference` as INFO) and their
+tolerances are tabulated in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+§9; every check involving the bank runs for both score variants and must
+pass for both. `inspect` reads a finished extraction (no model) and prints
+each position (token, role, reference position) and, per layer, E, H̄,
+margin, var_score and topk_mass at β\*_v of one variant (default the
+primary) and `query_gain`, at the three reference positions and averaged
+over the response.
 
 ### Verification on the cluster
 
@@ -277,9 +296,11 @@ hpc/submit.sh calibrate configs/llama32_3b.yaml dev/dev_warmup.jsonl
 cat $SCRATCH_ROOT/energy_llm/runs/qwen25_3b/calibration/beta_star.json | head -20
 ```
 
-Check: the job ends without `not bracketed`; `failed_ids` is empty;
-`mean_norm_entropy_curve` decreases from ~1 to ~0 across the grid and β\* is
-not at a grid edge. (Verification-only β\*, see the note above.)
+Check: the job ends without `not bracketed`; `failed_ids` is empty; for
+both variants `variants.<v>.mean_norm_entropy_curve` decreases from ~1 to
+~0 across the grid, and the log prints one `beta*[<variant>]` line each with
+its position on the grid and no `WARNING` (β\* within 0.5 decades of an end).
+(Verification-only β\*, see the note above.)
 
 #### 4. Verify (each model): everything PASS
 
@@ -295,10 +316,10 @@ full detail is in `<extraction_dir>/verify_report.json`. Read in particular:
 
 | check | what it proves | what to look at |
 |---|---|---|
-| `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w̃‖·√D·s` | error ≤ 4·u_bf16; `no_gamma_control_min_error` ≫ tolerance |
+| `gate` | read point + γ integration: the model's own gate pre-activation equals `‖w‖·‖γ⊙x̂‖·c` and `‖w̃‖·√D·s` | error ≤ 4·u_bf16 for both variants; `no_gamma_control_min_error` ≫ tolerance |
 | `reference` | every per-token trace (all β, three references) == naive float64 implementation | `max error / tolerance` ≤ 1 (expect ≪ 1); `topk_ids` row Jaccard ≥ 0.98. The pure-Python reference over the β grid adds a few minutes per layer and question: watch the 45 min walltime |
-| `tf_vs_cache` | teacher-forced x == x during cached generation, judged on the traces | PASS: tokens equal and, per layer, p99 of `|ΔH̄|`, `|ΔE|`, `JS(p_cache, p_tf)` at β\* ≤ 0.1 × σ_ℓ (spread of the metric over response positions × questions; `--tf-max-noise-ratio`). `max_ratio_max`, the per-layer x error (median/p99/max) and its location (id, layer, position, role) are reported apart |
-| `fp32_reference` | how far the bf16 residuals (TF and cached) are from a float32 forward on the same tokens | INFO only: per-layer x distances and the same propagated ratios; loads a second, float32 instance (~12 GB) and frees it; TF32 off during the check. `--no-fp32-reference` skips it |
+| `tf_vs_cache` | teacher-forced x == x during cached generation, judged on the traces | PASS: tokens equal and, for both variants and per layer, p99 of `|ΔH̄|`, `|ΔE|`, `JS(p_cache, p_tf)` at β\*_v ≤ 0.1 × σ_ℓ (spread of the metric over response positions × questions; `--tf-max-noise-ratio`) over the **analysis positions** (response + `question_last`, `prompt_last`, `response_first`). Reported apart, by role and special position (position 0 = attention sink): the same ratios with σ_ℓ per layer, `max_ratio_max`, the per-layer x error (median/p99/max) and its location (id, layer, position, role); the console line gives the template and position-0 ratios |
+| `fp32_reference` | how far the traced residuals (TF and cached) are from a float32 forward on the same tokens | INFO only: per-layer x distances and the same propagated ratios by position group; loads a second, float32 instance (~12 GB) and frees it; TF32 off during the check. If p99/σ_ℓ (TF vs float32, analysis positions) > 0.1 at any layer: `RECOMMEND trace_dtype=float32`. `--no-fp32-reference` skips it |
 | `alignment` | last prompt position emits the first token; response = generated non-stop tokens | all booleans true per question |
 | `hidden`, `files_vs_memory`, `determinism` | stored files hold exactly what was computed | 0 error on the stored arrays; GPU ≤ 1e-5 |
 | `permutation`, `limits`, `monotone`, `self_divergence`, `calibration` | invariances and limits on real activations | all PASS; `calibration` inside the bracket; `permutation`: per-trace ratios ≤ 1, negative control > 1, β of the max (`dkl` is ill-conditioned at high β, ARCHITECTURE §13.5) |
@@ -320,18 +341,28 @@ Check:
 - `model dtype bfloat16`;
 - `TF == greedy` % of tokens and answers, and `TF/greedy disagreements N: all margins < delta: True` (each disagreement listed with its margins; one above δ is an alignment problem: report it);
 - `max | ||x_hat||/sqrt(D) - 1 |` negligible (≲ 1e-3);
-- mean H̄ per layer at β\*: not saturated (not ≈ 0 or ≈ 1 in most layers);
+- the two `beta*[<variant>]` lines: position on the calibration grid, no `WARNING`;
+- `topk_ids of cos_gamma_key not stored`: the MB/question saved;
+- mean H̄ per layer at β\*_v for both variants: not saturated (not ≈ 0 or ≈ 1 in most layers);
 - peak GPU memory and seconds/question: note both (they size `samples_per_shard`: `(7200 − load) / s_per_question`);
 - empty / truncated counts: plausible for short factual answers;
 - TF/greedy disagreements: each with its margins; `all margins < delta`
   should be True (a disagreement above δ is not a numerical near-tie);
-- mean `H̄(prompt_last)` at β\* against the 0.55 ± 0.05 band and the
-  calibration bracket; β_ℓ min/max over layers;
-- per band (and per band without layer 0): `xhat_top1_frac` median/max at
-  the three references, `var_score` prompt vs response, γ top-5 fraction,
-  criteria 3 and 4, and the ablations (top-5 γ dims, outlier dim d\*):
-  `ΔH̄` and JS at β\* and at the re-matched β;
-- per layer: d\* and its share, γ fraction, `ΔH̄` intact / γ / d\*, β_ℓ.
+- the query gain `g_t` per band at `question_last`, `prompt_last` and the
+  response (median [p10, p90]);
+- `layer exclusion (reported, NOT applied)`: the layers the rule proposes
+  (first layer + CI-backed γ-ablation sign flips at the re-matched β, from
+  `cos_gamma_query`);
+- per variant (`== cos_gamma_query (primary)`, `== cos_gamma_key`): mean
+  `H̄(prompt_last)` at β\*_v against the 0.55 ± 0.05 band and the
+  calibration bracket; β_ℓ min/max over layers; re-matched β; sign flips;
+  per band of relative depth (and without layer 0): `H̄(prompt_last)`, `ΔH̄`
+  vs `question_last`, `xhat_top1_frac` median/max at the three references,
+  `var_score` prompt vs response, γ top-5 fraction, criteria 3 and 4, and
+  the ablations (top-5 γ dims, outlier dim d\*): `ΔH̄` and JS at β\*_v and
+  at the re-matched β; per layer `H̄(prompt_last)`, `ΔH̄` intact / γ / d\*,
+  `ΔH̄` vs `question_last`, β_ℓ;
+- per layer (shared): d\* and its share, γ fraction, `xhat_top1_frac` at `prompt_last`.
 
 #### 6. Manual alignment review: 3 questions per model
 
@@ -388,18 +419,19 @@ if it is wanted, and record its peak memory and seconds/question.
 
 ```
 calibration/
-  beta_star.json      beta*, calibration context, warm-up hash, bracket
-  bank.h5             gamma, ||w_tilde|| per layer, gamma diagnostic, fingerprint
+  beta_star.json      beta* per score variant (+ grid position), calibration context, warm-up hash
+  bank.h5             gamma, ||w||, ||w_tilde|| per layer, gamma diagnostic, fingerprint
 extract/<name>/
-  manifest.json       config + hash, beta*, commit, library versions, hardware,
-                      peak GPU memory per shard, dtype, checks, exhausted ids
+  manifest.json       config + hash, beta* per variant, commit, library versions, hardware,
+                      peak GPU memory per shard, model/trace dtype, checks, exhausted ids
   answers.parquet     id, prompt, response, token ids, lengths, empty_response,
                       truncated, stop_token_id, per-token logprob/entropy/logit,
                       TF mismatches, xhat_norm_max_rel_dev
   baselines.parquet   mean/min logprob, mean entropy, mean_neg_logit
-  traces.h5           /<id>/{energy, norm_entropy, topk_mass, mean_score, var_score,
-                             margin, xhat_top1_frac, topk_ids, js/<ref>, dkl/<ref>,
-                             role_mask}; attrs betas, reference_positions
+  traces.h5           /<id>/<variant>/{energy, norm_entropy, topk_mass, mean_score,
+                             var_score, margin, js/<ref>, dkl/<ref>, topk_ids (primary)},
+                      /<id>/{query_gain, xhat_top1_frac, role_mask};
+                      attrs variants, betas and beta_star per variant, reference_positions
   hidden.h5           /<id>/{question_last, prompt_last, response_first, response_last}
   bank.h5             copy of calibration/bank.h5
 ```
@@ -409,16 +441,24 @@ provenance, joins everything on `id`, and never needs the model.
 
 | File | Content |
 |---|---|
-| `manifest.json` | full config + hash, β* and calibration record, code commit, library versions, hardware and peak GPU memory per shard run, actual model dtype, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
+| `manifest.json` | full config + hash, β\* per variant and calibration record (grid positions), code commit, library versions, hardware and peak GPU memory per shard run, actual model and trace dtypes, checks (TF mismatches, ‖x̂‖ deviation, truncations, empty responses, max `xhat_top1_frac` per reference, γ summary), γ diagnostic, exhausted ids |
 | `answers.parquet` | id, prompt, response, prompt/generated token ids, lengths, `empty_response`, `truncated`, `stop_token_id`, per-token log-prob, entropy and chosen-token logit, TF mismatches (`tf_exact`, positions, TF tokens, top1 − top2 margins in TF and generation), per-step TF/decoding logit discrepancy (`tf_logit_diff`, `tf_logit_diff_max`, `tf_logit_diff_step0`), `xhat_norm_max_rel_dev` |
 | `baselines.parquet` | mean / min token log-probability, mean token entropy, `mean_neg_logit` (response tokens; NaN when empty) |
-| `traces.h5` | the datasets of "What is computed" per id, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions` (−1 = none); file attrs `betas` (β\* last), `topk_mass_k`, `topk_ids_k`, `reference_names`, `role_names`; gzip 4, one chunk per layer |
+| `traces.h5` | the datasets of "What is computed" per id, `/<id>/role_mask` `[T]` (0 template, 1 instruction, 2 question, 3 response); per-id attr `reference_positions` (−1 = none); file attrs `variants` (primary first), `primary`, `beta_star [n_variants]`, `betas [n_variants, n_beta]` (β\*_v last), `topk_mass_k`, `topk_ids_k [n_variants]`, `reference_names`, `role_names`; gzip 4, one chunk per layer |
 | `hidden.h5` | `/<id>/{question_last, prompt_last, response_first, response_last}` `[layers, D]` float16 (`response_*` NaN when empty) |
-| `bank.h5` | γ and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
+| `bank.h5` | γ, `‖w_i‖` and `‖W̃_i‖` per layer; γ diagnostic (top-5 `|γ|` dims and the share of `Σ‖w̃_i‖²` they carry) |
 
 Schemas and the per-shard working files: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7–8.
 
 ## History
+
+- **v0.2, step 10**: two score variants (`cos_gamma_query` primary: γ on the
+  query; `cos_gamma_key` control: the former convention), `query_gain`, one
+  β\* per variant with its grid position, β grid relative to β\*_v,
+  `control_topk_ids_k`, architecture adapter (Qwen2/Llama; Gemma not
+  implemented), `model.trace_dtype`, verify per variant with the analysis-
+  position criterion and the float32 precision rule, smoke per variant with
+  `g_t`, relative-depth bands and the layer exclusion rule (reported only).
 
 - **v2.1.0 (v0.2 plan, `docs/CHANGES_v0.2.md`)**: per-token traces at an
   absolute β grid + β\*, three reference positions, `topk_mass`,
